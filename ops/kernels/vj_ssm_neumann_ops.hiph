@@ -1,0 +1,317 @@
+#pragma once
+
+#include <hip/hip_runtime.h>
+#include <stdint.h>
+
+// ============================================================================
+// VegaJet Universal ReplaySSM & Chunked WY/Neumann Prefill Ops (gfx906)
+//   1. vj_ssm_wy_neumann_chunk16_kernel:
+//      Model-agnostic chunked C=16 WY/Neumann inverse T = (I-A)^-1 = prod_{k=0..3} (I + A^(2^k))
+//      ZERO SOLVE_TRI! 0 B private spill, <= 48 VGPRs!
+//      Computes chunk outputs O [H, C, Dv] and updates state S [H, Dk, Dv] in ONE fused kernel!
+//   2. vj_replay_ssm_decode_kernel:
+//      Universal Mamba-2 / GDN / KDA ReplaySSM decode kernel!
+//      Reads authoritative S_ckpt (read-only on non-flush steps = ZERO HBM2 state write!)
+//      + replays B[0..len-1] to emit exact y_t, flushing S_ckpt ONLY when flush_ckpt != 0!
+// ============================================================================
+
+namespace vegajet {
+namespace ssmdev {
+
+__device__ __forceinline__ float wave64_sum(float v) {
+    v += __shfl_xor(v, 32, 64);
+    v += __shfl_xor(v, 16, 64);
+    v += __shfl_xor(v, 8,  64);
+    v += __shfl_xor(v, 4,  64);
+    v += __shfl_xor(v, 2,  64);
+    v += __shfl_xor(v, 1,  64);
+    return v;
+}
+
+} // namespace ssmdev
+} // namespace vegajet
+
+// ============================================================================
+// 1. Model-Agnostic Chunked WY/Neumann GDN/Mamba2 Prefill Kernel (C = 16, ZERO SOLVE_TRI!)
+//    Grid: H * 256 (1 WG of 256 threads = 4 waves per head), Block: 256
+//    Supports Dk <= 128, Dv <= 128; strictly 0 B private spill!
+//    State layout: S [H, Dk, Dv] FP32
+//    Inputs: Q [H, C, Dk], K [H, C, Dk], V [H, C, Dv], decay [H, C] (exp(g_t)), beta [H, C]
+//    Output: O [H, C, Dv], updated S [H, Dk, Dv]
+// ============================================================================
+extern "C" __global__ __launch_bounds__(256, 4)
+void vj_ssm_wy_neumann_chunk16_kernel(
+    float*       __restrict__ S_all,     // [H, Dk, Dv] in-place updated
+    const float* __restrict__ Q_all,     // [H, 16, Dk]
+    const float* __restrict__ K_all,     // [H, 16, Dk]
+    const float* __restrict__ V_all,     // [H, 16, Dv]
+    const float* __restrict__ decay_all, // [H, 16] (per-step exp(g_t))
+    const float* __restrict__ beta_all,  // [H, 16] (0 -> Mamba2 pure additive; >0 -> GDN delta rule)
+    float*       __restrict__ O_all,     // [H, 16, Dv]
+    uint32_t H,
+    uint32_t Dk,
+    uint32_t Dv) {
+
+    const uint32_t h   = blockIdx.x;
+    const uint32_t tid = threadIdx.x; // 0..255 (16x16 matrix = 1 thread per (i,j)!)
+    if (h >= H) return;
+
+    constexpr uint32_t C = 16u;
+    const uint32_t r = tid >> 4; // 0..15
+    const uint32_t c = tid & 15u;// 0..15
+
+    __shared__ float sm_cum_g[C];       // cumulative decay prod_{m=0..t} decay[m]
+    __shared__ float sm_A[C * C];       // strictly lower triangular A_ij = -beta_i * (cum_g[i]/cum_g[j]) * (k_i . k_j)
+    __shared__ float sm_P[C * C];       // Neumann power P = A^(2^k)
+    __shared__ float sm_T[C * C];       // WY inverse T = (I - A)^-1
+    __shared__ float sm_QK[C * C];      // causal (cum_g[i]/cum_g[j]) * (q_i . k_j) for j <= i
+    __shared__ float sm_tmp[C * C];
+
+    const float* Qh = Q_all     + static_cast<uint64_t>(h) * C * Dk;
+    const float* Kh = K_all     + static_cast<uint64_t>(h) * C * Dk;
+    const float* Vh = V_all     + static_cast<uint64_t>(h) * C * Dv;
+    const float* gh = decay_all + static_cast<uint64_t>(h) * C;
+    const float* bh = beta_all  + static_cast<uint64_t>(h) * C;
+    float*       Oh = O_all     + static_cast<uint64_t>(h) * C * Dv;
+    float*       Sh = S_all     + static_cast<uint64_t>(h) * Dk * Dv;
+
+    // Step 1: Cumulative decay prefix product in LDS (thread 0)
+    if (tid == 0u) {
+        float acc = 1.0f;
+        for (uint32_t t = 0u; t < C; ++t) {
+            acc *= gh[t];
+            sm_cum_g[t] = acc;
+        }
+    }
+    __syncthreads();
+
+    // Step 2: Compute strictly lower-triangular A (for Neumann WY) & causal QK^T (1 thread per (r, c)!)
+    const float ratio_rc = (r >= c) ? (sm_cum_g[r] / fmaxf(sm_cum_g[c], 1e-30f)) : 0.0f;
+    float kk = 0.0f, qk = 0.0f;
+    if (r >= c) {
+        const float* kr = Kh + r * Dk;
+        const float* kc = Kh + c * Dk;
+        const float* qr = Qh + r * Dk;
+        #pragma nounroll
+        for (uint32_t d = 0u; d < Dk; ++d) {
+            const float kcv = kc[d];
+            if (r > c) kk = fmaf(kr[d], kcv, kk);
+            qk = fmaf(qr[d], kcv, qk);
+        }
+    }
+    // GDN WY matrix: T = (I + L)^-1 where L_rc = beta_r * ratio_rc * (k_r . k_c) for r > c
+    // Letting A = -L, T = (I - A)^-1 = (I + A)(I + A^2)(I + A^4)(I + A^8) — EXACT in 3 squarings, ZERO SOLVE_TRI!
+    const float a_val = (r > c) ? (-bh[r] * ratio_rc * kk) : 0.0f;
+    sm_A[tid]  = a_val;
+    sm_P[tid]  = a_val;
+    sm_T[tid]  = (r == c) ? 1.0f : a_val;
+    sm_QK[tid] = (r >= c) ? (ratio_rc * qk) : 0.0f;
+    __syncthreads();
+
+    // Step 3: Exact Neumann Series Inverse (C=16 -> 3 parallel matmul squarings, ZERO SOLVE_TRI!)
+    #pragma unroll
+    for (uint32_t s = 0u; s < 3u; ++s) {
+        // sm_tmp = P * P
+        float p2 = 0.0f;
+        if (r > c) {
+            #pragma nounroll
+            for (uint32_t k = c + 1u; k < r; ++k) p2 = fmaf(sm_P[r * C + k], sm_P[k * C + c], p2);
+        }
+        sm_tmp[tid] = p2;
+        __syncthreads();
+        sm_P[tid] = p2;
+        __syncthreads();
+
+        // sm_tmp = T + T * P
+        float tp = sm_T[tid];
+        if (r > c) {
+            #pragma nounroll
+            for (uint32_t k = c + 1u; k <= r; ++k) tp = fmaf(sm_T[r * C + k], sm_P[k * C + c], tp);
+        }
+        sm_tmp[tid] = tp;
+        __syncthreads();
+        sm_T[tid] = tp;
+        __syncthreads();
+    }
+
+    // Step 4: For each V-column j (strided across 256 threads in 16-column groups: r = token, c -> Dv):
+    //   1) Predict state contribution on K: s_k[t, j] = sum_i (cum_g[t] * K[t,i]) * S[i,j]
+    //   2) rhs[t, j] = beta[t] * (V[t, j] - s_k[t, j])
+    //   3) dv[t, j]  = sum_{u<=t} T[t, u] * rhs[u, j]   (WY exact chunk delta!)
+    //   4) O[t, j]   = sum_i (cum_g[t] * Q[t,i]) * S[i,j] + sum_{u<=t} QK[t, u] * dv[u, j]
+    //   5) Update S[i, j] = cum_g[C-1] * S[i, j] + sum_{u=0..C-1} (cum_g[C-1]/cum_g[u]) * K[u, i] * dv[u, j]
+    __shared__ float sm_rhs[C * C]; // [C tokens x 16 V-cols tile]
+    __shared__ float sm_dv[C * C];
+
+    const float g_end = sm_cum_g[C - 1u];
+
+    for (uint32_t j0 = 0u; j0 < Dv; j0 += 16u) {
+        const uint32_t j = j0 + c;
+        const bool j_valid = (j < Dv);
+
+        float sk = 0.0f, sq = 0.0f;
+        if (j_valid) {
+            const float* kr = Kh + r * Dk;
+            const float* qr = Qh + r * Dk;
+            #pragma nounroll
+            for (uint32_t i = 0u; i < Dk; ++i) {
+                const float sij = Sh[i * Dv + j];
+                sk = fmaf(kr[i], sij, sk);
+                sq = fmaf(qr[i], sij, sq);
+            }
+            sk *= sm_cum_g[r];
+            sq *= sm_cum_g[r];
+            sm_rhs[tid] = bh[r] * (Vh[r * Dv + j] - sk);
+        } else {
+            sm_rhs[tid] = 0.0f;
+        }
+        __syncthreads();
+
+        // dv[r, j] = sum_{u<=r} T[r, u] * rhs[u, j]
+        float dv_rj = 0.0f;
+        #pragma nounroll
+        for (uint32_t u = 0u; u <= r; ++u) {
+            dv_rj = fmaf(sm_T[r * C + u], sm_rhs[u * C + c], dv_rj);
+        }
+        sm_dv[tid] = dv_rj;
+        __syncthreads();
+
+        // Output O[r, j] = sq + sum_{u<=r} QK[r, u] * dv[u, j]
+        if (j_valid) {
+            float intra = 0.0f;
+            #pragma nounroll
+            for (uint32_t u = 0u; u <= r; ++u) {
+                intra = fmaf(sm_QK[r * C + u], sm_dv[u * C + c], intra);
+            }
+            Oh[r * Dv + j] = sq + intra;
+
+            // Update S[i, j] for i = r, r+16, ...
+            #pragma nounroll
+            for (uint32_t i = r; i < Dk; i += C) {
+                float s_upd = g_end * Sh[i * Dv + j];
+                #pragma nounroll
+                for (uint32_t u = 0u; u < C; ++u) {
+                    const float scale_u = g_end / fmaxf(sm_cum_g[u], 1e-30f);
+                    s_upd = fmaf(scale_u * Kh[u * Dk + i], sm_dv[u * C + c], s_upd);
+                }
+                Sh[i * Dv + j] = s_upd;
+            }
+        }
+        __syncthreads();
+    }
+}
+
+// ============================================================================
+// 2. Universal ReplaySSM Decode Kernel (Mamba-2 / GDN / KDA, ZERO HBM2 state write on non-flush!)
+//    Grid: H * 64 (1 Wave64 per head), Block: 64
+//    Supports Dk <= 64, Dv <= 64, replay_len <= 16; strictly 0 B spill!
+//    family: 0=Mamba2, 1=GDN, 2=KDA
+//    flush_ckpt: 0 -> read-only S_ckpt (ZERO HBM2 writes to S_ckpt!); 1 -> also flush S_ckpt!
+// ============================================================================
+extern "C" __global__ __launch_bounds__(64, 2)
+void vj_replay_ssm_decode_kernel(
+    float*       __restrict__ S_ckpt,    // [H, Dk, Dv] (read-only when flush_ckpt == 0!)
+    const float* __restrict__ Q_buf,     // [L, H, Dk]
+    const float* __restrict__ K_buf,     // [L, H, Dk]
+    const float* __restrict__ V_buf,     // [L, H, Dv]
+    const float* __restrict__ decay_buf, // [L, H] (Mamba2/GDN) or [L, H, Dk] (KDA)
+    const float* __restrict__ beta_buf,  // [L, H]
+    float*       __restrict__ y_out,     // [H, Dv] (output for last step replay_len-1)
+    uint32_t H,
+    uint32_t Dk,
+    uint32_t Dv,
+    uint32_t replay_len,
+    uint32_t family,
+    uint32_t flush_ckpt) {
+
+    const uint32_t h    = blockIdx.x;
+    const uint32_t lane = threadIdx.x; // handles column j = lane (Dv <= 64)
+    if (h >= H) return;
+
+    __shared__ float sm_hist_k[16 * 64];  // [16, Dk] decayed low-rank keys (4 KiB LDS)
+    __shared__ float sm_hist_dv[16 * 64]; // [16, Dv] delta-v vectors (4 KiB LDS)
+    __shared__ float sm_cum_d[64];        // [Dk] cumulative decay from checkpoint
+    __shared__ float sm_dots[16];         // scalar dot products
+
+    if (lane < Dk) sm_cum_d[lane] = 1.0f;
+    __syncthreads();
+
+    float* Sh = S_ckpt + static_cast<uint64_t>(h) * Dk * Dv;
+
+    for (uint32_t t = 0u; t < replay_len; ++t) {
+        const float* kh = K_buf + (static_cast<uint64_t>(t) * H + h) * Dk;
+        const float* vh = V_buf + (static_cast<uint64_t>(t) * H + h) * Dv;
+        const float  beta = (family == 0u) ? 1.0f : beta_buf[t * H + h];
+
+        // Update cumulative decay & decay historical keys
+        if (lane < Dk) {
+            const float d_step = (family == 2u)
+                                 ? decay_buf[(static_cast<uint64_t>(t) * H + h) * Dk + lane]
+                                 : decay_buf[t * H + h];
+            sm_cum_d[lane] *= d_step;
+            for (uint32_t u = 0u; u < t; ++u) sm_hist_k[u * 64u + lane] *= d_step;
+        }
+        __syncthreads();
+
+        // Compute dot(hist_k[u], k_t) for u < t
+        for (uint32_t u = 0u; u < t; ++u) {
+            float p = (lane < Dk) ? (sm_hist_k[u * 64u + lane] * kh[lane]) : 0.0f;
+            float s = vegajet::ssmdev::wave64_sum(p);
+            if (lane == 0u) sm_dots[u] = s;
+        }
+        __syncthreads();
+
+        // Compute dv_t[lane] for j = lane < Dv
+        if (lane < Dv) {
+            float dv_val = vh[lane];
+            if (family != 0u) {
+                float pred = 0.0f;
+                #pragma nounroll
+                for (uint32_t i = 0u; i < Dk; ++i) {
+                    pred = fmaf(sm_cum_d[i] * kh[i], Sh[i * Dv + lane], pred);
+                }
+                for (uint32_t u = 0u; u < t; ++u) {
+                    pred = fmaf(sm_dots[u], sm_hist_dv[u * 64u + lane], pred);
+                }
+                dv_val = beta * (vh[lane] - pred);
+            }
+            sm_hist_dv[t * 64u + lane] = dv_val;
+        }
+        if (lane < Dk) sm_hist_k[t * 64u + lane] = kh[lane];
+        __syncthreads();
+    }
+
+    // Emit final output y for step replay_len - 1
+    const uint32_t last = replay_len - 1u;
+    const float* qh = Q_buf + (static_cast<uint64_t>(last) * H + h) * Dk;
+    for (uint32_t u = 0u; u < replay_len; ++u) {
+        float p = (lane < Dk) ? (sm_hist_k[u * 64u + lane] * qh[lane]) : 0.0f;
+        float s = vegajet::ssmdev::wave64_sum(p);
+        if (lane == 0u) sm_dots[u] = s;
+    }
+    __syncthreads();
+
+    if (lane < Dv) {
+        float y = 0.0f;
+        #pragma nounroll
+        for (uint32_t i = 0u; i < Dk; ++i) {
+            y = fmaf(sm_cum_d[i] * qh[i], Sh[i * Dv + lane], y);
+        }
+        for (uint32_t u = 0u; u < replay_len; ++u) {
+            y = fmaf(sm_dots[u], sm_hist_dv[u * 64u + lane], y);
+        }
+        y_out[static_cast<uint64_t>(h) * Dv + lane] = y;
+
+        // ONLY write S_ckpt back to HBM2 on checkpoint flush (every L=16 tokens)!
+        if (flush_ckpt != 0u) {
+            #pragma nounroll
+            for (uint32_t i = 0u; i < Dk; ++i) {
+                float s_new = sm_cum_d[i] * Sh[i * Dv + lane];
+                for (uint32_t u = 0u; u < replay_len; ++u) {
+                    s_new = fmaf(sm_hist_k[u * 64u + i], sm_hist_dv[u * 64u + lane], s_new);
+                }
+                Sh[i * Dv + lane] = s_new;
+            }
+        }
+    }
+}

@@ -1,0 +1,171 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+#pragma once
+#include <stdint.h>
+#include <math.h>
+#ifdef __HIPCC__
+#include <hip/hip_runtime.h>
+#endif
+
+// Experimental algebraic tree-WY verification, NOT a bit-exact replacement.
+// Raw recurrent output only: no convolution, normalization, gate, or quantizer.
+// Fixed 32 V heads, 8 Q/K heads, dimension 128; grid=128, block=256.
+// Inputs q/k: [M][8][128], v: [M][32][128], decay/beta: [M][32].
+// parent[i] is -1 (S0) or in [0,i); M must be 5,8,12. All pointers
+// nonnull and disjoint. One layer per launch. No cross-WG synchronization.
+// Records: 128 structs, durable until commit. Temporary input/output buffers
+// may be poisoned after verification. No external triangular solver, replay,
+// FP16, or non-temporal active-state reads. Commit needs records ONLY.
+// accepted=0 restores S0; otherwise selects node accepted-1 and its ancestors.
+// For chronological prefixes use parent[i]=i-1. No host integration implied.
+namespace vegajet { namespace treewy {
+constexpr int max_m = 12;
+struct Record {
+    float initial[128 * 32];
+    float key[max_m * 128];
+    float path[max_m * max_m]; // path[i,j]: decay from AFTER ancestor j to i
+    float root[max_m];        // decay from S0 to node i
+    float delta[max_m * 32];  // solved FP32 WY rank-one coefficients
+};
+#ifdef __HIPCC__
+#define VJ_TREEWY_HD __host__ __device__
+#else
+#define VJ_TREEWY_HD
+#endif
+// Deliberately match production's 16-FMA partials and left-to-right sum8.
+VJ_TREEWY_HD inline float dot128(const float* a, const float* b) {
+    float p[8];
+    for (int g=0; g<8; ++g) {
+        float x=0.0f;
+        for (int r=0; r<16; ++r) x=fmaf(a[g*16+r],b[g*16+r],x);
+        p[g]=x;
+    }
+    float x=p[0];
+    for (int g=1; g<8; ++g) x=x+p[g];
+    return x;
+}
+#undef VJ_TREEWY_HD
+#ifdef __HIPCC__
+__device__ inline float sum8(const float* a, int c) {
+    float x=a[c];
+    for (int r=1; r<8; ++r) x=x+a[r*32+c];
+    return x;
+}
+#endif
+} }
+
+#ifdef __HIPCC__
+extern "C" __global__ __launch_bounds__(256,4)
+void vj_gdn_treewy_verify_kernel(
+    const float* initial, const float* q, const float* k, const float* v,
+    const float* decay, const float* beta, const int* parent,
+    float* output, vegajet::treewy::Record* records, int M) {
+    using namespace vegajet::treewy;
+    if ((M!=5 && M!=8 && M!=12) || blockIdx.x>=128 || blockDim.x!=256) return;
+    const int t=threadIdx.x, head=blockIdx.x/4, part=blockIdx.x%4;
+    const int col=t%32, rg=t/32, hk=head%8;
+    __shared__ float s0[4096], keys[1536], queries[1536];
+    __shared__ float path[144], root[12], b[144], bn[144];
+    __shared__ float x[384], xn[384], partial[256];
+    __shared__ int valid;
+    if (t==0) {
+        valid=1;
+        for (int i=0;i<M;++i) if (parent[i]<-1 || parent[i]>=i) valid=0;
+    }
+    __syncthreads();
+    if (!valid) return;
+    Record& rec=records[blockIdx.x];
+    // Exactly one ordinary cached global read per S0 element per verify.
+    for (int e=t;e<4096;e+=256) {
+        const float z=initial[head*16384+(e/32)*128+part*32+e%32];
+        s0[e]=z; rec.initial[e]=z;
+    }
+    for (int e=t;e<M*128;e+=256) {
+        keys[e]=k[(e/128*8+hk)*128+e%128];
+        queries[e]=q[(e/128*8+hk)*128+e%128];
+        rec.key[e]=keys[e];
+    }
+    if (t<M) {
+        float d=1.0f;
+        for (int j=0;j<M;++j) path[t*12+j]=0.0f;
+        int j=t;
+        while (j>=0) {
+            path[t*12+j]=d;
+            d=d*decay[j*32+head];
+            j=parent[j];
+        }
+        root[t]=d; rec.root[t]=d;
+        for (j=0;j<M;++j) rec.path[t*12+j]=path[t*12+j];
+    }
+    __syncthreads();
+    // Strict ancestor matrix B=-T. (I+T)delta=beta*(v-root*S0^T k).
+    for (int e=t;e<M*M;e+=256) {
+        const int i=e/M,j=e%M;
+        b[i*12+j]=(j<i && path[i*12+j]!=0.0f)
+            ? -(beta[i*32+head]*path[i*12+j]*dot128(keys+i*128,keys+j*128)) : 0.0f;
+    }
+    for (int i=0;i<M;++i) {
+        float p=0.0f;
+        for (int r=0;r<16;++r)
+            p=fmaf(s0[(rg*16+r)*32+col],keys[i*128+rg*16+r],p);
+        partial[t]=p;
+        __syncthreads();
+        if (t<32) x[i*32+t]=beta[i*32+head]*(v[(i*32+head)*128+part*32+t]-root[i]*sum8(partial,t));
+        __syncthreads();
+    }
+    // Nilpotent inverse by doubling: x <- (I+B)x, B <- B^2.
+    // After ceil(log2 M) rounds x=(I+B0+...+B0^(M-1))*rhs.
+    // This is a true unit-triangular/WY solve, NOT chronological state replay.
+    for (int span=1;span<M;span*=2) {
+        for (int e=t;e<M*32;e+=256) {
+            const int i=e/32,c=e%32;
+            float z=x[e];
+            for (int j=0;j<i;++j) z=fmaf(b[i*12+j],x[j*32+c],z);
+            xn[e]=z;
+        }
+        for (int e=t;e<M*M;e+=256) {
+            const int i=e/M,j=e%M;
+            float z=0.0f;
+            for (int l=j+1;l<i;++l) z=fmaf(b[i*12+l],b[l*12+j],z);
+            bn[i*12+j]=z;
+        }
+        __syncthreads();
+        for (int e=t;e<M*32;e+=256) x[e]=xn[e];
+        for (int e=t;e<M*M;e+=256) b[e/M*12+e%M]=bn[e/M*12+e%M];
+        __syncthreads();
+    }
+    for (int e=t;e<M*32;e+=256) rec.delta[e]=x[e];
+    // Reconstruct each node directly from S0 and ancestor WY terms.
+    for (int i=0;i<M;++i) {
+        float o=0.0f;
+        for (int r=0;r<16;++r) {
+            const int row=rg*16+r;
+            float z=root[i]*s0[row*32+col];
+            for (int j=0;j<=i;++j) if (path[i*12+j]!=0.0f)
+                z=fmaf(keys[j*128+row],path[i*12+j]*x[j*32+col],z);
+            o=fmaf(z,queries[i*128+row],o);
+        }
+        partial[t]=o;
+        __syncthreads();
+        if (t<32) output[(i*32+head)*128+part*32+t]=sum8(partial,t);
+        __syncthreads();
+    }
+}
+
+extern "C" __global__ __launch_bounds__(256)
+void vj_gdn_treewy_commit_kernel(const vegajet::treewy::Record* records,
+                                float* state, int M, int accepted) {
+    using namespace vegajet::treewy;
+    if ((M!=5 && M!=8 && M!=12) || accepted<0 || accepted>M || blockIdx.x>=128 || blockDim.x!=256) return;
+    const Record& rec=records[blockIdx.x];
+    const int head=blockIdx.x/4,part=blockIdx.x%4,i=accepted-1;
+    for (int e=threadIdx.x;e<4096;e+=256) {
+        float z=rec.initial[e];
+        if (accepted!=0) {
+            z=rec.root[i]*z;
+            for (int j=0;j<=i;++j) if (rec.path[i*12+j]!=0.0f)
+                z=fmaf(rec.key[j*128+e/32],rec.path[i*12+j]*rec.delta[j*32+e%32],z);
+        }
+        state[head*16384+(e/32)*128+part*32+e%32]=z;
+    }
+}
+#endif

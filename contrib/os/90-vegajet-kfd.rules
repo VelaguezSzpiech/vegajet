@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# Inert template: nothing in the VegaJet tree installs or reloads udev rules. Copy by hand after review.
+# Grants the local GPU access group read+write on the KFD node. Replace "render" if the host uses another group.
+KERNEL=="kfd", SUBSYSTEM=="misc", GROUP="render", MODE="0660"

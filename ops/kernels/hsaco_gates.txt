@@ -1,0 +1,144 @@
+# gfx906 code-object gate manifest: one line per kernel in every .hsaco.
+#   <kernel> <class> [waiver_vgpr_ceiling]
+# class  stream : standalone streaming GEMV (decode M=1 weight streams, LM head)  -> vgpr_count <= 48 (5 waves/SIMD)
+#        tiled  : persistent super-kernels, tiled GEMMs and everything else       -> vgpr_count <= 64 (4 waves/SIMD)
+# Every kernel must also have private_segment_fixed_size == 0 and < 24576 B of machine code.
+# A waiver is a ratchet for a kernel that exceeds its class limit today: the build and the loader fail if
+# vgpr_count rises above the ceiling, and also fail once the kernel fits its class (then delete the waiver).
+# An unlisted kernel fails the gate, so new kernels must be classified here.
+
+vegajet_megakernel_vm tiled
+kfd_memcpy_u32 tiled
+kfd_memset_u32 tiled
+kfd_stamp_clock_u64 tiled
+vj_flash_decode_mixed_kv_kernel tiled
+vj_flash_decode_lse_merge_kernel tiled
+ornith_embed_q8_kernel tiled
+ornith_rms_quant_q8_kernel tiled
+ornith_p2p_ar_res_rms_quant_kernel tiled
+ornith_p2p_ar_res_rms_quant_prepush_kernel tiled
+ornith_gemv_q4a8_m1_w32_kernel stream
+ornith_gemv_q4a8_m1_w16_kernel stream
+ornith_gemm_q4a8_tcc_kernel tiled 73
+ornith_gemm_q4a8_m8_kernel tiled
+ornith_gemm_q4a8_m12_kernel tiled
+ornith_gemm_q4a8_m16_l2_kernel tiled
+ornith_gdn_conv_l2_gate_kernel tiled
+ornith_gdn_recur_quant_kernel tiled
+ornith_gdn_wy_prefill_quant_kernel tiled 70
+ornith_attn_qkv_prep_kernel tiled
+ornith_attn_flash_quant_kernel tiled
+ornith_attn_prep_flash_m1_kernel tiled
+ornith_moe_router_fp16_logits_kernel tiled
+ornith_moe_router_top8_kernel tiled
+ornith_swiglu_quant_q8_kernel tiled
+ornith_moe_gu_iq2s_merged_kernel stream 55
+ornith_moe_down_iq3xxs_split_kernel stream
+ornith_moe_group_sort_kernel tiled
+ornith_moe_gu_iq2s_grouped_kernel tiled 81
+ornith_moe_down_iq3xxs_grouped_kernel tiled
+ornith_vocab_argmax_q8_kernel stream
+ornith_vocab_logits_q8_kernel stream
+ornith_vocab_argmax_q8_batch6_kernel stream
+ornith_vocab_argmax_q8_batch12_l2_kernel stream
+ornith_vocab_argmax_q8_batch16_l2_kernel tiled
+ornith_mtp_eh_norm_cat_q8_kernel tiled
+ornith_moe_gu_q4a8_kernel stream 58
+ornith_moe_down_q4a8_kernel stream
+vj_quant_act_q4_dot8_kernel tiled
+vj_gemv_q8_dp4a_kernel stream
+vj_gemv_q8_dp4a_tcc_xor_kernel stream
+vj_gemv_q4_dot8_kernel stream
+vj_gemv_q4_dot8_tcc_xor_kernel stream
+vj_gemm_q8_dp4a_tiled_kernel tiled
+vj_gemm_q4_dot8_tiled_kernel tiled
+vj_vocab_q8_dp4a_argmax_kernel stream 63
+vj_vocab_q8_dp4a_argmax_batch_kernel stream 63
+vj_gemm_q8_dp4a_tiled_64x32_kernel tiled 77
+vj_gemm_q8_dp4a_tiled_32x32x128_splitk_kernel tiled
+vj_gemm_f16_fdot2_tiled_kernel tiled
+vj_gemv_q8_dp4a_splitk_p1_kernel stream
+vj_splitk_reduce_f32_kernel tiled
+vj_gemv_q4a8_splitk_p1_kernel stream
+vj_splitk_reduce_prepush_f32_kernel tiled
+vj_gemv_q4a8_w64_kernel stream
+vj_gemv_q4a8_w64_1r_kernel stream
+vj_gemv_q4k_stream_kernel stream
+vj_ssm_wy_neumann_chunk16_kernel tiled
+vj_replay_ssm_decode_kernel tiled
+kfd_soak_fill_u32x4 tiled
+kfd_soak_verify_u32x4 tiled
+ornith_p2p_ar_i8_res_rms_quant_kernel tiled
+ornith_moe_m1_router_shared_kernel tiled
+ornith_p2p_ar_moe_m1_front_kernel tiled
+ornith_p2p_ar_moe_m1_front_s240_kernel tiled
+ornith_moe_m1_rtr_shgu_kernel stream
+ornith_moe_m1_top8_swiglu_kernel tiled
+ornith_gdn_recur_splitv_quant_kernel stream
+ornith_gdn_conv_recur_splitv_quant_m1_kernel tiled
+ornith_moe_m1_back_kernel tiled
+ornith_moe_m1_back_s224_kernel tiled
+ornith_moe_m1_back_s240_kernel tiled
+ornith_moe_gu_iq2s_m1_8r_kernel stream
+ornith_moe_gu_iq2s_m1_8r_nolut_kernel stream
+ornith_moe_gu_iq2s_m1_16r_kernel stream
+ornith_moe_gu_iq2s_m1_16r_g32_kernel stream
+ornith_moe_gu_iq2s_m1_8r_g32_kernel stream
+ornith_moe_mid_f32_to_q8_kernel tiled
+ornith_moe_down_d8_sh_m1_kernel stream
+vj_spec_flash_partial_kernel stream
+vj_spec_flash_merge_quant_kernel stream
+vj_flash_splitkv_any_partial_kernel stream
+vj_flash_splitkv_any_merge_quant_kernel stream
+vj_spec_gdn_verify_kernel stream
+vj_spec_gdn_norm_quant_kernel stream
+vj_moe_down_dot8_kernel stream
+vj_moe_down_dot8_prepush_kernel stream
+vj_moe_gu_dot8_kernel stream
+vj_moe_gu_dot8_cached_kernel stream
+vj_moe_gu_q3_kernel stream
+vj_repack_iq2s_to_dot8_gu_kernel stream
+vj_moe_gu_dot8_lru_kernel tiled
+ornith_p2p_ar_res_rms_quant_ts_kernel tiled
+ornith_p2p_ar_res_rms_quant_ref_kernel tiled
+vj_moe_route_group_kernel tiled
+vj_moe_down_grouped_dp_kernel tiled
+vj_moe_down_grouped_f32_kernel tiled
+vj_moe_down_combine_dp_kernel stream
+vj_moe_down_combine_f32_kernel stream
+vj_prefill_fa2_quant_kernel tiled
+vj_prefill_fa2_quant_f32q_kernel tiled
+vj_prefill_gqa_fa2 tiled
+vj_prefill_gemm_q4a8_64x128_kernel tiled
+vj_prefill_gemm_q4a8_64x64_kernel tiled
+vj_prefill_moe_gu_iq2s_tiled_kernel tiled
+vj_prefill_gdn_splitv_batch_kernel tiled
+vj_prefill_gdn_conv_l2_gate_kernel tiled
+vj_prefill_gdn_normq_kernel tiled
+vj_prefill_gdn_wy_split_kernel tiled
+vj_prefill_gdn_128wg tiled
+vj_prefill_gdn_128wg_normq tiled
+vj_prefill_moe_down_iq3_tiled_kernel tiled
+vj_moe_down_combine_all_f32_kernel stream
+vj_prefill_router_fp16_tiled_kernel tiled
+ornith_vocab_argmax_q8_mubuf_kernel stream
+vj_prefill_q8_to_q4_kernel stream
+vj_prefill_gemm_q4a4_64x128_dot8_kernel tiled
+vj_prefill_gemm_q4a4_64x64_dot8_kernel tiled
+vj_prefill_moe_gu_iq2s_dot8_kernel tiled
+vj_prefill_moe_down_dot8_tiled_kernel tiled
+ornith_m1_gdn_super_kernel tiled
+ornith_m1_gqa_super_kernel tiled
+ornith_m1_moe_super_kernel tiled
+ornith_m1_moe_super_q3_kernel tiled
+vj_dflash2_tap_copy_kernel tiled
+vj_dflash2_quant_q8_kernel tiled
+vj_dflash2_embed_block_kernel tiled
+vj_dflash2_dyn_conv_kernel tiled
+vj_dflash2_kv_inject_kernel tiled
+vj_dflash2_attn_kernel tiled
+vj_dflash2_swiglu_quant_kernel tiled
+vj_dflash2_vocab_topk16_kernel tiled
+vj_vm_attn_block tiled
+vj_vm_ffn_block tiled
+vj_vm_aux_block tiled

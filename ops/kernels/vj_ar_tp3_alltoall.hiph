@@ -1,0 +1,245 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+#pragma once
+#if defined(__HIPCC__)
+#include <hip/hip_runtime.h>
+#endif
+#include <cstdint>
+#include <cstddef>
+
+// Three 3072-element partials -> full replica on every rank. Launch <<<1,64>>>
+// once per GPU. Each inbox has TWO parity banks, each 3*lines(wire) Slots.
+// All buffers are disjoint; only inbox[rank] is polled. Peer mappings must allow
+// system-coherent writes (NC), final epoch lines UC. Initialize inboxes/status
+// to zero. Epochs start at 1, advance by one, never wrap. Rank-local launches
+// and output reads are ordered before that rank's next publication; no global
+// host retirement is needed. After ANY timeout/error stop all ranks permanently.
+// Two banks suffice: publishing e+2 requires consuming e+1, whose slowest
+// producer already consumed e. Reject the whole output on nonzero status.
+namespace vj_tp3 {
+constexpr unsigned length=3072, tiles=96;
+enum class Wire : unsigned { fp16, int8 };
+enum class Partition : unsigned { symmetric, weighted };
+struct alignas(64) Slot { uint32_t words[16]; }; // One cacheline, not one tile.
+static_assert(sizeof(Slot)==64, "cacheline");
+#if defined(__HIPCC__)
+#define VJ_TP3_HD __host__ __device__
+#else
+#define VJ_TP3_HD
+#endif
+VJ_TP3_HD constexpr unsigned block_bytes(Wire w) { return w==Wire::fp16 ? 64 : 34; }
+VJ_TP3_HD constexpr unsigned payload_bytes(Wire w) { return tiles*block_bytes(w); }
+VJ_TP3_HD constexpr unsigned lines(Wire w) { return (payload_bytes(w)+4+63)/64; }
+VJ_TP3_HD constexpr unsigned epoch_word(Wire w) { return lines(w)*16-1; }
+VJ_TP3_HD constexpr unsigned bank_frame(unsigned rank,unsigned epoch) {
+    return (epoch&1u)*3+rank;
+}
+VJ_TP3_HD inline uint32_t* word(Slot* p,unsigned rank,unsigned i,Wire w) {
+    return &p[rank*lines(w)+i/16].words[i%16];
+}
+// Actual contiguous tile ranges. Each WG visits its own range first, then the
+// next two ranges; every rank still sends its entire partial before polling.
+VJ_TP3_HD constexpr unsigned range_begin(unsigned r,Partition p) {
+    return p==Partition::symmetric ? r*32 : (r==0 ? 0 : r==1 ? 30 : r==2 ? 63 : 96);
+}
+VJ_TP3_HD inline uint32_t bits(float x) { union { float f; uint32_t u; } v{x}; return v.u; }
+VJ_TP3_HD inline float value(uint32_t x) { union { uint32_t u; float f; } v{x}; return v.f; }
+VJ_TP3_HD inline uint16_t to_half(float x) {
+    const uint32_t u=bits(x), sign=(u>>16)&0x8000;
+    int e=int((u>>23)&255)-127;
+    uint32_t m=u&0x7fffff;
+    if(e==128) return uint16_t(sign|(m ? 0x7e00 : 0x7c00));
+    if(e>15) return uint16_t(sign|0x7c00);
+    if(e< -25) return uint16_t(sign);
+    if(e< -14) {
+        m|=0x800000;
+        unsigned shift=unsigned(-e-1);
+        uint32_t q=m>>shift, rem=m&((1u<<shift)-1);
+        q+=rem>(1u<<(shift-1)) || (rem==(1u<<(shift-1)) && (q&1));
+        return uint16_t(sign|q);
+    }
+    uint32_t q=(unsigned(e+15)<<10)|(m>>13);
+    q+=(m&8191)>4096 || ((m&8191)==4096 && (q&1));
+    return uint16_t(sign|q);
+}
+VJ_TP3_HD inline float from_half(uint16_t h) {
+    unsigned e=(h>>10)&31, m=h&1023;
+    float x=e==0 ? float(m)*0x1p-24f : e==31 ? value(m ? 0x7fc00000 : 0x7f800000) : value((e+112)<<23|m<<13);
+    return (h&0x8000) ? -x : x;
+}
+// RNE independent of the host rounding mode; ratio is finite and bounded.
+VJ_TP3_HD inline int quantize(float x,float d) {
+    float y=d==0 ? 0 : x/d, a=y<0 ? -y : y;
+    unsigned q=unsigned(a);
+    float rem=a-float(q);
+    q+=rem>0.5f || (rem==0.5f && (q&1));
+    if(q>127) q=127;
+    return y<0 ? -int(q) : int(q);
+}
+// Little-endian block32: FP16[32], or signed INT8[32] followed by FP16 scale.
+// Halfword stores give adjacent 34-byte blocks disjoint writers (no dword RMW).
+// Quantize using the stored rounded FP16 scale, including scale-underflow zero.
+VJ_TP3_HD inline bool pack(const float* x,uint16_t* p,Wire w) {
+    float a=0;
+    for(unsigned i=0;i<32;++i) {
+        float v=x[i]<0 ? -x[i] : x[i];
+        if(!(v<=65504.0f)) return false;
+        if(v>a) a=v;
+    }
+    if(w==Wire::fp16) {
+        for(unsigned i=0;i<32;++i) p[i]=to_half(x[i]);
+    } else {
+        uint16_t h=to_half(a/127.0f);
+        float d=from_half(h);
+        for(unsigned i=0;i<16;++i)
+            p[i]=uint16_t(uint8_t(quantize(x[2*i],d))) |
+                 uint16_t(uint16_t(uint8_t(quantize(x[2*i+1],d)))<<8);
+        p[16]=h;
+    }
+    return true;
+}
+#undef VJ_TP3_HD
+}
+
+#if defined(__HIPCC__)
+namespace vj_tp3 {
+__device__ __forceinline__ void posted_dword(uint32_t* p,uint32_t v) {
+    asm volatile("flat_store_dword %0, %1 glc slc" :: "v"(p), "v"(v) : "memory");
+}
+__device__ __forceinline__ void posted(uint32_t* p,uint32_t epoch) {
+    posted_dword(p,epoch);
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+}
+__device__ __forceinline__ void posted_half(uint16_t* p,unsigned v) {
+    asm volatile("flat_store_short %0, %1 glc slc" :: "v"(p), "v"(v) : "memory");
+}
+__device__ __forceinline__ uint32_t coherent(const uint32_t* p) {
+    uint32_t v;
+    asm volatile("flat_load_dword %0, %1 glc slc\n\ts_waitcnt vmcnt(0)" : "=v"(v) : "v"(p) : "memory");
+    return v;
+}
+__device__ __forceinline__ unsigned read_half(Slot* p,unsigned r,unsigned byte,Wire w) {
+    return (coherent(word(p,r,byte/4,w))>>((byte%4)*8))&65535;
+}
+}
+extern "C" __global__ __launch_bounds__(64)
+void vj_ar_tp3_alltoall(const float* partial,vj_tp3::Slot* inbox0,
+    vj_tp3::Slot* inbox1,vj_tp3::Slot* inbox2,float* output,
+    unsigned* error,unsigned rank,unsigned epoch,unsigned max_poll_iters,
+    vj_tp3::Wire wire,vj_tp3::Partition partition) {
+    using namespace vj_tp3;
+    if(!error) return;
+    if(rank>=3 || !epoch || blockDim.x!=64 || blockDim.y!=1 || blockDim.z!=1 ||
+       gridDim.x!=1 || gridDim.y!=1 || gridDim.z!=1 || !partial || !output ||
+       !inbox0 || !inbox1 || !inbox2 || unsigned(wire)>1 || unsigned(partition)>1 ||
+       (reinterpret_cast<uintptr_t>(inbox0)&63) || (reinterpret_cast<uintptr_t>(inbox1)&63) ||
+       (reinterpret_cast<uintptr_t>(inbox2)&63)) {
+        if(!threadIdx.x) atomicOr(error,1u);
+        return;
+    }
+    unsigned t=threadIdx.x;
+    Slot* local=rank==0 ? inbox0 : rank==1 ? inbox1 : inbox2;
+    unsigned previous=0;
+    if(!t) {
+        previous=coherent(word(local,bank_frame(rank,epoch-1),epoch_word(wire),wire));
+        if(previous!=epoch-1) atomicOr(error,8u);
+        unsigned current=coherent(word(local,bank_frame(rank,epoch),epoch_word(wire),wire));
+        if(current!=(epoch>2 ? epoch-2 : 0)) atomicOr(error,8u);
+        previous=atomicAdd(error,0u);
+    }
+    if(__shfl(previous,0)) return; // Sticky fail-stop, including nonconsecutive epochs.
+    unsigned frame=bank_frame(rank,epoch), bad=0;
+    #pragma nounroll
+    for(unsigned phase=0;phase<3;++phase) {
+        unsigned owner=(rank+phase)%3;
+        #pragma nounroll
+        for(unsigned tile=range_begin(owner,partition);tile<range_begin(owner+1,partition);++tile) {
+            float x=t<32 ? partial[tile*32+t] : 0.0f;
+            float a=x<0 ? -x : x;
+            bad|=!(a<=65504.0f);
+            unsigned offset=tile*(block_bytes(wire)/2)+t;
+            unsigned v=to_half(x);
+            if(wire==Wire::int8) {
+                a=bad ? 0.0f : a;
+                // All lanes participate in every shuffle, including lane 16
+                // which supplies a quantized pair before storing the scale.
+                #pragma nounroll
+                for(unsigned delta=16;delta;delta>>=1) a=fmaxf(a,__shfl_xor(a,delta,32));
+                unsigned h=to_half(a/127.0f);
+                unsigned q=uint8_t(quantize(bad ? 0.0f : x,from_half(uint16_t(h))));
+                unsigned pair=q|(__shfl_down(q,1,32)<<8);
+                unsigned paired=__shfl(pair,int(2*(t&15)),32);
+
+                v=t==16 ? h : paired;
+                if(t<17) {
+                    posted_half(reinterpret_cast<uint16_t*>(inbox0+frame*lines(wire))+offset,v);
+                    posted_half(reinterpret_cast<uint16_t*>(inbox1+frame*lines(wire))+offset,v);
+                    posted_half(reinterpret_cast<uint16_t*>(inbox2+frame*lines(wire))+offset,v);
+                }
+            } else {
+                unsigned pair=v|(__shfl_down(v,1,32)<<16);
+                pair=__shfl(pair,int(2*(t&15)),32);
+                if(t<16) {
+                    unsigned i=tile*16+t;
+                    posted_dword(word(inbox0,frame,i,wire),pair);
+                    posted_dword(word(inbox1,frame,i,wire),pair);
+                    posted_dword(word(inbox2,frame,i,wire),pair);
+                }
+            }
+        }
+    }
+    if(__ballot(bad)!=0) {
+        if(!t) atomicOr(error,2u);
+        #pragma nounroll
+        for(unsigned i=t;i<length;i+=64) output[i]=value(0x7fc00000);
+        return; // Partial bytes are not published.
+    }
+    #pragma nounroll
+    for(unsigned i=payload_bytes(wire)/4+t;i<epoch_word(wire);i+=64) {
+        posted_dword(word(inbox0,frame,i,wire),0);
+        posted_dword(word(inbox1,frame,i,wire),0);
+        posted_dword(word(inbox2,frame,i,wire),0);
+    }
+    asm volatile("s_waitcnt vmcnt(0)" ::: "memory"); // Drain posted payload and padding before epoch.
+    __threadfence_system(); // Every lane completes/releases its own payload.
+    __syncthreads(); // Entire wave reaches release before lane 0 publishes.
+    unsigned ready=0;
+    if(!t) {
+        posted(word(inbox0,frame,epoch_word(wire),wire),epoch);
+        posted(word(inbox1,frame,epoch_word(wire),wire),epoch);
+        posted(word(inbox2,frame,epoch_word(wire),wire),epoch);
+        __threadfence_system();
+        #pragma nounroll
+        for(unsigned n=0;n<max_poll_iters;++n) {
+            unsigned a=coherent(word(local,bank_frame(0,epoch),epoch_word(wire),wire));
+            unsigned b=coherent(word(local,bank_frame(1,epoch),epoch_word(wire),wire));
+            unsigned c=coherent(word(local,bank_frame(2,epoch),epoch_word(wire),wire));
+            if(a==epoch && b==epoch && c==epoch) { ready=1; break; }
+            if(a>epoch || b>epoch || c>epoch) break;
+            asm volatile("s_sleep 1" ::: "memory");
+        }
+        if(!ready) atomicOr(error,4u);
+    }
+    ready=__shfl(ready,0);
+    __syncthreads();
+    __threadfence_system();
+    #pragma nounroll
+    for(unsigned i=t;i<length;i+=64) {
+        float result=value(0x7fc00000);
+        if(ready) {
+            #pragma nounroll
+            for(unsigned r=0;r<3;++r) {
+                unsigned source=bank_frame(r,epoch);
+                float v;
+                if(wire==Wire::fp16) v=from_half(uint16_t(read_half(local,source,i*2,wire)));
+                else {
+                    unsigned base=(i/32)*34, byte=base+i%32;
+                    unsigned q=(coherent(word(local,source,byte/4,wire))>>((byte%4)*8))&255;
+                    v=from_half(uint16_t(read_half(local,source,base+32,wire)))*float(q<128 ? int(q) : int(q)-256);
+                }
+                result=r==0 ? v : __fadd_rn(result,v);
+            }
+        }
+        output[i]=result;
+    }
+}
+#endif

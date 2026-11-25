@@ -1,0 +1,390 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+// VJ_Q4_DOT8 M=1 routed-MoE tile bodies for gfx906: lossless 4-bit re-code of IQ3_XXS (Down) and IQ2_S
+// (Gate+Up), decoded in registers with v_perm_b32 + v_dot4_i32_i8. No codebook in LDS, no LDS gather.
+// Format, exactness proof and host layout: core/q4_dot8_repack.hpp.
+//
+//  * vj_dot8_down_row_iq3:  one Down row (cols = 512, 16 lanes x one 32-weight block), 8 routed slots, same
+//    LDS inputs (sm_mq / sm_md / sm_ids / sm_w) and same per-row float sum as kernel 9c / stage B of 9d.
+//  * vj_dot8_gu_row_iq2s:   one Gate+Up row pair (cols = 16 * n_it * 32), same LDS inputs (sm_xq / sm_xd) and
+//    the same (gate, up) row sums as kernel 9b / stage A of 9d.
+//  Both return the 16-lane-reduced value in every lane of the 16-lane group.
+//
+// Integer dot products are identical to 9b/9c (same int8 weights, exact int32 accumulation); the float scale
+// expressions and accumulation order are copied from 9b/9c, so the results are bit-identical, not just close.
+//
+// The constants below are visible to plain C++ so tests/test_q4_dot8.cpp can static_assert them against the
+// tables solved in core/q4_dot8_repack.hpp.
+#pragma once
+
+#include <stdint.h>
+
+namespace vegajet {
+namespace dot8_dev {
+
+// v_perm_b32 register lookup tables (see dot8_solve_iq3_tables / dot8_iq2_table_word).
+constexpr uint32_t kIq3ALo = 0xF8F807F8u;
+constexpr uint32_t kIq3AHi = 0x030707F8u;
+constexpr uint32_t kIq3BLo = 0xE4EC0BFCu;
+constexpr uint32_t kIq3BHi = 0x3D332BDCu;
+constexpr uint32_t kIq2Lo  = 0xF82B1908u;
+constexpr uint32_t kIq2Hi  = 0x0000D5E7u;
+
+} // namespace dot8_dev
+} // namespace vegajet
+
+#if defined(__HIP__)
+#include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+
+namespace vegajet {
+namespace dot8_dev {
+
+typedef uint32_t d8_u32x4 __attribute__((ext_vector_type(4)));
+typedef uint32_t d8_u32x2 __attribute__((ext_vector_type(2)));
+template <typename T>
+using GPtr = T __attribute__((address_space(1)))*;
+template <bool C, typename A, typename B> struct CondT { using type = A; };
+template <typename A, typename B> struct CondT<false, A, B> { using type = B; };
+
+__device__ __forceinline__ int32_t sdot4(uint32_t a, uint32_t b, int32_t c) {
+    return __builtin_amdgcn_sdot4(static_cast<int32_t>(a), static_cast<int32_t>(b), c, false);
+}
+
+// One-hit decode weight streams: glc=1 slc=1 (nontemporal), register targeted.
+__device__ __forceinline__ uint4 ldg_x4_nt(const uint4* p) {
+    const d8_u32x4 v = __builtin_nontemporal_load(reinterpret_cast<const d8_u32x4*>(p));
+    return make_uint4(v[0], v[1], v[2], v[3]);
+}
+__device__ __forceinline__ uint4 ldg_x4_nt(GPtr<const uint4> p) {
+    const d8_u32x4 v = __builtin_nontemporal_load(reinterpret_cast<GPtr<const d8_u32x4>>(p));
+    return make_uint4(v[0], v[1], v[2], v[3]);
+}
+__device__ __forceinline__ uint2 ldg_x2_nt(const uint2* p) {
+    const d8_u32x2 v = __builtin_nontemporal_load(reinterpret_cast<const d8_u32x2*>(p));
+    return make_uint2(v[0], v[1]);
+}
+__device__ __forceinline__ uint2 ldg_x2_nt(GPtr<const uint2> p) {
+    const d8_u32x2 v = __builtin_nontemporal_load(reinterpret_cast<GPtr<const d8_u32x2>>(p));
+    return make_uint2(v[0], v[1]);
+}
+__device__ __forceinline__ uint32_t ldg_u32_nt(const uint32_t* p) { return __builtin_nontemporal_load(p); }
+__device__ __forceinline__ uint32_t ldg_u32_nt(GPtr<const uint32_t> p) { return __builtin_nontemporal_load(p); }
+__device__ __forceinline__ uint32_t ldg_u16_nt(const uint16_t* p) { return __builtin_nontemporal_load(p); }
+__device__ __forceinline__ uint32_t ldg_u16_nt(GPtr<const uint16_t> p) { return __builtin_nontemporal_load(p); }
+
+// Pins a wave-uniform 64-bit byte offset into SGPRs so the compiler cannot re-associate it with the per-lane
+// offset (it otherwise emits one quarter-rate v_mad_u64_u32 + a 64-bit VGPR address per load instead of the
+// global_load saddr form). The pointer itself stays derived from the kernel argument (global address space).
+// Only call on values that are uniform across the wave.
+__device__ __forceinline__ uint64_t uniform_u64(uint64_t v) {
+    const uint32_t lo = __builtin_amdgcn_readfirstlane(static_cast<uint32_t>(v));
+    const uint32_t hi = __builtin_amdgcn_readfirstlane(static_cast<uint32_t>(v >> 32));
+    return (static_cast<uint64_t>(hi) << 32) | lo;
+}
+
+__device__ __forceinline__ float h2f(uint32_t h16) {
+    return __half2float(__ushort_as_half(static_cast<unsigned short>(h16 & 0xFFFFu)));
+}
+
+// 4 IQ3_XXS codes (bytes of `ws`, low nibble of each byte) -> 4 signed int8. 2 v_and + 2 v_perm + 1 v_xor.
+__device__ __forceinline__ uint32_t dec4_iq3(uint32_t ws) {
+    return __builtin_amdgcn_perm(kIq3AHi, kIq3ALo, ws & 0x0F0F0F0Fu) ^
+           __builtin_amdgcn_perm(kIq3BHi, kIq3BLo, ws & 0x07070707u);
+}
+// 4 IQ2_S codes (0..5) -> 4 signed int8. 1 v_and + 1 v_perm.
+__device__ __forceinline__ uint32_t dec4_iq2(uint32_t ws) {
+    return __builtin_amdgcn_perm(kIq2Hi, kIq2Lo, ws & 0x07070707u);
+}
+
+// Full 32-weight block dot (Down): low nibbles x activation bytes 0..15, high nibbles x bytes 16..31.
+__device__ __forceinline__ int32_t dot32_iq3(const uint4 w, const uint4 xa, const uint4 xb) {
+    int32_t dp = sdot4(dec4_iq3(w.x), xa.x, 0);
+    dp = sdot4(dec4_iq3(w.y), xa.y, dp);
+    dp = sdot4(dec4_iq3(w.z), xa.z, dp);
+    dp = sdot4(dec4_iq3(w.w), xa.w, dp);
+    dp = sdot4(dec4_iq3(w.x >> 4), xb.x, dp);
+    dp = sdot4(dec4_iq3(w.y >> 4), xb.y, dp);
+    dp = sdot4(dec4_iq3(w.z >> 4), xb.z, dp);
+    dp = sdot4(dec4_iq3(w.w >> 4), xb.w, dp);
+    return dp;
+}
+
+// IQ2_S half-block dots (one 4-bit scale per 16 weights, as in 9b): lo = weights 0..15, hi = 16..31.
+__device__ __forceinline__ int32_t dot16_lo_iq2(const uint4 w, const uint4 xa) {
+    int32_t dp = sdot4(dec4_iq2(w.x), xa.x, 0);
+    dp = sdot4(dec4_iq2(w.y), xa.y, dp);
+    dp = sdot4(dec4_iq2(w.z), xa.z, dp);
+    dp = sdot4(dec4_iq2(w.w), xa.w, dp);
+    return dp;
+}
+__device__ __forceinline__ int32_t dot16_hi_iq2(const uint4 w, const uint4 xb) {
+    int32_t dp = sdot4(dec4_iq2(w.x >> 4), xb.x, 0);
+    dp = sdot4(dec4_iq2(w.y >> 4), xb.y, dp);
+    dp = sdot4(dec4_iq2(w.z >> 4), xb.z, dp);
+    dp = sdot4(dec4_iq2(w.w >> 4), xb.w, dp);
+    return dp;
+}
+
+// 16-lane butterfly sum with the same partners and order as `v += __shfl_xor(v, 8|4|2|1, 16)` in 9b/9c
+// (float add is commutative, so the result is bit-identical), but via ds_swizzle bit-mask mode
+// (and = 0x1F, xor = 8/4/2/1): no lane-index VGPRs, unlike ds_bpermute.
+__device__ __forceinline__ float sum16(float v) {
+    v += __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(v), 0x201F));
+    v += __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(v), 0x101F));
+    v += __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(v), 0x4E, 0xF, 0xF, true));
+    v += __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(v), 0xB1, 0xF, 0xF, true));
+    return v;
+}
+
+// -------------------------------------------------------------------------------------------------
+// (a) Routed Down row, IQ3_XXS-sourced VJ_Q4_DOT8, cols = 512 (16 blocks, one per lane16).
+//   w_qs : weight plane base of this layer  [n_exp * D rows, w_stride bytes]  (row = exp * D + row)
+//   w_sc : scale region base                [n_exp * D rows, s_stride bytes]  per row {u32 s nibbles, f32 d} x 2
+//   sm_mq: 8 slots x 32 uint4 INT8 mid activations, sm_md: 8 x 16 block scales, sm_ids/sm_w: routed ids/weights.
+// kBatch slots have their weight + scale loads issued before any of them is consumed. Slots are still
+// accumulated in ascending order, so the result is bit-identical to 9c.
+// -------------------------------------------------------------------------------------------------
+template <uint32_t kBatch, bool kCached = false, typename WPtr = const uint8_t*, typename SPtr = const uint8_t*>
+__device__ __forceinline__ float vj_dot8_down_row_iq3(
+    WPtr __restrict__ w_qs, uint32_t w_stride,
+    SPtr __restrict__ w_sc, uint32_t s_stride,
+    const uint4* sm_mq, const float* sm_md, const int32_t* sm_ids, const float* sm_w,
+    uint32_t row, uint32_t D, uint32_t lane16) {
+    static_assert(8u % kBatch == 0u, "kBatch must divide 8");
+    constexpr bool kIsG = __is_same(WPtr, GPtr<const uint8_t>);
+    using U4P = typename CondT<kIsG, GPtr<const uint4>, const uint4*>::type;
+    using U2P = typename CondT<kIsG, GPtr<const uint2>, const uint2*>::type;
+    const uint32_t w_off  = row * w_stride + lane16 * 16u;
+    const uint32_t s_off  = row * s_stride + (lane16 >> 3) * 8u;
+    const uint32_t sh_sub = (lane16 & 7u) * 4u;
+
+    float total = 0.0f;
+    #pragma unroll
+    for (uint32_t s0 = 0u; s0 < 8u; s0 += kBatch) {
+        uint4 wv[kBatch];
+        uint2 sv[kBatch];
+        #pragma unroll
+        for (uint32_t k = 0u; k < kBatch; ++k) {
+            // sm_ids[slot] is the same LDS word for every lane: wave uniform.
+            const uint32_t e  = __builtin_amdgcn_readfirstlane(static_cast<uint32_t>(sm_ids[s0 + k]));
+            const uint64_t eb = static_cast<uint64_t>(e * D);
+            WPtr wb = w_qs + uniform_u64(eb * w_stride);  // SGPR base + 32-bit lane offset
+            SPtr sb = w_sc + uniform_u64(eb * s_stride);
+            // Opaque copies of the lane offsets: stops LICM from hoisting (base + lane offset) into a 64-bit VGPR
+            // pair, so each load is global_load saddr (SGPR base + 32-bit VGPR offset), 0 VALU address math.
+            uint32_t wo = w_off, so = s_off;
+            asm volatile("" : "+v"(wo), "+v"(so));
+            if constexpr (kCached) {
+                wv[k] = *reinterpret_cast<U4P>(wb + wo);
+                sv[k] = *reinterpret_cast<U2P>(sb + so);
+            } else {
+                wv[k] = ldg_x4_nt(reinterpret_cast<U4P>(wb + wo));
+                sv[k] = ldg_x2_nt(reinterpret_cast<U2P>(sb + so));
+            }
+        }
+        // Keep the whole batch of loads in flight before the first v_perm/v_dot (the scheduler otherwise sinks
+        // each load next to its first use to save VGPRs, which serializes the memory latency).
+        __builtin_amdgcn_sched_barrier(0);
+        #pragma unroll
+        for (uint32_t k = 0u; k < kBatch; ++k) {
+            const uint32_t slot = s0 + k;
+            const float    ew   = sm_w[slot];
+            const uint4    xa   = sm_mq[slot * 32u + lane16 * 2u + 0u];
+            const uint4    xb   = sm_mq[slot * 32u + lane16 * 2u + 1u];
+            const float    xd   = sm_md[slot * 16u + lane16];
+            const int32_t  dp   = dot32_iq3(wv[k], xa, xb);
+            const uint32_t sc   = (sv[k].x >> sh_sub) & 0xFu;
+            const float    gdb  = __uint_as_float(sv[k].y) * (0.5f + static_cast<float>(sc)) * 0.5f;
+            total = fmaf(ew * gdb * xd, static_cast<float>(dp), total);
+        }
+    }
+    return sum16(total);
+}
+
+// -------------------------------------------------------------------------------------------------
+// (b) Routed Gate+Up row pair, merged IQ2_S-sourced VJ_Q4_DOT8.
+//   w_gu : merged weight plane base of this layer [n_exp * local_ff rows, w_stride]: per block {gate uint4, up uint4}
+//   w_sc : scale region base [rows, s_stride]: [nblk x u16 (gate sc | up sc << 8)] [nsb x u32 (gate d | up d << 16)]
+//   erow_base = exp * local_ff (wave uniform), row = row inside the expert, kNIt = nblk / 16 (6 for D = 3072),
+//   kNIt must be a multiple of kBatch.
+//   sm_xq: x_q8 as uint4 (2 per block), sm_xd: x block scales (d only).
+// Accumulation order per lane: it ascending; per it the gate chain gets lo then hi and the up chain gets lo
+// then hi, exactly as 9b (the two independent chains are interleaved, which does not change either sum).
+// -------------------------------------------------------------------------------------------------
+template <uint32_t kNIt, uint32_t kBatch, bool kCached = false, typename WPtr = const uint8_t*, typename SPtr = const uint8_t*>
+__device__ __forceinline__ float2 vj_dot8_gu_row_iq2s(
+    WPtr __restrict__ w_gu, uint32_t w_stride,
+    SPtr __restrict__ w_sc, uint32_t s_stride,
+    const uint4* sm_xq, const float* sm_xd,
+    uint32_t erow_base, uint32_t row, uint32_t lane16) {
+    static_assert(kNIt % kBatch == 0u, "kBatch must divide kNIt");
+    constexpr bool kIsG = __is_same(WPtr, GPtr<const uint8_t>);
+    using U4P  = typename CondT<kIsG, GPtr<const uint4>, const uint4*>::type;
+    using U16P = typename CondT<kIsG, GPtr<const uint16_t>, const uint16_t*>::type;
+    using U32P = typename CondT<kIsG, GPtr<const uint32_t>, const uint32_t*>::type;
+    constexpr uint32_t n_it = kNIt;
+    constexpr uint32_t nblk = kNIt * 16u;
+    WPtr wb = w_gu + uniform_u64(static_cast<uint64_t>(erow_base) * w_stride);
+    SPtr sb = w_sc + uniform_u64(static_cast<uint64_t>(erow_base) * s_stride);
+    const uint32_t w_off  = row * w_stride + lane16 * 32u;
+    const uint32_t sc_off = row * s_stride + lane16 * 2u;
+    const uint32_t d_off  = row * s_stride + nblk * 2u + (lane16 >> 3) * 4u;
+
+    // Fully unrolled over the kNIt block columns: every per-iteration offset folds into the 12-bit immediate
+    // of global_load, so only three per-lane base offsets stay live.
+    float ag = 0.0f, au = 0.0f;
+    #pragma unroll
+    for (uint32_t it0 = 0u; it0 < n_it; it0 += kBatch) {
+        uint4    gw[kBatch], uw[kBatch];
+        uint32_t scv[kBatch], d2v[kBatch];
+        #pragma unroll
+        for (uint32_t k = 0u; k < kBatch; ++k) {
+            const uint32_t it = it0 + k;
+            const uint32_t wo = w_off + it * 512u;
+            const uint32_t so = sc_off + it * 32u;
+            const uint32_t dO = d_off + it * 8u;   // superblock of block it*16+lane16 = 2*it + (lane16 >> 3)
+            if constexpr (kCached) {
+                gw[k]  = *reinterpret_cast<U4P>(wb + wo);
+                uw[k]  = *reinterpret_cast<U4P>(wb + wo + 16u);
+                scv[k] = *reinterpret_cast<U16P>(sb + so);
+                d2v[k] = *reinterpret_cast<U32P>(sb + dO);
+            } else {
+                gw[k]  = ldg_x4_nt(reinterpret_cast<U4P>(wb + wo));
+                uw[k]  = ldg_x4_nt(reinterpret_cast<U4P>(wb + wo + 16u));
+                scv[k] = ldg_u16_nt(reinterpret_cast<U16P>(sb + so));
+                d2v[k] = ldg_u32_nt(reinterpret_cast<U32P>(sb + dO));
+            }
+        }
+        __builtin_amdgcn_sched_barrier(0);
+        #pragma unroll
+        for (uint32_t k = 0u; k < kBatch; ++k) {
+            {
+                // ag and au are independent chains, so gate/up can be interleaved; each chain still sees
+                // lo (weights 0..15) then hi (16..31) per block, exactly as in 9b. Consuming xa before xb is
+                // read keeps only one activation uint4 live.
+                const uint32_t ib  = (it0 + k) * 16u + lane16;
+                const float    xda = sm_xd[ib];
+                const float    pg  = h2f(d2v[k]) * 0.25f * xda;
+                const float    pu  = h2f(d2v[k] >> 16) * 0.25f * xda;
+                const uint4    xa  = sm_xq[ib * 2u];
+                const int32_t  g0  = dot16_lo_iq2(gw[k], xa);
+                const int32_t  u0  = dot16_lo_iq2(uw[k], xa);
+                ag = fmaf(pg * (0.5f + static_cast<float>(scv[k] & 0xFu)), static_cast<float>(g0), ag);
+                au = fmaf(pu * (0.5f + static_cast<float>((scv[k] >> 8) & 0xFu)), static_cast<float>(u0), au);
+                const uint4    xb  = sm_xq[ib * 2u + 1u];
+                const int32_t  g1  = dot16_hi_iq2(gw[k], xb);
+                const int32_t  u1  = dot16_hi_iq2(uw[k], xb);
+                ag = fmaf(pg * (0.5f + static_cast<float>((scv[k] >> 4) & 0xFu)), static_cast<float>(g1), ag);
+                au = fmaf(pu * (0.5f + static_cast<float>((scv[k] >> 12) & 0xFu)), static_cast<float>(u1), au);
+            }
+        }
+    }
+    return make_float2(sum16(ag), sum16(au));
+}
+
+// -------------------------------------------------------------------------------------------------
+// (c) Lossless 3-bit bit-sliced Routed Gate+Up row pair (VJ_Q3_IQ2S, 2304 B w_plane + 256 B s_plane).
+//   Eliminates sm_grid32 LDS gathers while reading only 1.30x of IQ2_S (vs 1.82x for 4-bit DOT8).
+//   100% bit-identical int8 weights, scales, and float accumulation order to 9b / vj_dot8_gu_row_iq2s!
+// -------------------------------------------------------------------------------------------------
+__device__ __forceinline__ uint32_t dec4_q3(uint32_t mag_sh, uint32_t sgn_sh) {
+    const uint32_t sel = (mag_sh & 0x03030303u) | (sgn_sh & 0x04040404u);
+    return __builtin_amdgcn_perm(0x00D5E7F8u, 0x002B1908u, sel);
+}
+__device__ __forceinline__ int32_t dot16_lo_q3(uint32_t mg, uint32_t sg, const uint4 xa) {
+    int32_t dp = sdot4(dec4_q3(mg,      sg << 2), xa.x, 0);
+    dp         = sdot4(dec4_q3(mg >> 2, sg << 1), xa.y, dp);
+    dp         = sdot4(dec4_q3(mg >> 4, sg),      xa.z, dp);
+    dp         = sdot4(dec4_q3(mg >> 6, sg >> 1), xa.w, dp);
+    return dp;
+}
+__device__ __forceinline__ int32_t dot16_hi_q3(uint32_t mg, uint32_t sg, const uint4 xb) {
+    int32_t dp = sdot4(dec4_q3(mg,      sg >> 2), xb.x, 0);
+    dp         = sdot4(dec4_q3(mg >> 2, sg >> 3), xb.y, dp);
+    dp         = sdot4(dec4_q3(mg >> 4, sg >> 4), xb.z, dp);
+    dp         = sdot4(dec4_q3(mg >> 6, sg >> 5), xb.w, dp);
+    return dp;
+}
+
+template <uint32_t kNIt, uint32_t kBatch, bool kCached = false, typename WPtr = const uint8_t*, typename SPtr = const uint8_t*>
+__device__ __forceinline__ float2 vj_q3_gu_row_iq2s(
+    WPtr __restrict__ w_gu, uint32_t w_stride,
+    SPtr __restrict__ w_sc, uint32_t s_stride,
+    const uint4* sm_xq, const float* sm_xd,
+    uint32_t erow_base, uint32_t row, uint32_t lane16) {
+    static_assert(kNIt % kBatch == 0u, "kBatch must divide kNIt");
+    constexpr bool kIsG = __is_same(WPtr, GPtr<const uint8_t>);
+    using U4P  = typename CondT<kIsG, GPtr<const uint4>, const uint4*>::type;
+    using U2P  = typename CondT<kIsG, GPtr<const uint2>, const uint2*>::type;
+    using U16P = typename CondT<kIsG, GPtr<const uint16_t>, const uint16_t*>::type;
+    using U32P = typename CondT<kIsG, GPtr<const uint32_t>, const uint32_t*>::type;
+    constexpr uint32_t nblk = kNIt * 16u;
+    constexpr uint32_t nsb  = nblk >> 3;
+    WPtr wb = w_gu + uniform_u64(static_cast<uint64_t>(erow_base) * w_stride);
+    SPtr sb = w_sc + uniform_u64(static_cast<uint64_t>(erow_base) * s_stride);
+    const uint32_t r_w_off = row * w_stride;
+    const uint32_t r_s_off = row * s_stride;
+    uint32_t d_off = r_s_off + nblk * 2u + lane16 * 4u;
+    asm volatile("" : "+v"(d_off));
+    const uint32_t d2_mine = (lane16 < nsb)
+        ? (kCached ? *reinterpret_cast<U32P>(sb + d_off) : ldg_u32_nt(reinterpret_cast<U32P>(sb + d_off)))
+        : 0u;
+
+    float ag = 0.0f, au = 0.0f;
+    #pragma nounroll
+    for (uint32_t it0 = 0u; it0 < kNIt; it0 += kBatch) {
+        uint4    mgv[kBatch];
+        uint2    sgv[kBatch];
+        uint32_t scv[kBatch];
+        #pragma unroll
+        for (uint32_t k = 0u; k < kBatch; ++k) {
+            const uint32_t ib = (it0 + k) * 16u + lane16;
+            uint32_t m_off = r_w_off + ib * 16u;
+            uint32_t g_off = r_w_off + nblk * 16u + ib * 8u;
+            uint32_t s_off = r_s_off + ib * 2u;
+            asm volatile("" : "+v"(m_off), "+v"(g_off), "+v"(s_off));
+            if constexpr (kCached) {
+                mgv[k] = *reinterpret_cast<U4P>(wb + m_off);
+                sgv[k] = *reinterpret_cast<U2P>(wb + g_off);
+                scv[k] = *reinterpret_cast<U16P>(sb + s_off);
+            } else {
+                mgv[k] = ldg_x4_nt(reinterpret_cast<U4P>(wb + m_off));
+                sgv[k] = ldg_x2_nt(reinterpret_cast<U2P>(wb + g_off));
+                scv[k] = ldg_u16_nt(reinterpret_cast<U16P>(sb + s_off));
+            }
+        }
+        __builtin_amdgcn_sched_barrier(0);
+        #pragma unroll
+        for (uint32_t k = 0u; k < kBatch; ++k) {
+            if constexpr (kBatch == 2u) {
+                if (k == 0u) asm volatile("s_waitcnt vmcnt(3)" : "+v"(mgv[0].x), "+v"(sgv[0].x), "+v"(scv[0]) :: "memory");
+                else         asm volatile("s_waitcnt vmcnt(0)" : "+v"(mgv[1].x), "+v"(sgv[1].x), "+v"(scv[1]) :: "memory");
+            } else if constexpr (kBatch == 3u) {
+                if (k == 0u)      asm volatile("s_waitcnt vmcnt(6)" : "+v"(mgv[0].x), "+v"(sgv[0].x), "+v"(scv[0]) :: "memory");
+                else if (k == 1u) asm volatile("s_waitcnt vmcnt(3)" : "+v"(mgv[1].x), "+v"(sgv[1].x), "+v"(scv[1]) :: "memory");
+                else              asm volatile("s_waitcnt vmcnt(0)" : "+v"(mgv[2].x), "+v"(sgv[2].x), "+v"(scv[2]) :: "memory");
+            }
+            const uint32_t ib  = (it0 + k) * 16u + lane16;
+            const uint32_t d2k = __shfl(static_cast<int>(d2_mine), static_cast<int>(ib >> 3), 16);
+            const float    xda = sm_xd[ib];
+            const float    pg  = h2f(d2k) * 0.25f * xda;
+            const float    pu  = h2f(d2k >> 16) * 0.25f * xda;
+            const uint4    xa  = sm_xq[ib * 2u];
+            const int32_t  g0  = dot16_lo_q3(mgv[k].x, sgv[k].x, xa);
+            const int32_t  u0  = dot16_lo_q3(mgv[k].z, sgv[k].y, xa);
+            ag = fmaf(pg * (0.5f + static_cast<float>(scv[k] & 0xFu)), static_cast<float>(g0), ag);
+            au = fmaf(pu * (0.5f + static_cast<float>((scv[k] >> 8) & 0xFu)), static_cast<float>(u0), au);
+            const uint4    xb  = sm_xq[ib * 2u + 1u];
+            const int32_t  g1  = dot16_hi_q3(mgv[k].y, sgv[k].x, xb);
+            const int32_t  u1  = dot16_hi_q3(mgv[k].w, sgv[k].y, xb);
+            ag = fmaf(pg * (0.5f + static_cast<float>((scv[k] >> 4) & 0xFu)), static_cast<float>(g1), ag);
+            au = fmaf(pu * (0.5f + static_cast<float>((scv[k] >> 12) & 0xFu)), static_cast<float>(u1), au);
+        }
+    }
+    return make_float2(sum16(ag), sum16(au));
+}
+
+} // namespace dot8_dev
+} // namespace vegajet
+
+#endif // __HIP__

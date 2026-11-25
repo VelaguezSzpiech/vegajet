@@ -1,0 +1,253 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+// Expert-grouped routed MoE Down (VJ_Q4_DOT8, IQ3_XXS-sourced, cols = 512) for multi-token batches on gfx906.
+//
+// Pipeline (three dispatches, all deterministic, no float atomics):
+//   1. vj_moe_route_group_kernel        top_ids[M*8] -> counting sort by expert (ascending route m*8+s inside an
+//                                       expert), unique-expert list, per-expert offset/count, and a list of
+//                                       bounded work items (expert, start, len <= kItemRoutes) for every expert
+//                                       with count >= min_group ("wide" experts).
+//   2. vj_moe_down_grouped_{dp,f32}     one workgroup per (64-row (_dp) / 32-row (_f32) tile, work item): loads +
+//                                       decodes the expert's weight tile ONCE into registers (decoded int8,
+//                                       4 (_dp) / 2 (_f32) rows x 8 dwords per lane) and applies it to every routed activation of the item.
+//        _dp  (exact) writes the per-lane exact int32 block dot  dp[route][row][lane16]       (64 B / route-row)
+//        _f32 (fast)  writes the 16-lane-reduced float  sum16(ew*gdb*xd*dp)  part[route][row] ( 4 B / route-row)
+//   3. vj_moe_down_combine_{dp,f32}     per (16 rows, token), same grid / LDS / float order as
+//                                       vj_moe_down_dot8_kernel. Slots whose expert is "skinny"
+//                                       (count < min_group, e.g. exactly one routed token) are computed from the
+//                                       weights exactly as today (same loads, same cost); wide slots take the
+//                                       grouped result instead of re-streaming 256 B of codes.
+//        _dp : bit-identical to vj_moe_down_dot8_kernel (dp is an exact integer; the float chain
+//              fmaf(ew*gdb*xd, dp, total) per lane, slots ascending, then sum16, then + sh is replayed verbatim).
+//        _f32: deterministic but NOT bit-identical (wide slots are lane-reduced before being added, after the
+//              skinny-slot sum16, in ascending slot order).
+//
+// The constants / packing helpers below are plain C++ so core/moe_route_group.* and the CPU test share them.
+#pragma once
+
+#include <stdint.h>
+
+namespace vegajet {
+namespace moe_grp {
+
+constexpr uint32_t kNumExperts    = 256u;
+constexpr uint32_t kTopK          = 8u;
+constexpr uint32_t kCols          = 512u;   // Down input width (local_ff) = 16 blocks of 32
+constexpr uint32_t kLanes         = 16u;    // one 32-weight block per lane
+constexpr uint32_t kMaxM          = 512u;   // routing kernel LDS holds M*8 <= 4096 expert ids (u8)
+constexpr uint32_t kItemRoutes    = 64u;    // max routes per grouped work item (bounds every workgroup)
+constexpr uint32_t kStageRoutes   = 16u;    // routes staged in LDS per pass (16 x 512 B = 8 KiB)
+constexpr uint32_t kRowsPerThreadDp  = 4u;  // decoded rows kept in registers per lane, exact (_dp) kernel
+constexpr uint32_t kRowsPerThreadF32 = 2u;  // same, fast (_f32) kernel
+constexpr uint32_t kTileRowsDp  = 16u * kRowsPerThreadDp;   // rows per grouped workgroup: 64
+constexpr uint32_t kTileRowsF32 = 16u * kRowsPerThreadF32;  // 32
+constexpr uint32_t kComboRows     = 16u;    // rows per combine workgroup (as vj_moe_down_dot8_kernel)
+
+// Header words written by the routing kernel.
+constexpr uint32_t kHdrUnique        = 0u;  // number of experts with >= 1 route
+constexpr uint32_t kHdrItems         = 1u;  // number of grouped work items
+constexpr uint32_t kHdrGroupedRoutes = 2u;  // routes owned by wide experts (count >= min_group)
+constexpr uint32_t kHdrRoutes        = 3u;  // M * 8
+constexpr uint32_t kHdrWords         = 4u;
+
+// Upper bound of the work-item count for M tokens (grid.y of the grouped kernels):
+//   sum_e ceil(c_e / 64) <= sum_e (c_e + 63) / 64 <= (R + 63 * min(256, R)) / 64, and <= R.
+constexpr uint32_t item_cap(uint32_t M) {
+    const uint32_t R = M * kTopK;
+    const uint32_t U = R < kNumExperts ? R : kNumExperts;
+    const uint32_t b = (R + (kItemRoutes - 1u) * U + kItemRoutes - 1u) / kItemRoutes;
+    return b < R ? b : R;
+}
+constexpr uint32_t items_for_count(uint32_t c, uint32_t min_group) {
+    return (c != 0u && c >= min_group) ? (c + kItemRoutes - 1u) / kItemRoutes : 0u;
+}
+
+// Work item: expert (8 bits) | (len - 1) (6 bits) | start in the sorted route list (18 bits).
+constexpr uint32_t item_pack(uint32_t e, uint32_t start, uint32_t len) {
+    return (e & 255u) | (((len - 1u) & 63u) << 8) | (start << 14);
+}
+constexpr uint32_t item_expert(uint32_t it) { return it & 255u; }
+constexpr uint32_t item_len(uint32_t it)    { return ((it >> 8) & 63u) + 1u; }
+constexpr uint32_t item_start(uint32_t it)  { return it >> 14; }
+
+static_assert(kItemRoutes == 64u, "item_pack len field is 6 bits");
+static_assert(kItemRoutes % kStageRoutes == 0u, "stages must tile an item");
+
+} // namespace moe_grp
+} // namespace vegajet
+
+#if defined(__HIP__)
+#include <hip/hip_runtime.h>
+
+#include "ops/kernels/vj_moe_dot8.hiph"
+
+namespace vegajet {
+namespace moe_grp_dev {
+
+using namespace vegajet::dot8_dev;
+
+// Decoded 32-weight block (8 x 4 signed int8): words 0..3 pair with activation bytes 0..15, 4..7 with 16..31.
+struct Dec32 { uint32_t w[8]; };
+
+__device__ __forceinline__ Dec32 decode32_iq3(const uint4 q) {
+    Dec32 d;
+    d.w[0] = dec4_iq3(q.x);      d.w[1] = dec4_iq3(q.y);      d.w[2] = dec4_iq3(q.z);      d.w[3] = dec4_iq3(q.w);
+    d.w[4] = dec4_iq3(q.x >> 4); d.w[5] = dec4_iq3(q.y >> 4); d.w[6] = dec4_iq3(q.z >> 4); d.w[7] = dec4_iq3(q.w >> 4);
+    return d;
+}
+// Exact int32 block dot. Integer accumulation is exact (|dp| <= 32 * 62 * 127 < 2^18), so the chain order is free.
+__device__ __forceinline__ int32_t dot32_dec(const Dec32& d, const uint4 xa, const uint4 xb) {
+    int32_t dp = sdot4(d.w[0], xa.x, 0);
+    dp = sdot4(d.w[1], xa.y, dp);
+    dp = sdot4(d.w[2], xa.z, dp);
+    dp = sdot4(d.w[3], xa.w, dp);
+    dp = sdot4(d.w[4], xb.x, dp);
+    dp = sdot4(d.w[5], xb.y, dp);
+    dp = sdot4(d.w[6], xb.z, dp);
+    dp = sdot4(d.w[7], xb.w, dp);
+    return dp;
+}
+
+// Per-lane block scale, same expression as vj_dot8_down_row_iq3.
+__device__ __forceinline__ float gdb_of(const uint2 sv, uint32_t lane16) {
+    const uint32_t sc = (sv.x >> ((lane16 & 7u) * 4u)) & 0xFu;
+    return __uint_as_float(sv.y) * (0.5f + static_cast<float>(sc)) * 0.5f;
+}
+
+// -------------------------------------------------------------------------------------------------
+// Combine row, exact mode. Same contract and float order as vj_dot8_down_row_iq3<kBatch>; for a wide slot
+// (bit `slot` of gmask, wave uniform) the exact int32 dp comes from dp_tok (= dp buffer + m * 8 * D * 16)
+// instead of 256 B of weight codes + the LDS activation. The scale word is still loaded (gdb is needed to
+// replay ew*gdb*xd exactly). Result: bit-identical to vj_dot8_down_row_iq3.
+// Requires the combine geometry: blockDim = 256, row = blockIdx.x * 16 + threadIdx.x / 16, lane16 = tid & 15,
+// so the dp element (row, lane16) = (row & ~15) * 16 + threadIdx.x: wave-uniform SGPR base + tid * 4 bytes.
+//
+// Control flow is kept out of the batch on purpose (uniform if/else per slot made the scheduler hoist the
+// LDS reads of all slots and spill 15 VGPRs at the 48-VGPR cap):
+//   * kAllWide = true : every slot is wide -> one dword dp load + the scale per slot, no codes, no dot.
+//   * kAllWide = false: mixed token -> branch-free issue (the same dwordx4 instruction reads either the
+//     weight codes or, from the dp buffer, 16 B whose .x is this lane's dp: the 16 lanes of a row cover the
+//     same 64 B record + a 12 B tail inside the next one, so the cache lines touched are the same; the
+//     buffer must be padded by 16 B) and a branch-free select of the dp (the dot of a wide slot is computed
+//     on the dp bytes and discarded: wasted VALU on mixed tokens only).
+//   Tokens with gmask == 0 run kAllWide = false with every select false: today's loads, LDS reads, dot and
+//   float chain plus one v_cndmask per slot (calling vj_dot8_down_row_iq3<4> as a third path spilled 2 VGPRs).
+// -------------------------------------------------------------------------------------------------
+template <uint32_t kBatch, bool kAllWide>
+__device__ __forceinline__ float down_row_mixed_dp(
+    const uint8_t* __restrict__ w_qs, uint32_t w_stride,
+    const uint8_t* __restrict__ w_sc, uint32_t s_stride,
+    const int32_t* __restrict__ dp_tok,
+    const uint4* sm_mq, const float* sm_md, const int32_t* sm_ids, const float* sm_w, uint32_t gmask,
+    uint32_t row, uint32_t D, uint32_t lane16) {
+    static_assert(8u % kBatch == 0u, "kBatch must divide 8");
+    const uint32_t w_off  = row * w_stride + lane16 * 16u;
+    const uint32_t s_off  = row * s_stride + (lane16 >> 3) * 8u;
+    const uint32_t sh_sub = (lane16 & 7u) * 4u;
+    const uint32_t row_u  = blockIdx.x * 16u;   // == row & ~15 in the combine geometry, kept scalar
+
+    float total = 0.0f;
+    #pragma unroll
+    for (uint32_t s0 = 0u; s0 < 8u; s0 += kBatch) {
+        uint4 wv[kBatch];
+        uint2 sv[kBatch];
+        #pragma unroll
+        for (uint32_t k = 0u; k < kBatch; ++k) {
+            const uint32_t slot = s0 + k;
+            const uint32_t e  = __builtin_amdgcn_readfirstlane(static_cast<uint32_t>(sm_ids[slot]));
+            const uint64_t eb = static_cast<uint64_t>(e * D);
+            const uint8_t* sb = w_sc + uniform_u64(eb * s_stride);
+            const uint8_t* db = reinterpret_cast<const uint8_t*>(dp_tok) +
+                                uniform_u64((static_cast<uint64_t>(slot) * D + row_u) * 64u);
+            uint32_t so = s_off;
+            if (kAllWide) {
+                uint32_t dO = threadIdx.x * 4u;
+                asm volatile("" : "+v"(dO), "+v"(so));
+                // Cached L2 loads: dp_out was just written by grouped_dp and w_sc is shared across ~16 tokens/expert.
+                wv[k].x = *reinterpret_cast<const uint32_t*>(db + dO);
+            } else {
+                const bool     g  = (gmask >> slot) & 1u;
+                const uint8_t* wb = w_qs + uniform_u64(eb * w_stride);
+                const uint8_t* lb = g ? db : wb;
+                uint32_t wo = g ? threadIdx.x * 4u : w_off;
+                asm volatile("" : "+v"(wo), "+v"(so));
+                wv[k] = *reinterpret_cast<const uint4*>(lb + wo);
+            }
+            sv[k] = *reinterpret_cast<const uint2*>(sb + so);
+        }
+        __builtin_amdgcn_sched_barrier(0);
+        #pragma unroll
+        for (uint32_t k = 0u; k < kBatch; ++k) {
+            const uint32_t slot = s0 + k;
+            const float    ew   = sm_w[slot];
+            const float    xd   = sm_md[slot * 16u + lane16];
+            int32_t dp = static_cast<int32_t>(wv[k].x);
+            if (!kAllWide) {
+                const uint4   xa = sm_mq[slot * 32u + lane16 * 2u + 0u];
+                const uint4   xb = sm_mq[slot * 32u + lane16 * 2u + 1u];
+                const int32_t dw = dot32_iq3(wv[k], xa, xb);
+                dp = ((gmask >> slot) & 1u) ? dp : dw;
+            }
+            const uint32_t sc  = (sv[k].x >> sh_sub) & 0xFu;
+            const float    gdb = __uint_as_float(sv[k].y) * (0.5f + static_cast<float>(sc)) * 0.5f;
+            total = fmaf(ew * gdb * xd, static_cast<float>(dp), total);
+        }
+    }
+    return sum16(total);
+}
+
+// -------------------------------------------------------------------------------------------------
+// Combine row, fast mode: only skinny slots are streamed (per-lane fmaf chain, ascending), then sum16, then
+// the wide slots' lane-reduced partials are added in ascending slot order by the caller.
+// -------------------------------------------------------------------------------------------------
+template <uint32_t kBatch>
+__device__ __forceinline__ float down_row_skinny_only(
+    const uint8_t* __restrict__ w_qs, uint32_t w_stride,
+    const uint8_t* __restrict__ w_sc, uint32_t s_stride,
+    const uint4* sm_mq, const float* sm_md, const int32_t* sm_ids, const float* sm_w, uint32_t gmask,
+    uint32_t row, uint32_t D, uint32_t lane16) {
+    static_assert(8u % kBatch == 0u, "kBatch must divide 8");
+    const uint32_t w_off  = row * w_stride + lane16 * 16u;
+    const uint32_t s_off  = row * s_stride + (lane16 >> 3) * 8u;
+    const uint32_t sh_sub = (lane16 & 7u) * 4u;
+
+    float total = 0.0f;
+    #pragma unroll
+    for (uint32_t s0 = 0u; s0 < 8u; s0 += kBatch) {
+        if (((gmask >> s0) & ((1u << kBatch) - 1u)) == ((1u << kBatch) - 1u)) continue;  // whole batch wide
+        uint4 wv[kBatch];
+        uint2 sv[kBatch];
+        #pragma unroll
+        for (uint32_t k = 0u; k < kBatch; ++k) {
+            const uint32_t slot = s0 + k;
+            if ((gmask >> slot) & 1u) continue;
+            const uint32_t e  = __builtin_amdgcn_readfirstlane(static_cast<uint32_t>(sm_ids[slot]));
+            const uint64_t eb = static_cast<uint64_t>(e * D);
+            const uint8_t* wb = w_qs + uniform_u64(eb * w_stride);
+            const uint8_t* sb = w_sc + uniform_u64(eb * s_stride);
+            uint32_t wo = w_off, so = s_off;
+            asm volatile("" : "+v"(wo), "+v"(so));
+            wv[k] = ldg_x4_nt(reinterpret_cast<const uint4*>(wb + wo));
+            sv[k] = ldg_x2_nt(reinterpret_cast<const uint2*>(sb + so));
+        }
+        __builtin_amdgcn_sched_barrier(0);
+        #pragma unroll
+        for (uint32_t k = 0u; k < kBatch; ++k) {
+            const uint32_t slot = s0 + k;
+            if ((gmask >> slot) & 1u) continue;
+            const float    ew  = sm_w[slot];
+            const uint4    xa  = sm_mq[slot * 32u + lane16 * 2u + 0u];
+            const uint4    xb  = sm_mq[slot * 32u + lane16 * 2u + 1u];
+            const float    xd  = sm_md[slot * 16u + lane16];
+            const int32_t  dp  = dot32_iq3(wv[k], xa, xb);
+            const uint32_t sc  = (sv[k].x >> sh_sub) & 0xFu;
+            const float    gdb = __uint_as_float(sv[k].y) * (0.5f + static_cast<float>(sc)) * 0.5f;
+            total = fmaf(ew * gdb * xd, static_cast<float>(dp), total);
+        }
+    }
+    return sum16(total);
+}
+
+} // namespace moe_grp_dev
+} // namespace vegajet
+
+#endif // __HIP__

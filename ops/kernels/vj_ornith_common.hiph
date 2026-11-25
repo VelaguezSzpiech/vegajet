@@ -1,0 +1,413 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+#pragma once
+// High-Bandwidth Bare-Metal gfx906 (Vega 20) Kernels for Ornith-122B (Qwen3.5-MoE Hybrid)
+//   - Strictly 0 B private register spill (private_seg_size == 0) enforced at build & load time!
+//   - TCC L2 anti-camping: odd-256B row strides (16/16 channel spread) & 1-cycle XOR swizzle
+//   - Asymmetric VJ_Q4_A8 (u4 + FP16 d,m, 0 sign-ext, v_dot4_i32_i8) for Q4_K dense trunk (2x less HBM2!)
+//   - 32-lane/row M=1 streaming GEMV (zero wave-tail waste) + 16-token register-tiled prefill GEMM
+//   - Branchless 5-inst SWAR sign negation + LDS-cached coalesced uint4 IQ2_S & IQ3_XXS MoE
+//   - 512-thread single-read register-cached GDN recurrence + C=16 WY/Neumann prefill (0 SOLVE_TRI)
+//   - FP16 64-WG parallel MoE router + Push-Only Dual-BAR0 P2P AllReduce fused with RMSNorm/Quant
+#include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+#include <stdint.h>
+
+#include "core/ggml_iq_tables.hpp"
+#include "ops/kernels/vj_moe_dot8.hiph"
+
+// GDN state ring depth: slot ring_head holds the committed state, slots +1..+M the state after each token of a
+// speculative verify batch, so a batch may hold up to VJ_GDN_RING_SLOTS - 1 tokens. Must match kGdnRingSlots on the host.
+#define VJ_GDN_RING_SLOTS 17u
+
+namespace vegajet {
+namespace ornith_dev {
+
+typedef uint32_t u32x4 __attribute__((ext_vector_type(4)));
+typedef uint32_t u32x2 __attribute__((ext_vector_type(2)));
+typedef float    f32x4 __attribute__((ext_vector_type(4)));
+
+__device__ __forceinline__ int32_t sdot4(uint32_t a, uint32_t b, int32_t c) {
+    return __builtin_amdgcn_sdot4(static_cast<int32_t>(a), static_cast<int32_t>(b), c, false);
+}
+
+__device__ __forceinline__ float fp16_to_f32(uint16_t h) {
+    return __half2float(__ushort_as_half(h));
+}
+
+__device__ __forceinline__ uint4 ldg_u32x4_stream(const uint4* ptr) {
+    u32x4 v = __builtin_nontemporal_load(reinterpret_cast<const u32x4*>(ptr));
+    return make_uint4(v[0], v[1], v[2], v[3]);
+}
+
+__device__ __forceinline__ uint2 ldg_u32x2_stream(const uint2* ptr) {
+    u32x2 v = __builtin_nontemporal_load(reinterpret_cast<const u32x2*>(ptr));
+    return make_uint2(v[0], v[1]);
+}
+
+__device__ __forceinline__ uint32_t ldg_u32_stream(const uint32_t* ptr) {
+    return __builtin_nontemporal_load(ptr);
+}
+
+// INT8-wire AllReduce helpers. Multiplies must not be contracted into FMAs so that both ranks compute the
+// same dequantized values and l + p is commutative bit-for-bit.
+__device__ __forceinline__ uint32_t ar_q8_pack4(const float4 a, const float inv) {
+    #pragma clang fp contract(off)
+    const uint32_t q0 = static_cast<uint32_t>(max(-127, min(127, __float2int_rn(a.x * inv)))) & 0xFFu;
+    const uint32_t q1 = static_cast<uint32_t>(max(-127, min(127, __float2int_rn(a.y * inv)))) & 0xFFu;
+    const uint32_t q2 = static_cast<uint32_t>(max(-127, min(127, __float2int_rn(a.z * inv)))) & 0xFFu;
+    const uint32_t q3 = static_cast<uint32_t>(max(-127, min(127, __float2int_rn(a.w * inv)))) & 0xFFu;
+    return q0 | (q1 << 8) | (q2 << 16) | (q3 << 24);
+}
+
+__device__ __forceinline__ float ar_q8_accum4(float4* h, const uint32_t lw, const float ld, const uint32_t pw, const float pd, float ss) {
+    #pragma clang fp contract(off)
+    float4 ha = *h;
+    const float l0 = static_cast<float>(static_cast<int8_t>(lw & 0xFFu)) * ld;
+    const float l1 = static_cast<float>(static_cast<int8_t>((lw >> 8) & 0xFFu)) * ld;
+    const float l2 = static_cast<float>(static_cast<int8_t>((lw >> 16) & 0xFFu)) * ld;
+    const float l3 = static_cast<float>(static_cast<int8_t>(lw >> 24)) * ld;
+    const float p0 = static_cast<float>(static_cast<int8_t>(pw & 0xFFu)) * pd;
+    const float p1 = static_cast<float>(static_cast<int8_t>((pw >> 8) & 0xFFu)) * pd;
+    const float p2 = static_cast<float>(static_cast<int8_t>((pw >> 16) & 0xFFu)) * pd;
+    const float p3 = static_cast<float>(static_cast<int8_t>(pw >> 24)) * pd;
+    ha.x += l0 + p0;
+    ha.y += l1 + p1;
+    ha.z += l2 + p2;
+    ha.w += l3 + p3;
+    *h = ha;
+    ss += ha.x * ha.x; ss += ha.y * ha.y; ss += ha.z * ha.z; ss += ha.w * ha.w;
+    return ss;
+}
+
+__device__ __forceinline__ float wave64_sum(float v) {
+    v += __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(v), 0x041F));
+    v += __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(v), 0x081F));
+    v += __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(v), 0x101F));
+    v += __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(v), 0x201F));
+    v += __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(v), 0x401F));
+    v += __shfl_xor(v, 32, 64);
+    return v;
+}
+
+__device__ __forceinline__ float block32_sum(float v) {
+    v += __shfl_xor(v, 16, 32);
+    v += __shfl_xor(v, 8,  32);
+    v += __shfl_xor(v, 4,  32);
+    v += __shfl_xor(v, 2,  32);
+    v += __shfl_xor(v, 1,  32);
+    return v;
+}
+
+__device__ __forceinline__ float block32_max(float v) {
+    v = fmaxf(v, __shfl_xor(v, 16, 32));
+    v = fmaxf(v, __shfl_xor(v, 8,  32));
+    v = fmaxf(v, __shfl_xor(v, 4,  32));
+    v = fmaxf(v, __shfl_xor(v, 2,  32));
+    v = fmaxf(v, __shfl_xor(v, 1,  32));
+    return v;
+}
+
+// 5-instruction branchless SWAR 4-byte two's complement negation.
+// Valid & bit-exact because iq2s_grid and iq3xxs_grid have ZERO 0x00 bytes (all entries in 1..15),
+// so (m ^ 0xFF) + 1 in [0x81..0xFF] NEVER produces a carry into the next byte!
+__device__ __forceinline__ uint32_t apply_4signs_i8x4(uint32_t mag_u32, uint32_t sign4) {
+    const uint32_t add  = (sign4 * 0x00204081u) & 0x01010101u;
+    const uint32_t xorm = (add << 8) - add;
+    return (mag_u32 ^ xorm) + add;
+}
+
+// Compact 32-bit iq2s_grid32 decoder: 1-bank ds_read_b32 + v_perm_b32 (bit-exact vs iq2s_grid + apply_4signs_i8x4!).
+// mag4_sel has 2-bit magnitude indices {0,1,2} in bits 0..1 of each byte; sign4 has 4 sign bits in bits 0..3.
+__device__ __forceinline__ uint32_t iq2s_perm4(uint32_t mag4_sel, uint32_t sign4) {
+    const uint32_t sel = (mag4_sel & 0x03030303u) | ((sign4 * 0x00810204u) & 0x04040404u);
+    return __builtin_amdgcn_perm(0x00D5E7F8u, 0x002B1908u, sel);
+}
+
+__device__ __forceinline__ void grid_barrier_m(uint32_t* bar, uint32_t n_wgs, uint32_t sense) {
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+        __threadfence();
+        const uint32_t arr = atomicAdd(&bar[0], 1u) + 1u;
+        if (arr == n_wgs) {
+            __atomic_store_n(&bar[0], 0u, __ATOMIC_RELEASE);
+            __atomic_store_n(&bar[16], sense, __ATOMIC_RELEASE);
+        } else {
+            for (uint32_t spin = 0u; spin < 5000000u; ++spin) {
+                if (__atomic_load_n(&bar[16], __ATOMIC_ACQUIRE) == sense) break;
+                __builtin_amdgcn_s_sleep(1);
+            }
+        }
+    }
+    __syncthreads();
+}
+
+// Fast 1-Wave64 branchless 256-expert Softmax + Top-8 (64 threads x 4 experts/thread, 0 __syncthreads(), 0 LDS!).
+// Uses ds_swizzle_b32 (XOR mode) for offsets 1..16 (4x faster than ds_bpermute) and __shfl_xor for offset 32.
+// Packs non-negative FP32 probability p (IEEE-754 order == uint32 order) with (255 - e) into uint64 key
+// so exact deterministic tie-break (larger p, smaller e) is a single branchless uint64 max!
+template<int Off>
+__device__ __forceinline__ uint32_t xor_shfl32_fast(uint32_t v) {
+    if constexpr (Off == 32) return __shfl_xor(v, 32, 64);
+    else return static_cast<uint32_t>(__builtin_amdgcn_ds_swizzle(static_cast<int>(v), (Off << 10) | 0x1F));
+}
+
+template<int Off>
+__device__ __forceinline__ float xor_shfl_f32_fast(float v) {
+    return __uint_as_float(xor_shfl32_fast<Off>(__float_as_uint(v)));
+}
+
+template<int Off>
+__device__ __forceinline__ uint64_t step_max_u64(uint64_t bk) {
+    uint32_t lo = xor_shfl32_fast<Off>(static_cast<uint32_t>(bk));
+    uint32_t hi = xor_shfl32_fast<Off>(static_cast<uint32_t>(bk >> 32));
+    uint64_t ok = (static_cast<uint64_t>(hi) << 32) | lo;
+    return (ok > bk) ? ok : bk;
+}
+
+__device__ __forceinline__ void fast_softmax_top8_wave64(
+    const float* __restrict__ logits,
+    int32_t*     __restrict__ top_ids,
+    float*       __restrict__ top_w,
+    uint32_t l) {
+    float x0 = logits[l], x1 = logits[l + 64u], x2 = logits[l + 128u], x3 = logits[l + 192u];
+    float mx = fmaxf(fmaxf(x0, x1), fmaxf(x2, x3));
+    mx = fmaxf(mx, xor_shfl_f32_fast<32>(mx));
+    mx = fmaxf(mx, xor_shfl_f32_fast<16>(mx));
+    mx = fmaxf(mx, xor_shfl_f32_fast<8>(mx));
+    mx = fmaxf(mx, xor_shfl_f32_fast<4>(mx));
+    mx = fmaxf(mx, xor_shfl_f32_fast<2>(mx));
+    mx = fmaxf(mx, xor_shfl_f32_fast<1>(mx));
+
+    float p0 = __expf(x0 - mx), p1 = __expf(x1 - mx), p2 = __expf(x2 - mx), p3 = __expf(x3 - mx);
+    // Reduce each 64-expert quarter in identical ascending wave64_sum order (bit-identical to 4-wave sm_v[0..3]!).
+    const float s = ((wave64_sum(p0) + wave64_sum(p1)) + wave64_sum(p2)) + wave64_sum(p3);
+    const float inv_s = 1.0f / fmaxf(s, 1e-30f);
+    p0 *= inv_s; p1 *= inv_s; p2 *= inv_s; p3 *= inv_s;
+
+    uint64_t k0 = (static_cast<uint64_t>(__float_as_uint(p0)) << 32) | static_cast<uint64_t>(255u - l);
+    uint64_t k1 = (static_cast<uint64_t>(__float_as_uint(p1)) << 32) | static_cast<uint64_t>(255u - (l + 64u));
+    uint64_t k2 = (static_cast<uint64_t>(__float_as_uint(p2)) << 32) | static_cast<uint64_t>(255u - (l + 128u));
+    uint64_t k3 = (static_cast<uint64_t>(__float_as_uint(p3)) << 32) | static_cast<uint64_t>(255u - (l + 192u));
+
+    float top_sum = 0.0f;
+    #pragma nounroll
+    for (uint32_t r = 0u; r < 8u; ++r) {
+        uint64_t bk = (k0 > k1) ? k0 : k1;
+        uint64_t b2 = (k2 > k3) ? k2 : k3;
+        if (b2 > bk) bk = b2;
+        bk = step_max_u64<32>(bk);
+        bk = step_max_u64<16>(bk);
+        bk = step_max_u64<8>(bk);
+        bk = step_max_u64<4>(bk);
+        bk = step_max_u64<2>(bk);
+        bk = step_max_u64<1>(bk);
+        if (k0 == bk) k0 = 0ULL;
+        if (k1 == bk) k1 = 0ULL;
+        if (k2 == bk) k2 = 0ULL;
+        if (k3 == bk) k3 = 0ULL;
+        if (l == 0u) {
+            const float v = __uint_as_float(static_cast<uint32_t>(bk >> 32));
+            top_ids[r] = static_cast<int32_t>(255u - static_cast<uint32_t>(bk & 255u));
+            top_w[r]   = v;
+            top_sum += v;
+        }
+    }
+    if (l == 0u) {
+        const float inv_w = 1.0f / fmaxf(top_sum, 1e-30f);
+        #pragma unroll
+        for (uint32_t r = 0u; r < 8u; ++r) top_w[r] *= inv_w;
+    }
+}
+
+} // namespace ornith_dev
+} // namespace vegajet
+
+
+// ============================================================================
+// 3. Fused Push-Only Dual-BAR0 P2P AllReduce + ResidualAdd + RMSNorm + b=32 INT8 Quantize (+ x_ds)
+// ============================================================================
+template <bool kPrePushed = false>
+__device__ __forceinline__ void ornith_p2p_ar_fp16_body(
+    const float*    __restrict__ x_partial,
+    uint16_t*       __restrict__ peer_tx,
+    const uint16_t* __restrict__ local_rx,
+    uint32_t*       __restrict__ peer_flag,
+    const uint32_t* __restrict__ local_flag,
+    uint32_t*       __restrict__ bar_scratch,
+    float*          __restrict__ h_io,
+    const float*    __restrict__ w_rms,
+    float*          __restrict__ x_norm_out,
+    int8_t*         __restrict__ x_q8_out,
+    float2*         __restrict__ x_ds_out,
+    uint32_t M,
+    uint32_t D,
+    uint32_t epoch,
+    uint32_t do_norm,
+    float    eps,
+    uint64_t* ts) {
+    // ts (timeline build only): 6 x s_memrealtime stamps of thread 0: entry, payload packed, flag posted,
+    // peer payload visible, reduction done, norm+quant done.
+    #define VJ_AR_TS(k) do { if (ts && blockIdx.x == 0u && threadIdx.x == 0u) ts[k] = __builtin_amdgcn_s_memrealtime(); } while (0)
+    VJ_AR_TS(0);
+    const uint32_t m    = blockIdx.x;
+    const uint32_t tid  = threadIdx.x;
+    const uint32_t wave = tid >> 6;
+    const uint32_t lane = tid & 63u;
+    if (m >= M) return;
+
+    __shared__ float sm_red[4];
+    const uint64_t off = static_cast<uint64_t>(m) * D;
+    const float4*  xp4 = reinterpret_cast<const float4*>(x_partial + off);
+    uint4*         pt4 = reinterpret_cast<uint4*>(peer_tx + off);
+    const uint32_t n8  = D >> 3; // 384 uint4s (16B each) = 3072 FP16s -> 8x fewer PCIe TLPs!
+
+    if (!kPrePushed) {
+        #pragma nounroll
+        for (uint32_t i = tid; i < n8; i += 256u) {
+            const float4 a = xp4[i * 2u];
+            const float4 b = xp4[i * 2u + 1u];
+            const __half2 h0 = __float22half2_rn(make_float2(a.x, a.y));
+            const __half2 h1 = __float22half2_rn(make_float2(a.z, a.w));
+            const __half2 h2 = __float22half2_rn(make_float2(b.x, b.y));
+            const __half2 h3 = __float22half2_rn(make_float2(b.z, b.w));
+            uint4 pack;
+            pack.x = *reinterpret_cast<const uint32_t*>(&h0);
+            pack.y = *reinterpret_cast<const uint32_t*>(&h1);
+            pack.z = *reinterpret_cast<const uint32_t*>(&h2);
+            pack.w = *reinterpret_cast<const uint32_t*>(&h3);
+            pt4[i] = pack;
+        }
+        asm volatile("s_waitcnt vmcnt(0)\n" ::: "memory");
+        __threadfence_system();
+        if (M > 1u) {
+            vegajet::ornith_dev::grid_barrier_m(bar_scratch, M, epoch * 2u - 1u);
+        } else {
+            __syncthreads();
+        }
+    }
+
+    VJ_AR_TS(1);
+    if (m == 0u && tid == 0u) {
+        __threadfence_system();
+        __atomic_store_n(peer_flag, epoch, __ATOMIC_RELEASE);
+        VJ_AR_TS(2);
+        while (__atomic_load_n(local_flag, __ATOMIC_ACQUIRE) != epoch) {
+            __builtin_amdgcn_s_sleep(1);
+        }
+        __threadfence_system();
+        VJ_AR_TS(3);
+    }
+    if (M > 1u) {
+        vegajet::ornith_dev::grid_barrier_m(bar_scratch, M, epoch * 2u);
+    } else {
+        __syncthreads();
+    }
+
+    // Reduction + RMSNorm + quantize in ONE pass with the reduced values kept in registers (bit-identical to the
+    // former two-pass epilogue, which re-read h[] and w_rms[] element by element: 12 dependent load round trips
+    // per thread). Ownership is unchanged: thread t owns the 16-byte wire words i = t and t + 256 (8 residual
+    // elements each), so the sum-of-squares chain, the wave tree and the 4-wave RMS sum keep their order. The
+    // 4 lanes t & 3 of a wave hold one 32-element quant block; the block sum replays the old 32-lane xor tree
+    // (16, 8 across lanes, then 4, 2, 1 inside the thread). All loads are issued before the first use.
+    const uint4*  lr4 = reinterpret_cast<const uint4*>(local_rx + off);
+    const float4* h4c = reinterpret_cast<const float4*>(h_io + off);
+    float4*       h4  = reinterpret_cast<float4*>(h_io + off);
+    float*  xn = x_norm_out ? (x_norm_out + off) : nullptr;
+    int8_t* xq = x_q8_out + off;
+    float2* xd = x_ds_out + static_cast<uint64_t>(m) * (D >> 5);
+
+    float4 la[2], lb[2], ha[2], hb[2];
+    uint4  rv[2];
+    #pragma unroll
+    for (uint32_t it = 0u; it < 2u; ++it) {
+        const uint32_t i = min(tid + 256u * it, n8 - 1u);
+        la[it] = xp4[i * 2u];
+        lb[it] = xp4[i * 2u + 1u];
+        rv[it] = vegajet::ornith_dev::ldg_u32x4_stream(lr4 + i);
+        ha[it] = h4c[i * 2u];
+        hb[it] = h4c[i * 2u + 1u];
+    }
+    __builtin_amdgcn_sched_barrier(0);
+    float ss = 0.0f;
+    #pragma unroll
+    for (uint32_t it = 0u; it < 2u; ++it) {
+        const uint32_t i = tid + 256u * it;
+        const float2 p0 = __half22float2(*reinterpret_cast<const __half2*>(&rv[it].x));
+        const float2 p1 = __half22float2(*reinterpret_cast<const __half2*>(&rv[it].y));
+        const float2 p2 = __half22float2(*reinterpret_cast<const __half2*>(&rv[it].z));
+        const float2 p3 = __half22float2(*reinterpret_cast<const __half2*>(&rv[it].w));
+        ha[it].x += __half2float(__float2half(la[it].x)) + p0.x;
+        ha[it].y += __half2float(__float2half(la[it].y)) + p0.y;
+        ha[it].z += __half2float(__float2half(la[it].z)) + p1.x;
+        ha[it].w += __half2float(__float2half(la[it].w)) + p1.y;
+        hb[it].x += __half2float(__float2half(lb[it].x)) + p2.x;
+        hb[it].y += __half2float(__float2half(lb[it].y)) + p2.y;
+        hb[it].z += __half2float(__float2half(lb[it].z)) + p3.x;
+        hb[it].w += __half2float(__float2half(lb[it].w)) + p3.y;
+        if (i < n8) {
+            h4[i * 2u]      = ha[it];
+            h4[i * 2u + 1u] = hb[it];
+            ss = fmaf(ha[it].x, ha[it].x, fmaf(ha[it].y, ha[it].y, fmaf(ha[it].z, ha[it].z, fmaf(ha[it].w, ha[it].w, ss))));
+            ss = fmaf(hb[it].x, hb[it].x, fmaf(hb[it].y, hb[it].y, fmaf(hb[it].z, hb[it].z, fmaf(hb[it].w, hb[it].w, ss))));
+        }
+    }
+    VJ_AR_TS(4);
+    if (do_norm == 0u) return;
+
+    ss = vegajet::ornith_dev::wave64_sum(ss);
+    if (lane == 0u) sm_red[wave] = ss;
+    __syncthreads();
+    const float inv_rms = rsqrtf((sm_red[0] + sm_red[1] + sm_red[2] + sm_red[3]) / static_cast<float>(D) + eps);
+
+    const float4* w4 = reinterpret_cast<const float4*>(w_rms);
+    float4 wa[2], wb[2];
+    #pragma unroll
+    for (uint32_t it = 0u; it < 2u; ++it) {
+        const uint32_t i = min(tid + 256u * it, n8 - 1u);
+        wa[it] = w4[i * 2u];
+        wb[it] = w4[i * 2u + 1u];
+    }
+    __builtin_amdgcn_sched_barrier(0);
+    #pragma unroll
+    for (uint32_t it = 0u; it < 2u; ++it) {
+        // The reference adds the ROUNDED y values in its block-sum tree. Contraction is off here so the compiler
+        // cannot merge the multiply that produces y into the first tree add (that changes x_ds in the last bit).
+        #pragma clang fp contract(off)
+        const uint32_t i = tid + 256u * it;
+        float y[8], hs[8], ws[8];
+        hs[0] = ha[it].x * inv_rms; hs[1] = ha[it].y * inv_rms; hs[2] = ha[it].z * inv_rms; hs[3] = ha[it].w * inv_rms;
+        hs[4] = hb[it].x * inv_rms; hs[5] = hb[it].y * inv_rms; hs[6] = hb[it].z * inv_rms; hs[7] = hb[it].w * inv_rms;
+        ws[0] = wa[it].x; ws[1] = wa[it].y; ws[2] = wa[it].z; ws[3] = wa[it].w;
+        ws[4] = wb[it].x; ws[5] = wb[it].y; ws[6] = wb[it].z; ws[7] = wb[it].w;
+        float amax = 0.0f, t8[8];
+        #pragma unroll
+        for (uint32_t e = 0u; e < 8u; ++e) {
+            y[e] = hs[e] * ws[e];
+            amax = fmaxf(amax, fabsf(y[e]));
+            float v = y[e];
+            v += __shfl_xor(v, 2, 4);   // element ^ 16
+            v += __shfl_xor(v, 1, 4);   // element ^ 8
+            t8[e] = v;
+        }
+        amax = fmaxf(amax, __shfl_xor(amax, 2, 4));
+        amax = fmaxf(amax, __shfl_xor(amax, 1, 4));
+        const float bsum = (((t8[0] + t8[4]) + (t8[2] + t8[6])) + ((t8[1] + t8[5]) + (t8[3] + t8[7])));
+        const float d     = amax * (1.0f / 127.0f);
+        const float inv_d = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+        uint32_t q[2] = {0u, 0u};
+        #pragma unroll
+        for (uint32_t e = 0u; e < 8u; ++e)
+            q[e >> 2] |= (static_cast<uint32_t>(max(-127, min(127, __float2int_rn(y[e] * inv_d)))) & 0xFFu) << ((e & 3u) * 8u);
+        if (i < n8) {
+            if (xn) {
+                reinterpret_cast<float4*>(xn)[i * 2u]      = make_float4(y[0], y[1], y[2], y[3]);
+                reinterpret_cast<float4*>(xn)[i * 2u + 1u] = make_float4(y[4], y[5], y[6], y[7]);
+            }
+            reinterpret_cast<uint2*>(xq)[i] = make_uint2(q[0], q[1]);
+            if ((tid & 3u) == 0u) xd[i >> 2] = make_float2(d, bsum);
+        }
+    }
+    VJ_AR_TS(5);
+    #undef VJ_AR_TS
+}
+

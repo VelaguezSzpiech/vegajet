@@ -1,0 +1,237 @@
+#!/bin/sh
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+#
+# stream-test: packaged client harness for an installed VegaJet bundle.
+#
+# Starts the installed CLI as `vegajet serve --mock` on loopback, then requires:
+#   * GET /health returns 200,
+#   * POST /v1/chat/completions with stream=true answers with Content-Type text/event-stream,
+#   * at least two content deltas arrive before the terminal chunk,
+#   * a terminal chunk carries a non-null finish_reason ("stop" for the canned mock reply),
+#   * the stream ends with the literal SSE terminator `data: [DONE]`.
+#
+# This exercises the CPU mock engine only. It does not load a model, open /dev/kfd or run GPU inference; the
+# listening line must report engine=mock (or mock+scheduler) or the harness fails.
+#
+# Usage: stream-test [--vegajet PATH] [--timeout SECONDS]
+# Stable diagnostic names: E_USAGE, E_VEGAJET, E_DEPENDENCY, E_SPAWN, E_LISTEN, E_NOT_MOCK, E_HEALTH,
+# E_STREAM, E_FINISH, E_DONE, E_SERVER_STOP.
+
+set -u
+
+PROG=stream-test
+die() {
+    _name=$1
+    _rc=$2
+    shift 2
+    printf '%s: %s: %s\n' "$PROG" "$_name" "$*" >&2
+    exit "$_rc"
+}
+
+self=$0
+case $self in
+    */*) ;;
+    *) self=$(command -v "$self" 2>/dev/null) || die E_USAGE 2 "cannot find '$0' on PATH" ;;
+esac
+resolved=$(readlink -f -- "$self" 2>/dev/null) || resolved=$self
+self_dir=$(CDPATH= cd -- "$(dirname -- "$resolved")" 2>/dev/null && pwd -P) || die E_USAGE 2 "cannot resolve script directory"
+
+vegajet=${VEGAJET_BIN:-}
+[ -n "$vegajet" ] || vegajet=$self_dir/vegajet
+[ -x "$vegajet" ] || { vegajet=$(command -v vegajet 2>/dev/null || true); }
+timeout_s=20
+
+while [ $# -gt 0 ]; do
+    case $1 in
+        --vegajet)
+            [ $# -ge 2 ] || die E_USAGE 2 "--vegajet needs a path"
+            vegajet=$2
+            shift 2
+            ;;
+        --vegajet=*)
+            vegajet=${1#--vegajet=}
+            shift
+            ;;
+        --timeout)
+            [ $# -ge 2 ] || die E_USAGE 2 "--timeout needs seconds"
+            timeout_s=$2
+            shift 2
+            ;;
+        --help|-h)
+            printf 'usage: %s [--vegajet PATH] [--timeout SECONDS]\n' "$PROG"
+            exit 0
+            ;;
+        *) die E_USAGE 2 "unknown option: $1" ;;
+    esac
+done
+
+case $timeout_s in
+    ""|*[!0-9]*) die E_USAGE 2 "--timeout needs a whole number of seconds" ;;
+esac
+[ -n "$vegajet" ] || die E_VEGAJET 1 "no vegajet executable found (use --vegajet PATH)"
+[ -x "$vegajet" ] || die E_VEGAJET 1 "not executable: $vegajet"
+command -v python3 >/dev/null 2>&1 || die E_DEPENDENCY 1 "python3 is required by the stream-test client"
+
+exec python3 - "$vegajet" "$timeout_s" <<'PY'
+import http.client
+import json
+import os
+import queue
+import re
+import signal
+import subprocess
+import sys
+import threading
+import time
+
+PROG = "stream-test"
+vegajet, timeout_s = sys.argv[1], float(sys.argv[2])
+
+
+def fail(name, message, code=1):
+    print("%s: %s: %s" % (PROG, name, message), file=sys.stderr)
+    sys.exit(code)
+
+
+env = dict(os.environ)
+env.pop("VJ_GPU_DEVICES", None)
+
+try:
+    proc = subprocess.Popen(
+        [vegajet, "serve", "--mock", "--host", "127.0.0.1", "--port", "0"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+except OSError as exc:
+    fail("E_SPAWN", "cannot start %s: %s" % (vegajet, exc))
+
+line_q = queue.Queue()
+
+
+def read_listening_line():
+    line_q.put(proc.stdout.readline())
+
+
+threading.Thread(target=read_listening_line, daemon=True).start()
+try:
+    line = line_q.get(timeout=min(15.0, timeout_s))
+except queue.Empty:
+    proc.kill()
+    err = proc.stderr.read()
+    fail("E_LISTEN", "no listening line within %.0fs: %s" % (min(15.0, timeout_s), err.strip()))
+
+match = re.search(r"listening on http://([^:]+):(\d+) \((.*)\)", line)
+if not match:
+    proc.kill()
+    fail("E_LISTEN", "unexpected banner: %r" % line.strip())
+host, port, info = match.group(1), int(match.group(2)), match.group(3)
+engine_match = re.search(r"engine=([^,)]+)", info)
+engine = engine_match.group(1).strip() if engine_match else ""
+if not engine.startswith("mock"):
+    proc.kill()
+    fail("E_NOT_MOCK", "expected engine=mock*, got %r" % (info or "no engine field"))
+
+
+def stop_server():
+    if proc.poll() is None:
+        proc.send_signal(signal.SIGTERM)
+    try:
+        return proc.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        return None
+
+
+try:
+    conn = http.client.HTTPConnection(host, port, timeout=timeout_s)
+    conn.request("GET", "/health")
+    health = conn.getresponse()
+    health_body = health.read()
+    if health.status != 200:
+        fail("E_HEALTH", "GET /health -> %d: %r" % (health.status, health_body[:200]))
+
+    body = json.dumps(
+        {
+            "model": "vegajet-mock-gfx906",
+            "messages": [{"role": "user", "content": "stream-test"}],
+            "stream": True,
+            "max_tokens": 32,
+        }
+    )
+    conn.request("POST", "/v1/chat/completions", body, {"Content-Type": "application/json"})
+    resp = conn.getresponse()
+    if resp.status != 200:
+        fail("E_STREAM", "POST /v1/chat/completions -> %d: %r" % (resp.status, resp.read()[:200]))
+    ctype = resp.getheader("Content-Type") or ""
+    if "text/event-stream" not in ctype:
+        fail("E_STREAM", "expected text/event-stream, got %r" % ctype)
+
+    deltas = []
+    finish = None
+    saw_done = False
+    terminal_seen = False
+    deadline = time.time() + timeout_s
+
+    try:
+        while True:
+            if time.time() > deadline:
+                fail("E_STREAM", "stream did not finish within %.0fs" % timeout_s)
+            raw = resp.readline()
+            if not raw:
+                break
+            text = raw.decode("utf-8", "replace").rstrip("\r\n")
+            if not text:
+                continue
+            if not text.startswith("data: "):
+                continue
+            payload = text[len("data: "):]
+            if payload == "[DONE]":
+                saw_done = True
+                break
+            try:
+                event = json.loads(payload)
+            except json.JSONDecodeError as exc:
+                fail("E_STREAM", "malformed SSE JSON (%s): %r" % (exc, payload[:200]))
+            for choice in event.get("choices") or []:
+                delta = choice.get("delta") or {}
+                if delta.get("content"):
+                    if terminal_seen:
+                        fail("E_STREAM", "content delta arrived after finish_reason")
+                    deltas.append(delta["content"])
+                reason = choice.get("finish_reason")
+                if reason:
+                    terminal_seen = True
+                    finish = reason
+    except (OSError, http.client.HTTPException) as exc:
+        fail("E_STREAM", "stream read failed: %s" % exc)
+    resp.close()
+    conn.close()
+finally:
+    rc = stop_server()
+
+if len(deltas) < 2:
+    fail("E_STREAM", "expected at least two streamed content deltas, got %d" % len(deltas))
+content = "".join(deltas)
+if not content.strip():
+    fail("E_STREAM", "streamed content was empty")
+if finish is None:
+    fail("E_FINISH", "no finish_reason in the streamed response")
+if finish != "stop":
+    fail("E_FINISH", "expected finish_reason=stop, got %r" % finish)
+if not saw_done:
+    fail("E_DONE", "stream ended without the data: [DONE] terminator")
+if rc != 0:
+    fail("E_SERVER_STOP", "server exited %r after SIGTERM" % rc)
+
+print(
+    "%s: PASS engine=%s content_deltas=%d chars=%d finish_reason=%s done=yes"
+    % (PROG, engine, len(deltas), len(content), finish)
+)
+print(
+    "%s: note: exercised the CPU mock engine (serve --mock) over loopback; no GPU inference was performed."
+    % PROG
+)
+PY

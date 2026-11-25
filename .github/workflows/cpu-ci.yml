@@ -1,0 +1,66 @@
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# CPU regression on every push / pull request (tools/ci_regression.py --cpu-only: -O3 -Werror ctest, ASan + UBSan
+# ctest, tool self-tests, privacy audit), and the nightly GPU matrix on a self-hosted gfx906 runner
+# (tools/ci_regression.py --gpu-matrix 1,2,3: 0 B spill, 0 UE / DE, 32/32 + 129/129 parity, throughput vs baseline).
+name: CPU checks
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  cpu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # the privacy audit also reads the history
+      - name: Toolchain
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake g++ python3
+      - name: CPU regression (-O3 -Werror + ASan/UBSan ctest, self-tests, privacy)
+        run: python3 tools/ci_regression.py --cpu-only --jobs 4 --report ci-report.json
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+          PYTHONDONTWRITEBYTECODE: "1"
+      - name: Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-report
+          path: ci-report.json
+          if-no-files-found: ignore
+  gpu-matrix:
+    # Nightly / manual only, on a registered self-hosted runner with the GPUs (labels: self-hosted, linux, gfx906).
+    # Repository variables: NIGHTLY_MODEL (model file on the runner), NIGHTLY_BASELINE_DIR (tp1.json, tp2.json, ...),
+    # NIGHTLY_RUNNER (optional command prefix, e.g. the rig's GPU lock wrapper).
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, linux, gfx906]
+    timeout-minutes: 240
+    concurrency:
+      group: gpu-matrix
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (GPU)
+        run: cmake -S . -B build-gpu -DCMAKE_BUILD_TYPE=Release && cmake --build build-gpu -j
+      - name: GPU matrix TP 1,2,3
+        env:
+          MODEL: ${{ vars.NIGHTLY_MODEL }}
+          BASELINE_DIR: ${{ vars.NIGHTLY_BASELINE_DIR }}
+          RUNNER: ${{ vars.NIGHTLY_RUNNER }}
+        run: >-
+          python3 tools/ci_regression.py --gpu-matrix 1,2,3 --preflight --vegajet build-gpu/vegajet
+          --model "$MODEL" ${BASELINE_DIR:+--baseline-dir "$BASELINE_DIR"} --runner "$RUNNER"
+          --out-dir nightly --report nightly/report.json
+      - name: Scorecards
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-matrix
+          path: nightly/
+          if-no-files-found: ignore

@@ -1,0 +1,311 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+#pragma once
+// Launch WY then normq on one stream; 32 heads x four splits, 256 threads.
+#include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+#include <stdint.h>
+
+namespace vegajet {
+namespace wy128 {
+
+__device__ __forceinline__ float wave64_sum(float v) {   // identical tree to ornith_dev::wave64_sum
+    v += __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(v), 0x041F));
+    v += __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(v), 0x081F));
+    v += __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(v), 0x101F));
+    v += __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(v), 0x201F));
+    v += __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(v), 0x401F));
+    v += __shfl_xor(v, 32, 64);
+    return v;
+}
+
+// Opaque copy of a per-thread value: an empty asm register fence (no instruction is emitted) so that each phase
+// of the chunk loop recomputes its own thread-derived LDS / global offsets instead of the compiler hoisting ~30
+// of them out of the loop and holding them in VGPRs for the whole kernel (the M = 1 split-V kernel's note).
+__device__ __forceinline__ uint32_t opaque_u32(uint32_t v) {
+    asm volatile("" : "+v"(v));
+    return v;
+}
+
+// Deferred gated RMSNorm + block-32 quant for the 32 columns [col0, col0+32) of head hv, all M tokens.
+// Wave w handles tokens w, w+4, ...: the 64 lanes reduce the head's 64 pair-squares with the 5b wave64 tree,
+// lanes 0..15 then finish 2 columns each with 5b's 16-lane amax / sum trees.
+__device__ __forceinline__ void norm_quant_part(const float* __restrict__ fo_scratch, const float* __restrict__ sq_scratch,
+                                                const float* __restrict__ qkv_gab_in, const float* __restrict__ ssm_norm_w,
+                                                int8_t* __restrict__ out_q8, float2* __restrict__ out_ds,
+                                                uint32_t M, uint32_t nv, uint32_t hv, uint32_t part,
+                                                uint32_t stride_in, uint32_t z_off, float eps) {
+    const uint32_t wave = __builtin_amdgcn_readfirstlane(threadIdx.x >> 6);
+    const uint32_t lane = threadIdx.x & 63u;
+    const uint32_t l16  = lane & 15u;
+    const uint32_t col0 = part * 32u;
+    const uint32_t j0   = col0 + l16 * 2u;
+    const float w0 = ssm_norm_w[j0], w1 = ssm_norm_w[j0 + 1u];
+    #pragma nounroll
+    for (uint32_t m = wave; m < M; m += 4u) {
+        const uint64_t mh = static_cast<uint64_t>(m) * nv + hv;
+        const float lane_sq  = sq_scratch[mh * 64u + lane];
+        const float total_sq = wave64_sum(lane_sq);
+        const float inv_r = rsqrtf(total_sq * (1.0f / 128.0f) + eps);
+        const float fo0 = fo_scratch[mh * 128u + j0];
+        const float fo1 = fo_scratch[mh * 128u + j0 + 1u];
+        const float* zp = qkv_gab_in + static_cast<uint64_t>(m) * stride_in + z_off + hv * 128u;
+        const float z0 = zp[j0], z1 = zp[j0 + 1u];
+        const float y0 = (fo0 * inv_r * w0) * (z0 / (1.0f + __expf(-z0)));
+        const float y1 = (fo1 * inv_r * w1) * (z1 / (1.0f + __expf(-z1)));
+
+        float amax = fmaxf(fabsf(y0), fabsf(y1));
+        amax = fmaxf(amax, __shfl_xor(amax, 8, 16));
+        amax = fmaxf(amax, __shfl_xor(amax, 4, 16));
+        amax = fmaxf(amax, __shfl_xor(amax, 2, 16));
+        amax = fmaxf(amax, __shfl_xor(amax, 1, 16));
+        float bsum = y0 + y1;
+        bsum += __shfl_xor(bsum, 8, 16);
+        bsum += __shfl_xor(bsum, 4, 16);
+        bsum += __shfl_xor(bsum, 2, 16);
+        bsum += __shfl_xor(bsum, 1, 16);
+        const float d     = amax * (1.0f / 127.0f);
+        const float inv_d = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+        if (lane < 16u) {
+            int8_t* oq = out_q8 + mh * 128u;
+            oq[j0]      = static_cast<int8_t>(max(-127, min(127, __float2int_rn(y0 * inv_d))));
+            oq[j0 + 1u] = static_cast<int8_t>(max(-127, min(127, __float2int_rn(y1 * inv_d))));
+            if (lane == 0u) out_ds[mh * 4u + part] = make_float2(d, bsum);
+        }
+    }
+}
+
+// Per token, the 32 fo values of this part go to fo_scratch and the 16 pair-squares (fo[2l]^2 + fo[2l+1]^2, the
+// same expression as 5b) to sq_scratch[m][hv][part*16 + l]. Called by threads 0..31 (one wave half).
+__device__ __forceinline__ void emit_fo(float fo, float* __restrict__ fo_scratch, float* __restrict__ sq_scratch,
+                                        uint64_t mh, uint32_t part, uint32_t c) {
+    fo_scratch[mh * 128u + part * 32u + c] = fo;
+    const float fo1 = __shfl_down(fo, 1, 64);
+    const float fo0 = fo;
+    if ((c & 1u) == 0u) sq_scratch[mh * 64u + part * 16u + (c >> 1)] = fo0 * fo0 + fo1 * fo1;
+}
+
+} // namespace wy128
+} // namespace vegajet
+extern "C" __global__ __launch_bounds__(256, 4)
+void vj_prefill_gdn_128wg_normq(
+    const float* __restrict__ fo_scratch,
+    const float* __restrict__ sq_scratch,
+    const float* __restrict__ qkv_gab_in,
+    const float* __restrict__ ssm_norm_w,
+    int8_t*      __restrict__ out_q8,
+    float2*      __restrict__ out_ds,
+    uint32_t M,
+    uint32_t nv,
+    uint32_t stride_in,
+    uint32_t z_off,
+    float    eps) {
+    vegajet::wy128::norm_quant_part(fo_scratch, sq_scratch, qkv_gab_in, ssm_norm_w, out_q8, out_ds,
+                                   M, nv, blockIdx.x >> 2, blockIdx.x & 3u, stride_in, z_off, eps);
+}
+
+// ============================================================================
+// (a) Chunked WY / Neumann prefill, each head split over 4 WGs by value columns (nv * 4 = 128 WGs), C = 16.
+//   Per chunk of C tokens (cum_g[t] = prod_{u <= t} g_u):
+//     A[r][c]  = -beta_r (cum_g[r] / cum_g[c]) (k_r . k_c)   (r > c),  T = (I - A)^-1 = (I+A)(I+A^2)(I+A^4)(I+A^8)
+//     QK[r][c] =  (cum_g[r] / cum_g[c]) (q_r . k_c)            (r >= c)
+//     rhs[t][j] = beta_t (v_t[j] - cum_g[t] (k_t . S[:, j])),  dv = T rhs
+//     O[t][j]   = cum_g[t] (q_t . S[:, j]) + sum_{u <= t} QK[t][u] dv[u][j]
+//     S[i][j]   = cum_g[C-1] S[i][j] + sum_u (cum_g[C-1] / cum_g[u]) k_u[i] dv[u][j]
+//   Same algebra and the same per-entry expressions as ornith_gdn_wy_prefill_quant_kernel; the C x C matrices are
+//   recomputed by each of a head's 4 WGs (32 K MACs each), S lives in registers (thread = 16 rows x 1 column).
+//   C = 32 is not offered: K and Q chunks alone would be 32 KiB of LDS (1 WG/CU).
+//   No grid barrier: the RMS is deferred to vj_prefill_gdn_128wg_normq (same fo / sq scratch as (b)).
+// Kernargs: S_all (state, [nv][128][128]), conv_qkv, decay_in, beta_in, fo_scratch, sq_scratch, M, nk, nv, conv_dim
+// Grid: nv * 4 WGs, block 256. LDS 30,848 B -> 2 WGs/CU (120 resident; no barrier, so 128 WGs is fine).
+// Measured: 37 VGPRs (opaque per-phase thread ids), 0 spill.
+// ============================================================================
+extern "C" __global__ __launch_bounds__(256, 2)
+void vj_prefill_gdn_128wg(
+    float*       __restrict__ S_all,
+    const float* __restrict__ conv_qkv,
+    const float* __restrict__ decay_in,
+    const float* __restrict__ beta_in,
+    float*       __restrict__ fo_scratch,
+    float*       __restrict__ sq_scratch,
+    uint32_t M,
+    uint32_t nk,
+    uint32_t nv,
+    uint32_t conv_dim) {
+    constexpr uint32_t C = 16u;
+    const uint32_t hv   = blockIdx.x >> 2;
+    const uint32_t part = blockIdx.x & 3u;
+    const uint32_t tid  = threadIdx.x;
+    const uint32_t col0 = part * 32u;
+    const uint32_t hk   = hv % nk;
+
+    __shared__ float sm_k[C * 128u];          // 8 KiB
+    __shared__ float sm_q[C * 128u];          // 8 KiB
+    __shared__ float sm_T[C * C];             // 1 KiB
+    __shared__ float sm_QK[C * C];            // 1 KiB
+    __shared__ float sm_u[2u * 4u * 8u * 32u];// 8 KiB union: Neumann P, tmp | row-group partials | dv
+    __shared__ float sm_rhs[C * 32u];         // 2 KiB (rhs, later dv)
+    __shared__ float sm_qs[C * 32u];          // 2 KiB
+    __shared__ float sm_cg[C];
+    __shared__ float sm_beta[C];
+
+    float s_reg[16];
+    {
+        float* S_thr = S_all + static_cast<uint64_t>(hv) * 16384ULL + ((tid >> 5) * 16u + 8u) * 128u + col0 + (tid & 31u);
+        #pragma unroll
+        for (uint32_t r = 0u; r < 16u; ++r) s_reg[r] = S_thr[(static_cast<int32_t>(r) - 8) * 128];
+    }
+
+    #pragma nounroll
+    for (uint32_t m0 = 0u; m0 < M; m0 += C) {
+        const uint32_t clen = min(C, M - m0);
+        if (tid == 0u) {
+            float acc = 1.0f;
+            for (uint32_t t = 0u; t < C; ++t) {
+                if (t < clen) acc *= decay_in[static_cast<uint64_t>(m0 + t) * nv + hv];
+                sm_cg[t] = acc;
+            }
+        }
+        {
+            const uint32_t tq = vegajet::wy128::opaque_u32(threadIdx.x);
+            if (tq < C) sm_beta[tq] = (tq < clen) ? beta_in[static_cast<uint64_t>(m0 + tq) * nv + hv] : 0.0f;
+        }
+        #pragma unroll
+        for (uint32_t e = vegajet::wy128::opaque_u32(threadIdx.x); e < C * 128u; e += 256u) {
+            const uint32_t t = e >> 7, d = e & 127u;
+            const float* br = conv_qkv + static_cast<uint64_t>(m0 + min(t, clen - 1u)) * conv_dim;
+            sm_q[e] = (t < clen) ? br[hk * 128u + d] : 0.0f;
+            sm_k[e] = (t < clen) ? br[(nk + hk) * 128u + d] : 0.0f;
+        }
+        __syncthreads();
+
+        // C x C matrices (redundant per WG): thread (r, cc) = (tid >> 4, tid & 15).
+        float* sm_P = sm_u;
+        float* sm_tmp = sm_u + C * C;
+        {
+            const uint32_t tq = vegajet::wy128::opaque_u32(threadIdx.x);
+            const uint32_t r = tq >> 4, cc = tq & 15u;
+            const bool valid = (r < clen && cc < clen);
+            const float ratio = (valid && r >= cc) ? (sm_cg[r] / fmaxf(sm_cg[cc], 1e-30f)) : 0.0f;
+            float kk = 0.0f, qk = 0.0f;
+            if (valid && r >= cc) {
+                #pragma nounroll
+                for (uint32_t d = 0u; d < 128u; ++d) {
+                    const float kcv = sm_k[cc * 128u + d];
+                    if (r > cc) kk = fmaf(sm_k[r * 128u + d], kcv, kk);
+                    qk = fmaf(sm_q[r * 128u + d], kcv, qk);
+                }
+            }
+            const float a_val = (valid && r > cc) ? (-sm_beta[r] * ratio * kk) : 0.0f;
+            sm_P[tq]  = a_val;
+            sm_T[tq]  = (r == cc) ? 1.0f : a_val;
+            sm_QK[tq] = (valid && r >= cc) ? (ratio * qk) : 0.0f;
+            __syncthreads();
+            #pragma unroll
+            for (uint32_t st = 0u; st < 3u; ++st) {
+                float p2 = 0.0f;
+                if (r > cc) {
+                    #pragma nounroll
+                    for (uint32_t k = cc + 1u; k < r; ++k) p2 = fmaf(sm_P[r * C + k], sm_P[k * C + cc], p2);
+                }
+                sm_tmp[tq] = p2; __syncthreads();
+                sm_P[tq] = p2;   __syncthreads();
+                float tp = sm_T[tq];
+                if (r > cc) {
+                    #pragma nounroll
+                    for (uint32_t k = cc + 1u; k <= r; ++k) tp = fmaf(sm_T[r * C + k], sm_P[k * C + cc], tp);
+                }
+                sm_tmp[tq] = tp; __syncthreads();
+                sm_T[tq] = tp;   __syncthreads();
+            }
+        }
+
+        // k_t . S[:, j] and q_t . S[:, j] for this WG's 32 columns: row-group partials, 4 tokens per round.
+        #pragma nounroll
+        for (uint32_t tb = 0u; tb < C; tb += 4u) {
+            const uint32_t tq0 = vegajet::wy128::opaque_u32(threadIdx.x);
+            const uint32_t c = tq0 & 31u, rg = tq0 >> 5, i_beg = rg * 16u;
+            #pragma nounroll
+            for (uint32_t tl = 0u; tl < 4u; ++tl) {
+                const uint32_t t = tb + tl;
+                float pk = 0.0f, pq = 0.0f;
+                #pragma unroll
+                for (uint32_t r = 0u; r < 16u; ++r) {
+                    pk = fmaf(s_reg[r], sm_k[t * 128u + i_beg + r], pk);
+                    pq = fmaf(s_reg[r], sm_q[t * 128u + i_beg + r], pq);
+                    if ((r & 3u) == 3u) __builtin_amdgcn_sched_barrier(0);
+                }
+                sm_u[((0u * 4u + tl) * 8u + rg) * 32u + c] = pk;
+                sm_u[((1u * 4u + tl) * 8u + rg) * 32u + c] = pq;
+            }
+            __syncthreads();
+            {
+                const uint32_t tq = vegajet::wy128::opaque_u32(threadIdx.x);
+                const uint32_t kind = tq >> 7, tl = (tq >> 5) & 3u, cc = tq & 31u, t = tb + tl;
+                const float* pr = sm_u + ((kind * 4u + tl) * 8u) * 32u + cc;
+                const float sum = pr[0] + pr[32] + pr[64] + pr[96] + pr[128] + pr[160] + pr[192] + pr[224];
+                if (kind == 0u) {
+                    float rhs = 0.0f;
+                    if (t < clen) {
+                        const float vj = conv_qkv[static_cast<uint64_t>(m0 + t) * conv_dim + (2u * nk + hv) * 128u + col0 + cc];
+                        rhs = sm_beta[t] * (vj - sum * sm_cg[t]);
+                    }
+                    sm_rhs[t * 32u + cc] = rhs;
+                } else {
+                    sm_qs[t * 32u + cc] = (t < clen) ? sum * sm_cg[t] : 0.0f;
+                }
+            }
+            __syncthreads();
+        }
+
+        // dv = T rhs (in place into sm_u as scratch, then back), O = qs + QK dv -> fo / sq scratch.
+        float* sm_dv = sm_u;
+        #pragma unroll
+        for (uint32_t h = 0u; h < 2u; ++h) {
+            const uint32_t idx = vegajet::wy128::opaque_u32(threadIdx.x) + 256u * h, t = idx >> 5, cc = idx & 31u;
+            float dv = 0.0f;
+            if (t < clen) {
+                #pragma nounroll
+                for (uint32_t u = 0u; u <= t; ++u) dv = fmaf(sm_T[t * C + u], sm_rhs[u * 32u + cc], dv);
+            }
+            sm_dv[t * 32u + cc] = dv;
+        }
+        __syncthreads();
+        #pragma unroll
+        for (uint32_t h = 0u; h < 2u; ++h) {
+            const uint32_t idx = vegajet::wy128::opaque_u32(threadIdx.x) + 256u * h, t = idx >> 5, cc = idx & 31u;
+            if (t < clen) {
+                float intra = 0.0f;
+                #pragma nounroll
+                for (uint32_t u = 0u; u <= t; ++u) intra = fmaf(sm_QK[t * C + u], sm_dv[u * 32u + cc], intra);
+                const float fo = sm_qs[t * 32u + cc] + intra;
+                const uint64_t mh = static_cast<uint64_t>(m0 + t) * nv + hv;
+                vegajet::wy128::emit_fo(fo, fo_scratch, sq_scratch, mh, part, cc);
+            }
+        }
+
+        // State update in registers.
+        const float g_end = sm_cg[clen - 1u];
+        const uint32_t tqs = vegajet::wy128::opaque_u32(threadIdx.x);
+        const uint32_t c = tqs & 31u, i_beg = (tqs >> 5) * 16u;
+        #pragma unroll
+        for (uint32_t r = 0u; r < 16u; ++r) s_reg[r] *= g_end;
+        #pragma nounroll
+        for (uint32_t u = 0u; u < clen; ++u) {
+            const float coef = g_end / fmaxf(sm_cg[u], 1e-30f);
+            const float dvu  = sm_dv[u * 32u + c];
+            #pragma unroll
+            for (uint32_t r = 0u; r < 16u; ++r) {
+                s_reg[r] = fmaf(coef * sm_k[u * 128u + i_beg + r], dvu, s_reg[r]);
+                if ((r & 3u) == 3u) __builtin_amdgcn_sched_barrier(0);
+            }
+        }
+        __syncthreads();
+    }
+
+    {
+        const uint32_t tq = vegajet::wy128::opaque_u32(threadIdx.x);
+        float* S_thr = S_all + static_cast<uint64_t>(hv) * 16384ULL + ((tq >> 5) * 16u + 8u) * 128u + col0 + (tq & 31u);
+        #pragma unroll
+        for (uint32_t r = 0u; r < 16u; ++r) S_thr[(static_cast<int32_t>(r) - 8) * 128] = s_reg[r];
+    }
+}

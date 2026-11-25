@@ -1,0 +1,2 @@
+# Rig-specific agent instructions never leave the repository through `git archive` (the public export).
+CLAUDE.md export-ignore

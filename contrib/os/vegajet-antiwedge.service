@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+# Inert template: nothing in the VegaJet tree installs, enables or starts this unit. Copy by hand after review.
+#
+# Read-only anti-wedge preflight: journal the kernel release and the amdgpu command line once, so a later hang or
+# reboot can be correlated with the boot flags that were actually active. It never writes to sysfs/procfs, never
+# opens /dev/kfd, and never changes GPU or power state.
+
+[Unit]
+Description=VegaJet read-only anti-wedge preflight (inert template; not enabled)
+ConditionPathExists=/dev/kfd
+After=systemd-udev-settle.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'echo "vegajet-antiwedge: kernel=$(uname -r)"; echo "vegajet-antiwedge: cmdline=$(cat /proc/cmdline)"'
+Nice=19
+IOSchedulingClass=idle
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadOnlyPaths=/proc /sys
+
+[Install]
+WantedBy=multi-user.target

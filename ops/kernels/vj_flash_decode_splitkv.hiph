@@ -1,0 +1,189 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+#pragma once
+#include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+#include <stdint.h>
+#include <stddef.h>
+
+// Standalone gfx906, wave64. Include in exactly one HIP translation unit.
+// Wire layout (all allocations 16-byte aligned):
+// Q[M][16][8][B], K[T][8][B], V[T][8][B], byte arrays.
+// B=48 (Q8_0), B=32 (Q4_0). Each block has FP16 d at byte 0,
+// ignored bytes 2..15, and native payload at byte 16. Q8 payload is
+// 32 signed bytes. Q4 payload is 16 bytes: low nibble = element j,
+// high nibble = element j+16, each unsigned nibble minus 8. These are
+// aligned envelopes of native blocks, NOT byte-compatible GGUF strides.
+// Q has the same format as K/V. Values/scales and attention_scale must be
+// finite, and resulting scores must be finite. No runtime quantization.
+// Launch partition: block=(256,1,1), grid=(S,M,1), M=1 or 5..8.
+// Scratch partial[M][16][S][256] and lse[M][16][S] are FP32.
+// Split s covers [floor(T*s/S),floor(T*(s+1)/S)); causal t<=past+m.
+// T>=0,past>=0,S>=1. Empty splits write zero and -infinity.
+// Launch merge: block=(256,1,1), grid=(16,M,1).
+// Output[M][16][256], output_lse[M][16], both FP32.
+// All pointers must be nonaliasing, valid for their entire declared extent;
+// scratch allocation products must fit size_t, dimensions fit signed int.
+// Each token's K/V bytes are read once per partition/query, shared by all
+// 16 heads. Different query positions are separate blocks (not cross-M reuse).
+// Padded LDS block strides are odd vector counts (Q8 80B, Q4 48B).
+// Static LDS: Q8 1280 bytes; Q4 768 bytes. Resource TARGET, not a claim:
+// <=56 VGPR, <=18 KiB LDS, zero private bytes; inspect compiled symbols.
+// Production launch plan: S>=ceil(60/M) => >=240 launched wave64s.
+// S=1 is a correctness case; grid waves (including empty splits) are NOT
+// simultaneous resident/useful waves. Residency needs resource/ISA evidence
+// and runtime measurements. Prefer T/S large enough for useful work.
+namespace vj_flash_splitkv {
+using u32x4 = uint32_t __attribute__((ext_vector_type(4)));
+
+__device__ __forceinline__ float scale(const unsigned char* p) {
+    return __half2float(__ushort_as_half(*reinterpret_cast<const uint16_t*>(p)));
+}
+
+// Register-target MUBUF, followed by an explicit LDS vector store. Never use
+// buffer_load_dwordx4 ... lds: that form is not legal on gfx906.
+__device__ __forceinline__ void stage16(const unsigned char* base,
+                                       uint32_t offset, unsigned char* dst) {
+    const uintptr_t address = reinterpret_cast<uintptr_t>(base);
+    const u32x4 resource = {uint32_t(address), uint32_t(address >> 32),
+                            0xffffffffu, 0x00020000u};
+    u32x4 data;
+    asm volatile("buffer_load_dwordx4 %0, %1, %2, 0 offen\n\t"
+                 "s_waitcnt vmcnt(0)"
+                 : "=v"(data) : "v"(offset), "s"(resource) : "memory");
+    const uint32_t shared_address = uint32_t(reinterpret_cast<uintptr_t>(dst));
+    asm volatile("ds_write_b128 %0, %1\n\t"
+                 "s_waitcnt lgkmcnt(0)"
+                 : : "v"(shared_address), "v"(data) : "memory");
+}
+
+template<bool Q4>
+__device__ __forceinline__ int dot(uint32_t a, uint32_t b, int c) {
+    if constexpr (Q4) {
+        // XOR converts each native unsigned biased nibble into signed int4.
+        a ^= 0x88888888u;
+        b ^= 0x88888888u;
+        asm("v_dot8_i32_i4 %0, %1, %2, %0" : "+v"(c) : "v"(a), "v"(b));
+    } else {
+        asm("v_dot4_i32_i8 %0, %1, %2, %0" : "+v"(c) : "v"(a), "v"(b));
+    }
+    return c;
+}
+
+template<bool Q4>
+__device__ __forceinline__ float value(const unsigned char* block, int i) {
+    int v;
+    if constexpr (Q4) {
+        const unsigned b = block[16 + (i & 15)];
+        v = int((b >> ((i >> 4) * 4)) & 15) - 8;
+    } else {
+        v = reinterpret_cast<const int8_t*>(block + 16)[i];
+    }
+    return float(v) * scale(block);
+}
+
+template<bool Q4>
+__device__ __forceinline__ void partition(
+    const unsigned char* __restrict__ q, const unsigned char* __restrict__ k,
+    const unsigned char* __restrict__ v, float* __restrict__ partial,
+    float* __restrict__ lse, int T, int past, int S, float attention_scale,
+    unsigned char* shared) {
+    constexpr int B = Q4 ? 32 : 48;
+    constexpr int L = Q4 ? 48 : 80;
+    const int tid = int(threadIdx.x), lane = tid & 15, head = tid >> 4;
+    const int m = int(blockIdx.y), s = int(blockIdx.x);
+    const int begin = int((int64_t(T) * s) / S);
+    const int end = int((int64_t(T) * (s + 1)) / S);
+    const int64_t causal_end = int64_t(past) + m + 1;
+    const int stop = int(int64_t(end) < causal_end ? end : causal_end);
+    float acc[16] = {};
+    float maximum = -INFINITY, denominator = 0.0f;
+    #pragma nounroll
+    for (int t = begin; t < stop; ++t) {
+        if (tid < 8 * (B / 16)) {
+            const int b = tid / (B / 16), chunk = tid % (B / 16);
+            stage16(k + size_t(t) * 8 * B, uint32_t(tid * 16),
+                    shared + b * L + chunk * 16);
+            stage16(v + size_t(t) * 8 * B, uint32_t(tid * 16),
+                    shared + 8 * L + b * L + chunk * 16);
+        }
+        __syncthreads();
+        float score = 0.0f;
+        if (lane < 8) {
+            const unsigned char* qb = q + ((size_t(m) * 16 + head) * 8 + lane) * B;
+            const unsigned char* kb = shared + lane * L;
+            const uint32_t* qp = reinterpret_cast<const uint32_t*>(qb + 16);
+            const uint32_t* kp = reinterpret_cast<const uint32_t*>(kb + 16);
+            int sum = 0;
+            #pragma nounroll
+            for (int j = 0; j < (Q4 ? 4 : 8); ++j)
+                sum = dot<Q4>(qp[j], kp[j], sum);
+            score = (float(sum) * scale(qb)) * scale(kb);
+        }
+        #pragma unroll
+        for (int delta = 8; delta; delta >>= 1)
+            score += __shfl_xor(score, delta, 16);
+        score *= attention_scale;
+        const float next = fmaxf(maximum, score);
+        const float alpha = expf(maximum - next);
+        const float beta = expf(score - next);
+        denominator = denominator * alpha + beta;
+        maximum = next;
+        #pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const int d = lane + j * 16;
+            const float val = value<Q4>(shared + 8 * L + (d / 32) * L, d & 31);
+            acc[j] = fmaf(beta, val, acc[j] * alpha);
+        }
+        __syncthreads();
+    }
+    const size_t row = (size_t(m) * 16 + head) * S + s;
+    const float reciprocal = denominator > 0.0f ? 1.0f / denominator : 0.0f;
+    #pragma unroll
+    for (int j = 0; j < 16; ++j)
+        partial[row * 256 + lane + j * 16] = acc[j] * reciprocal;
+    if (lane == 0)
+        lse[row] = denominator > 0.0f ? maximum + logf(denominator) : -INFINITY;
+}
+} // namespace vj_flash_splitkv
+
+extern "C" __global__ __launch_bounds__(256)
+void vj_flash_decode_q8_partition(
+    const unsigned char* __restrict__ q, const unsigned char* __restrict__ k,
+    const unsigned char* __restrict__ v, float* __restrict__ partial,
+    float* __restrict__ lse, int T, int past, int S, float attention_scale) {
+    __shared__ __align__(16) unsigned char shared[1280];
+    vj_flash_splitkv::partition<false>(q, k, v, partial, lse, T, past, S,
+                                      attention_scale, shared);
+}
+
+extern "C" __global__ __launch_bounds__(256)
+void vj_flash_decode_q4_partition(
+    const unsigned char* __restrict__ q, const unsigned char* __restrict__ k,
+    const unsigned char* __restrict__ v, float* __restrict__ partial,
+    float* __restrict__ lse, int T, int past, int S, float attention_scale) {
+    __shared__ __align__(16) unsigned char shared[768];
+    vj_flash_splitkv::partition<true>(q, k, v, partial, lse, T, past, S,
+                                     attention_scale, shared);
+}
+
+extern "C" __global__ __launch_bounds__(256)
+void vj_flash_decode_merge(const float* __restrict__ partial,
+                          const float* __restrict__ lse,
+                          float* __restrict__ output,
+                          float* __restrict__ output_lse, int S) {
+    const size_t head = size_t(blockIdx.y) * 16 + blockIdx.x;
+    const unsigned d = threadIdx.x;
+    float maximum = -INFINITY;
+    for (int s = 0; s < S; ++s) maximum = fmaxf(maximum, lse[head * S + s]);
+    float numerator = 0.0f, denominator = 0.0f;
+    for (int s = 0; s < S; ++s) {
+        const float x = lse[head * S + s];
+        // Avoid -inf - -inf for an all-empty attention window.
+        const float weight = x == -INFINITY ? 0.0f : expf(x - maximum);
+        numerator = fmaf(weight, partial[(head * S + s) * 256 + d], numerator);
+        denominator += weight;
+    }
+    output[head * 256 + d] = denominator > 0.0f ? numerator / denominator : 0.0f;
+    if (d == 0)
+        output_lse[head] = denominator > 0.0f ? maximum + logf(denominator) : -INFINITY;
+}

@@ -1,0 +1,1688 @@
+#pragma once
+
+#include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+#include <stdint.h>
+
+// ============================================================================
+// VegaJet Canonical Native gfx906 (Vega 20) Quantization Ops
+// Model-agnostic kernels for the 3 canonical VRAM formats:
+//   1. VJ_Q8_DP4A : b=32 planar INT8 + FP16 scales (v_dot4_i32_i8, 53.6 TOPS)
+//   2. VJ_Q4_DOT8 : b=32 planar signed INT4 (8x4b/u32) + FP16 scales + optional FWHT-64 (v_dot8_i32_i4)
+//   3. VJ_IQ_PACKED: sub-4-bit LDS codebook kernels (in model-specific dispatchers)
+// ============================================================================
+
+namespace vegajet {
+namespace dev {
+
+typedef uint32_t vj_u32x4 __attribute__((ext_vector_type(4)));
+
+__device__ __forceinline__ int32_t vj_sdot4(uint32_t a, uint32_t b, int32_t c) {
+    return __builtin_amdgcn_sdot4(static_cast<int32_t>(a), static_cast<int32_t>(b), c, false);
+}
+
+__device__ __forceinline__ int32_t vj_sdot8(uint32_t a, uint32_t b, int32_t c) {
+    return __builtin_amdgcn_sdot8(static_cast<int32_t>(a), static_cast<int32_t>(b), c, false);
+}
+
+__device__ __forceinline__ float vj_fp16_to_f32(uint16_t h) {
+    return __half2float(__ushort_as_half(h));
+}
+
+__device__ __forceinline__ uint4 vj_ldg_u32x4_stream(const uint4* ptr) {
+    vj_u32x4 v = __builtin_nontemporal_load(reinterpret_cast<const vj_u32x4*>(ptr));
+    return make_uint4(v[0], v[1], v[2], v[3]);
+}
+
+__device__ __forceinline__ uint32_t vj_ldg_u32_stream(const uint32_t* ptr) {
+    return __builtin_nontemporal_load(ptr);
+}
+
+__device__ __forceinline__ float vj_block32_sum(float v) {
+    v += __shfl_xor(v, 16, 32);
+    v += __shfl_xor(v, 8,  32);
+    v += __shfl_xor(v, 4,  32);
+    v += __shfl_xor(v, 2,  32);
+    v += __shfl_xor(v, 1,  32);
+    return v;
+}
+
+__device__ __forceinline__ float vj_wave64_sum(float v) {
+    v += __shfl_xor(v, 32, 64);
+    v += __shfl_xor(v, 16, 64);
+    v += __shfl_xor(v, 8,  64);
+    v += __shfl_xor(v, 4,  64);
+    v += __shfl_xor(v, 2,  64);
+    v += __shfl_xor(v, 1,  64);
+    return v;
+}
+
+// Register-resident 64-point normalized FWHT across one Wave64 (zero LDS, zero barriers!)
+__device__ __forceinline__ float vj_fwht64_wave64(float x, uint32_t lane) {
+    #pragma unroll
+    for (uint32_t s = 1u; s < 64u; s <<= 1u) {
+        float peer = __shfl_xor(x, static_cast<int>(s), 64);
+        x = ((lane & s) == 0u) ? (x + peer) : (peer - x);
+    }
+    return x * 0.125f;
+}
+
+// Unpack 4 signed 4-bit nibbles (low 16 bits of word) into 4 signed INT8 bytes packed in uint32_t
+__device__ __forceinline__ uint32_t vj_unpack_4nib_to_i8x4(uint32_t w16) {
+    // Sign-extend each 4-bit two's-complement nibble to 8-bit signed byte
+    uint32_t b0 = static_cast<uint32_t>(static_cast<int8_t>((w16 & 0xFu) << 4) >> 4) & 0xFFu;
+    uint32_t b1 = static_cast<uint32_t>(static_cast<int8_t>(((w16 >> 4) & 0xFu) << 4) >> 4) & 0xFFu;
+    uint32_t b2 = static_cast<uint32_t>(static_cast<int8_t>(((w16 >> 8) & 0xFu) << 4) >> 4) & 0xFFu;
+    uint32_t b3 = static_cast<uint32_t>(static_cast<int8_t>(((w16 >> 12) & 0xFu) << 4) >> 4) & 0xFFu;
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+}
+
+} // namespace dev
+} // namespace vegajet
+
+// ============================================================================
+// 1. Online Activation Quantizer: FP32 [M, K] -> Optional FWHT-64 + b=32 INT4 (VJ_Q4_DOT8)
+//    Grid: (K / 64) * 64 threads, y = M; Block: 64 (1 Wave64 per 64-elem chunk = 2 b=32 blocks!)
+// ============================================================================
+extern "C" __global__ __launch_bounds__(64, 8)
+void vj_quant_act_q4_dot8_kernel(
+    const float* __restrict__ x_f32,   // [M, K]
+    uint32_t*    __restrict__ x_q4,    // [M, K/8]
+    float*       __restrict__ x_d,     // [M, K/32]
+    uint32_t K,
+    uint32_t M,
+    uint32_t do_fwht64) {
+    const uint32_t m   = blockIdx.y;
+    const uint32_t blk64 = blockIdx.x;
+    const uint32_t lane  = threadIdx.x;
+    if (m >= M) return;
+
+    const uint32_t c = blk64 * 64u + lane;
+    float v = (c < K) ? x_f32[static_cast<uint64_t>(m) * K + c] : 0.0f;
+    if (do_fwht64 != 0u) {
+        v = vegajet::dev::vj_fwht64_wave64(v, lane);
+    }
+
+    // Sub-block of 32: lanes 0..31 = b0, lanes 32..63 = b1
+    float amax = fabsf(v);
+    amax = fmaxf(amax, __shfl_xor(amax, 16, 32));
+    amax = fmaxf(amax, __shfl_xor(amax, 8,  32));
+    amax = fmaxf(amax, __shfl_xor(amax, 4,  32));
+    amax = fmaxf(amax, __shfl_xor(amax, 2,  32));
+    amax = fmaxf(amax, __shfl_xor(amax, 1,  32));
+    float d     = amax * (1.0f / 7.0f);
+    float inv_d = (amax > 0.0f) ? (7.0f / amax) : 0.0f;
+    int32_t q   = max(-7, min(7, __float2int_rn(v * inv_d)));
+    uint32_t nib = static_cast<uint32_t>(q) & 0xFu;
+
+    // Pack 8 consecutive lanes into 1 uint32_t via warp shuffle (zero LDS!)
+    const uint32_t sub8 = lane & 7u;
+    uint32_t p = nib << (sub8 * 4u);
+    p |= __shfl_xor(p, 1, 8);
+    p |= __shfl_xor(p, 2, 8);
+    p |= __shfl_xor(p, 4, 8);
+
+    if (sub8 == 0u) {
+        x_q4[static_cast<uint64_t>(m) * (K >> 3) + (c >> 3)] = p;
+    }
+    if ((lane & 31u) == 0u) {
+        x_d[static_cast<uint64_t>(m) * (K >> 5) + (c >> 5)] = d;
+    }
+}
+
+// ============================================================================
+// 2. Decode M=1 Streaming GEMV: VJ_Q8_DP4A (glc=1 slc=1, native v_dot4_i32_i8)
+//    Grid: ceil(rows / 4) * 256, Block: 256 (4 waves = 4 rows/WG)
+// ============================================================================
+extern "C" __global__ __launch_bounds__(256, 4)
+void vj_gemv_q8_dp4a_kernel(
+    const int8_t*   __restrict__ w_qs,  // [rows, cols]
+    const uint16_t* __restrict__ w_ds,  // [rows, cols/32]
+    const int8_t*   __restrict__ x_q8,  // [cols]
+    const float*    __restrict__ x_d,   // [cols/32] (or cols/16 with stride=2)
+    float*          __restrict__ y_out, // [rows]
+    uint32_t rows,
+    uint32_t cols) {
+    const uint32_t wave = threadIdx.x >> 6;
+    const uint32_t lane = threadIdx.x & 63u;
+    const uint32_t row  = blockIdx.x * 4u + wave;
+    if (row >= rows) return;
+
+    const uint4*    w4  = reinterpret_cast<const uint4*>(w_qs + static_cast<uint64_t>(row) * cols);
+    const uint16_t* ds  = w_ds + static_cast<uint64_t>(row) * (cols >> 5);
+    const uint4*    x4  = reinterpret_cast<const uint4*>(x_q8);
+    const uint32_t  n16 = cols >> 4; // 16-byte chunks
+
+    float acc = 0.0f;
+    #pragma nounroll
+    for (uint32_t i = lane; i < n16; i += 64u) {
+        uint4 wv = vegajet::dev::vj_ldg_u32x4_stream(w4 + i);
+        uint4 xv = x4[i];
+        int32_t dp = vegajet::dev::vj_sdot4(wv.w, xv.w,
+                     vegajet::dev::vj_sdot4(wv.z, xv.z,
+                     vegajet::dev::vj_sdot4(wv.y, xv.y,
+                     vegajet::dev::vj_sdot4(wv.x, xv.x, 0))));
+        float sc = vegajet::dev::vj_fp16_to_f32(ds[i >> 1]) * x_d[i >> 1];
+        acc = fmaf(sc, static_cast<float>(dp), acc);
+    }
+    acc = vegajet::dev::vj_wave64_sum(acc);
+    if (lane == 0u) y_out[row] = acc;
+}
+
+// ============================================================================
+// 2b. Decode M=1 Streaming GEMV with Universal Vega 20 TCC L2 Anti-Camping:
+//     - tcc_mode == 1 (XorTileSwizzle): 0-VRAM static XOR phys_tile = k_tile ^ (row & 15) (1-cycle v_xor_b32!)
+//     - tcc_mode == 0/2 (Odd-256B stride): arbitrary row_stride_bytes (gcd(16, stride/256) == 1)
+//     VGPR <= 48 (5 waves/SIMD), 0 B spill!
+// ============================================================================
+extern "C" __global__ __launch_bounds__(256, 5)
+void vj_gemv_q8_dp4a_tcc_xor_kernel(
+    const int8_t*   __restrict__ w_qs,
+    const uint16_t* __restrict__ w_ds,
+    const int8_t*   __restrict__ x_q8,
+    const float*    __restrict__ x_d,
+    float*          __restrict__ y_out,
+    uint32_t rows,
+    uint32_t cols,
+    uint32_t row_stride_bytes,
+    uint32_t tcc_xor_enable) {
+    const uint32_t wave = threadIdx.x >> 6;
+    const uint32_t lane = threadIdx.x & 63u;
+    const uint32_t row  = blockIdx.x * 4u + wave;
+    if (row >= rows) return;
+
+    const uint4*    w4  = reinterpret_cast<const uint4*>(w_qs + static_cast<uint64_t>(row) * row_stride_bytes);
+    const uint16_t* ds  = w_ds + static_cast<uint64_t>(row) * (cols >> 5);
+    const uint4*    x4  = reinterpret_cast<const uint4*>(x_q8);
+    const uint32_t  n16 = cols >> 4; // 16-byte chunks; 16 chunks = 1x 256-byte TCC tile
+    const uint32_t  xor_mask = (tcc_xor_enable != 0u) ? (row & 15u) : 0u;
+
+    float acc = 0.0f;
+    #pragma nounroll
+    for (uint32_t i = lane; i < n16; i += 64u) {
+        const uint32_t k_tile    = i >> 4;
+        const uint32_t in_tile   = i & 15u;
+        const uint32_t phys_tile = k_tile ^ xor_mask; // 1-cycle v_xor_b32!
+        const uint32_t phys_i    = (phys_tile << 4) | in_tile;
+        uint4 wv = vegajet::dev::vj_ldg_u32x4_stream(w4 + phys_i);
+        uint4 xv = x4[i];
+        int32_t dp = vegajet::dev::vj_sdot4(wv.w, xv.w,
+                     vegajet::dev::vj_sdot4(wv.z, xv.z,
+                     vegajet::dev::vj_sdot4(wv.y, xv.y,
+                     vegajet::dev::vj_sdot4(wv.x, xv.x, 0))));
+        float sc = vegajet::dev::vj_fp16_to_f32(ds[i >> 1]) * x_d[i >> 1];
+        acc = fmaf(sc, static_cast<float>(dp), acc);
+    }
+    acc = vegajet::dev::vj_wave64_sum(acc);
+    if (lane == 0u) y_out[row] = acc;
+}
+
+// ============================================================================
+// 3. Decode M=1 Streaming GEMV: VJ_Q4_DOT8 (glc=1 slc=1, native v_dot8_i32_i4!)
+//    ONE kernel executes Q4_0 / Q4_1 / Q4_K / IQ4_NL / IQ4_XS / AWQ / GPTQ!
+//    Each lane handles one full b=32 block = 1x uint4 (16 B) weight + 1x uint4 act!
+// ============================================================================
+extern "C" __global__ __launch_bounds__(256, 4)
+void vj_gemv_q4_dot8_kernel(
+    const uint32_t* __restrict__ w_q4,  // [rows, cols/8] (4 u32 = 1 uint4 per b=32 block)
+    const uint16_t* __restrict__ w_ds,  // [rows, cols/32]
+    const uint32_t* __restrict__ x_q4,  // [cols/8]
+    const float*    __restrict__ x_d,   // [cols/32]
+    float*          __restrict__ y_out, // [rows]
+    uint32_t rows,
+    uint32_t cols) {
+    const uint32_t wave = threadIdx.x >> 6;
+    const uint32_t lane = threadIdx.x & 63u;
+    const uint32_t row  = blockIdx.x * 4u + wave;
+    if (row >= rows) return;
+
+    const uint4*    w4 = reinterpret_cast<const uint4*>(w_q4 + static_cast<uint64_t>(row) * (cols >> 3));
+    const uint16_t* ds = w_ds + static_cast<uint64_t>(row) * (cols >> 5);
+    const uint4*    x4 = reinterpret_cast<const uint4*>(x_q4);
+    const uint32_t  nb = cols >> 5; // number of b=32 blocks
+
+    float acc = 0.0f;
+    #pragma nounroll
+    for (uint32_t b = lane; b < nb; b += 64u) {
+        uint4 wv = vegajet::dev::vj_ldg_u32x4_stream(w4 + b);
+        uint4 xv = x4[b];
+        int32_t dp = vegajet::dev::vj_sdot8(wv.w, xv.w,
+                     vegajet::dev::vj_sdot8(wv.z, xv.z,
+                     vegajet::dev::vj_sdot8(wv.y, xv.y,
+                     vegajet::dev::vj_sdot8(wv.x, xv.x, 0))));
+        float sc = vegajet::dev::vj_fp16_to_f32(ds[b]) * x_d[b];
+        acc = fmaf(sc, static_cast<float>(dp), acc);
+    }
+    acc = vegajet::dev::vj_wave64_sum(acc);
+    if (lane == 0u) y_out[row] = acc;
+}
+
+// ============================================================================
+// 3b. Decode M=1 Streaming GEMV: VJ_Q4_DOT8 with Universal Vega 20 TCC Anti-Camping
+//     - tcc_xor_enable == 1: static XOR phys_tile = k_tile ^ (row & 15) (1-cycle v_xor_b32!)
+//     - tcc_xor_enable == 0: odd-256B padded row_stride_bytes (gcd(16, stride/256) == 1)
+//     VGPR <= 48 (5 waves/SIMD), 0 B spill!
+// ============================================================================
+extern "C" __global__ __launch_bounds__(256, 5)
+void vj_gemv_q4_dot8_tcc_xor_kernel(
+    const uint32_t* __restrict__ w_q4,
+    const uint16_t* __restrict__ w_ds,
+    const uint32_t* __restrict__ x_q4,
+    const float*    __restrict__ x_d,
+    float*          __restrict__ y_out,
+    uint32_t rows,
+    uint32_t cols,
+    uint32_t row_stride_bytes,
+    uint32_t tcc_xor_enable) {
+    const uint32_t wave = threadIdx.x >> 6;
+    const uint32_t lane = threadIdx.x & 63u;
+    const uint32_t row  = blockIdx.x * 4u + wave;
+    if (row >= rows) return;
+
+    const uint4*    w4 = reinterpret_cast<const uint4*>(
+        reinterpret_cast<const uint8_t*>(w_q4) + static_cast<uint64_t>(row) * row_stride_bytes);
+    const uint16_t* ds = w_ds + static_cast<uint64_t>(row) * (cols >> 5);
+    const uint4*    x4 = reinterpret_cast<const uint4*>(x_q4);
+    const uint32_t  nb = cols >> 5; // 16-byte b=32 blocks; 16 blocks = 1x 256-byte TCC tile
+    const uint32_t  xor_mask = (tcc_xor_enable != 0u) ? (row & 15u) : 0u;
+
+    float acc = 0.0f;
+    #pragma nounroll
+    for (uint32_t b = lane; b < nb; b += 64u) {
+        const uint32_t k_tile    = b >> 4;
+        const uint32_t in_tile   = b & 15u;
+        const uint32_t phys_tile = k_tile ^ xor_mask; // 1-cycle v_xor_b32!
+        const uint32_t phys_b    = (phys_tile << 4) | in_tile;
+        uint4 wv = vegajet::dev::vj_ldg_u32x4_stream(w4 + phys_b);
+        uint4 xv = x4[b];
+        int32_t dp = vegajet::dev::vj_sdot8(wv.w, xv.w,
+                     vegajet::dev::vj_sdot8(wv.z, xv.z,
+                     vegajet::dev::vj_sdot8(wv.y, xv.y,
+                     vegajet::dev::vj_sdot8(wv.x, xv.x, 0))));
+        float sc = vegajet::dev::vj_fp16_to_f32(ds[b]) * x_d[b];
+        acc = fmaf(sc, static_cast<float>(dp), acc);
+    }
+    acc = vegajet::dev::vj_wave64_sum(acc);
+    if (lane == 0u) y_out[row] = acc;
+}
+
+// ============================================================================
+// 4. Prefill LDS-Tiled Multi-Token GEMM: VJ_Q8_DP4A (L2 ON glc=0 slc=0, v_dot4_i32_i8)
+//    Computes Y[M, N] = X_q8[M, K] * W_q8[N, K]^T
+//    Tile: BM = 32 tokens, BN = 32 output rows, BK = 32 (1 b=32 block/step, 1024 B LDS each!)
+//    Block: 256 threads (16x16 thread tile -> each thread computes 2x2 = 4 outputs, zero spill!)
+//    Grid: (ceil(N/32)*256, ceil(M/32), 1)
+// ============================================================================
+extern "C" __global__ __launch_bounds__(256, 4)
+void vj_gemm_q8_dp4a_tiled_kernel(
+    const int8_t*   __restrict__ w_qs,  // [N, K]
+    const uint16_t* __restrict__ w_ds,  // [N, K/32]
+    const int8_t*   __restrict__ x_q8,  // [M, K]
+    const float*    __restrict__ x_d,   // [M, K/32] (or K/16 when x_d_stride16 != 0)
+    float*          __restrict__ y_out, // [M, N]
+    uint32_t N,
+    uint32_t K,
+    uint32_t M,
+    uint32_t x_d_stride16) {
+    __shared__ uint32_t sm_w[32][9];   // 32 rows x 32 int8 (8 uint32 + 1 pad -> ZERO bank conflicts!)
+    __shared__ uint32_t sm_x[32][9];   // 32 toks x 32 int8 (8 uint32 + 1 pad -> ZERO bank conflicts!)
+    __shared__ float    sm_wd[32];
+    __shared__ float    sm_xd0[32];
+    __shared__ float    sm_xd1[32];
+
+    const uint32_t tid = threadIdx.x;
+    const uint32_t tn  = tid & 15u;       // 0..15 -> 2 rows: tn*2, tn*2+1
+    const uint32_t tm  = tid >> 4;        // 0..15 -> 2 toks: tm*2, tm*2+1
+    const uint32_t n0  = blockIdx.x * 32u;
+    const uint32_t m0  = blockIdx.y * 32u;
+    const uint32_t nb  = K >> 5;
+    const uint32_t kw  = K >> 2; // uint32 stride per row
+
+    float c00 = 0.0f, c01 = 0.0f, c10 = 0.0f, c11 = 0.0f;
+
+    const uint32_t* w32 = reinterpret_cast<const uint32_t*>(w_qs);
+    const uint32_t* x32 = reinterpret_cast<const uint32_t*>(x_q8);
+
+    // Cooperative load mapping: 256 threads = 32 rows x 8 uint32 -> 1 uint32/thread!
+    const uint32_t ld_r = tid >> 3; // 0..31
+    const uint32_t ld_k = tid & 7u; // 0..7
+
+    #pragma nounroll
+    for (uint32_t b = 0u; b < nb; ++b) {
+        const uint32_t gn = n0 + ld_r;
+        const uint32_t gm = m0 + ld_r;
+        sm_w[ld_r][ld_k] = (gn < N) ? w32[static_cast<uint64_t>(gn) * kw + b * 8u + ld_k] : 0u;
+        sm_x[ld_r][ld_k] = (gm < M) ? x32[static_cast<uint64_t>(gm) * kw + b * 8u + ld_k] : 0u;
+        if (ld_k == 0u) {
+            sm_wd[ld_r]  = (gn < N) ? vegajet::dev::vj_fp16_to_f32(w_ds[static_cast<uint64_t>(gn) * nb + b]) : 0.0f;
+            if (x_d_stride16 == 0u) {
+                float xd = (gm < M) ? x_d[static_cast<uint64_t>(gm) * nb + b] : 0.0f;
+                sm_xd0[ld_r] = xd;
+                sm_xd1[ld_r] = xd;
+            } else {
+                sm_xd0[ld_r] = (gm < M) ? x_d[static_cast<uint64_t>(gm) * (nb * 2u) + b * 2u + 0u] : 0.0f;
+                sm_xd1[ld_r] = (gm < M) ? x_d[static_cast<uint64_t>(gm) * (nb * 2u) + b * 2u + 1u] : 0.0f;
+            }
+        }
+        __syncthreads();
+
+        const uint32_t r0 = tn * 2u, r1 = r0 + 1u;
+        const uint32_t t0 = tm * 2u, t1 = t0 + 1u;
+        int32_t a00_lo = 0, a01_lo = 0, a10_lo = 0, a11_lo = 0;
+        int32_t a00_hi = 0, a01_hi = 0, a10_hi = 0, a11_hi = 0;
+
+        #pragma unroll
+        for (uint32_t k = 0u; k < 4u; ++k) {
+            uint32_t wr0 = sm_w[r0][k], wr1 = sm_w[r1][k];
+            uint32_t xt0 = sm_x[t0][k], xt1 = sm_x[t1][k];
+            a00_lo = vegajet::dev::vj_sdot4(wr0, xt0, a00_lo);
+            a01_lo = vegajet::dev::vj_sdot4(wr1, xt0, a01_lo);
+            a10_lo = vegajet::dev::vj_sdot4(wr0, xt1, a10_lo);
+            a11_lo = vegajet::dev::vj_sdot4(wr1, xt1, a11_lo);
+        }
+        #pragma unroll
+        for (uint32_t k = 4u; k < 8u; ++k) {
+            uint32_t wr0 = sm_w[r0][k], wr1 = sm_w[r1][k];
+            uint32_t xt0 = sm_x[t0][k], xt1 = sm_x[t1][k];
+            a00_hi = vegajet::dev::vj_sdot4(wr0, xt0, a00_hi);
+            a01_hi = vegajet::dev::vj_sdot4(wr1, xt0, a01_hi);
+            a10_hi = vegajet::dev::vj_sdot4(wr0, xt1, a10_hi);
+            a11_hi = vegajet::dev::vj_sdot4(wr1, xt1, a11_hi);
+        }
+
+        const float wd0 = sm_wd[r0], wd1 = sm_wd[r1];
+        c00 = fmaf(wd0 * sm_xd0[t0], static_cast<float>(a00_lo), fmaf(wd0 * sm_xd1[t0], static_cast<float>(a00_hi), c00));
+        c01 = fmaf(wd1 * sm_xd0[t0], static_cast<float>(a01_lo), fmaf(wd1 * sm_xd1[t0], static_cast<float>(a01_hi), c01));
+        c10 = fmaf(wd0 * sm_xd0[t1], static_cast<float>(a10_lo), fmaf(wd0 * sm_xd1[t1], static_cast<float>(a10_hi), c10));
+        c11 = fmaf(wd1 * sm_xd0[t1], static_cast<float>(a11_lo), fmaf(wd1 * sm_xd1[t1], static_cast<float>(a11_hi), c11));
+        __syncthreads();
+    }
+
+    const uint32_t gn0 = n0 + tn * 2u, gn1 = gn0 + 1u;
+    const uint32_t gm0 = m0 + tm * 2u, gm1 = gm0 + 1u;
+    if (gm0 < M && gn0 < N) y_out[static_cast<uint64_t>(gm0) * N + gn0] = c00;
+    if (gm0 < M && gn1 < N) y_out[static_cast<uint64_t>(gm0) * N + gn1] = c01;
+    if (gm1 < M && gn0 < N) y_out[static_cast<uint64_t>(gm1) * N + gn0] = c10;
+    if (gm1 < M && gn1 < N) y_out[static_cast<uint64_t>(gm1) * N + gn1] = c11;
+}
+
+// ============================================================================
+// 5. Prefill LDS-Tiled Multi-Token GEMM: VJ_Q4_DOT8 (L2 ON glc=0 slc=0, v_dot8_i32_i4!)
+//    Computes Y[M, N] = X_q4[M, K] * W_q4[N, K]^T
+//    Tile: BM = 32 tokens, BN = 32 rows, BK = 32 (4 uint32 = 16 B per row -> 512 B LDS!)
+//    Block: 256 threads (16x16 thread tile -> 2x2 outputs/thread, 8x 4-bit MACs/instruction!)
+// ============================================================================
+extern "C" __global__ __launch_bounds__(256, 4)
+void vj_gemm_q4_dot8_tiled_kernel(
+    const uint32_t* __restrict__ w_q4,  // [N, K/8]
+    const uint16_t* __restrict__ w_ds,  // [N, K/32]
+    const uint32_t* __restrict__ x_q4,  // [M, K/8]
+    const float*    __restrict__ x_d,   // [M, K/32]
+    float*          __restrict__ y_out, // [M, N]
+    uint32_t N,
+    uint32_t K,
+    uint32_t M) {
+    __shared__ uint32_t sm_w[32][4]; // 32 rows x 4 uint32 = 512 B
+    __shared__ uint32_t sm_x[32][4]; // 32 toks x 4 uint32 = 512 B
+    __shared__ float    sm_wd[32];
+    __shared__ float    sm_xd[32];
+
+    const uint32_t tid = threadIdx.x;
+    const uint32_t tn  = tid & 15u;
+    const uint32_t tm  = tid >> 4;
+    const uint32_t n0  = blockIdx.x * 32u;
+    const uint32_t m0  = blockIdx.y * 32u;
+    const uint32_t nb  = K >> 5;
+    const uint32_t kw  = K >> 3;
+
+    float c00 = 0.0f, c01 = 0.0f, c10 = 0.0f, c11 = 0.0f;
+
+    // 128 threads load W (32x4), 128 threads load X (32x4) in ONE coalesced step!
+    const uint32_t is_x = tid >> 7;        // 0 = W, 1 = X
+    const uint32_t ld_r = (tid & 127u) >> 2; // 0..31
+    const uint32_t ld_k = tid & 3u;          // 0..3
+
+    #pragma nounroll
+    for (uint32_t b = 0u; b < nb; ++b) {
+        if (is_x == 0u) {
+            uint32_t gn = n0 + ld_r;
+            sm_w[ld_r][ld_k] = (gn < N) ? w_q4[static_cast<uint64_t>(gn) * kw + b * 4u + ld_k] : 0u;
+            if (ld_k == 0u) {
+                sm_wd[ld_r] = (gn < N) ? vegajet::dev::vj_fp16_to_f32(w_ds[static_cast<uint64_t>(gn) * nb + b]) : 0.0f;
+            }
+        } else {
+            uint32_t gm = m0 + ld_r;
+            sm_x[ld_r][ld_k] = (gm < M) ? x_q4[static_cast<uint64_t>(gm) * kw + b * 4u + ld_k] : 0u;
+            if (ld_k == 0u) {
+                sm_xd[ld_r] = (gm < M) ? x_d[static_cast<uint64_t>(gm) * nb + b] : 0.0f;
+            }
+        }
+        __syncthreads();
+
+        const uint32_t r0 = tn * 2u, r1 = r0 + 1u;
+        const uint32_t t0 = tm * 2u, t1 = t0 + 1u;
+        int32_t a00 = 0, a01 = 0, a10 = 0, a11 = 0;
+        #pragma unroll
+        for (uint32_t k = 0u; k < 4u; ++k) {
+            uint32_t wr0 = sm_w[r0][k], wr1 = sm_w[r1][k];
+            uint32_t xt0 = sm_x[t0][k], xt1 = sm_x[t1][k];
+            a00 = vegajet::dev::vj_sdot8(wr0, xt0, a00);
+            a01 = vegajet::dev::vj_sdot8(wr1, xt0, a01);
+            a10 = vegajet::dev::vj_sdot8(wr0, xt1, a10);
+            a11 = vegajet::dev::vj_sdot8(wr1, xt1, a11);
+        }
+        c00 = fmaf(sm_wd[r0] * sm_xd[t0], static_cast<float>(a00), c00);
+        c01 = fmaf(sm_wd[r1] * sm_xd[t0], static_cast<float>(a01), c01);
+        c10 = fmaf(sm_wd[r0] * sm_xd[t1], static_cast<float>(a10), c10);
+        c11 = fmaf(sm_wd[r1] * sm_xd[t1], static_cast<float>(a11), c11);
+        __syncthreads();
+    }
+
+    const uint32_t gn0 = n0 + tn * 2u, gn1 = gn0 + 1u;
+    const uint32_t gm0 = m0 + tm * 2u, gm1 = gm0 + 1u;
+    if (gm0 < M && gn0 < N) y_out[static_cast<uint64_t>(gm0) * N + gn0] = c00;
+    if (gm0 < M && gn1 < N) y_out[static_cast<uint64_t>(gm0) * N + gn1] = c01;
+    if (gm1 < M && gn0 < N) y_out[static_cast<uint64_t>(gm1) * N + gn0] = c10;
+    if (gm1 < M && gn1 < N) y_out[static_cast<uint64_t>(gm1) * N + gn1] = c11;
+}
+
+// ============================================================================
+// 6. Decode M=1 Streaming Vocab/LM-Head Argmax: VJ_Q8_DP4A (2-row/wave double-buffered uint4 DP4A!)
+//    Model-agnostic: eliminates Q6_K bit-unpacking, sm_qh LDS LUT, and xsum8 subtraction!
+//    Supports both b=32 (x_d_stride16 == 0) and b=16 Q8_1_16 (x_d_stride16 != 0) activations.
+//    Grid: (num_blocks * 256, 1, 1), Block: (256, 1, 1) -> 480 blocks = 8 WGs/CU on Vega 20!
+// ============================================================================
+extern "C" __global__ __launch_bounds__(256, 4)
+void vj_vocab_q8_dp4a_argmax_kernel(
+    const int8_t*   __restrict__ w_qs,      // [local_rows, cols]
+    const uint16_t* __restrict__ w_ds,      // [local_rows, cols/32]
+    const int8_t*   __restrict__ x_q8,      // [cols]
+    const float*    __restrict__ x_d,       // [cols/32] or [cols/16]
+    float*          __restrict__ block_vals,// [gridDim.x]
+    int32_t*        __restrict__ block_ids, // [gridDim.x]
+    uint64_t*       __restrict__ trace_slot,// optional [16] s_memrealtime (slot[10] = done counter)
+    uint32_t local_rows,
+    uint32_t cols,
+    uint32_t row_offset,
+    uint32_t valid_limit,
+    uint32_t x_d_stride16) {
+    if (trace_slot && blockIdx.x == 0u && threadIdx.x == 0u) trace_slot[0] = __builtin_amdgcn_s_memrealtime();
+    __shared__ float   sm_v[4];
+    __shared__ int32_t sm_i[4];
+
+    const uint32_t wave   = threadIdx.x >> 6;
+    const uint32_t lane   = threadIdx.x & 63u;
+    const uint32_t g_wave = blockIdx.x * 4u + wave;
+    const uint32_t stride = gridDim.x * 4u;
+    const uint4*   qs4    = reinterpret_cast<const uint4*>(w_qs);
+    const uint4*   xq4    = reinterpret_cast<const uint4*>(x_q8);
+    const uint32_t row_u4 = cols >> 4;
+    const uint32_t row_ds = cols >> 5;
+    const uint32_t eff_rows = (row_offset < valid_limit)
+                            ? ((local_rows < (valid_limit - row_offset)) ? local_rows : (valid_limit - row_offset))
+                            : 0u;
+    const uint32_t n_pairs = (eff_rows + 1u) >> 1;
+
+    float   best_v  = -1e30f;
+    int32_t best_id = -1;
+
+    if (cols == 2560u && x_d_stride16 != 0u) {
+        // Fast double-buffered 2-row/wave path for cols=2560 (160 uint4 = 64 + 64 + 32)
+        #pragma nounroll
+        for (uint32_t p = g_wave; p < n_pairs; p += stride) {
+            const uint32_t r0 = p * 2u;
+            const uint32_t r1 = (r0 + 1u < eff_rows) ? (r0 + 1u) : r0;
+            const uint4*    w0 = qs4  + static_cast<uint64_t>(r0) * 160ULL;
+            const uint4*    w1 = qs4  + static_cast<uint64_t>(r1) * 160ULL;
+            const uint16_t* d0 = w_ds + static_cast<uint64_t>(r0) * 80ULL;
+            const uint16_t* d1 = w_ds + static_cast<uint64_t>(r1) * 80ULL;
+
+            uint4 a0 = vegajet::dev::vj_ldg_u32x4_stream(w0 + lane);
+            uint4 b0 = vegajet::dev::vj_ldg_u32x4_stream(w1 + lane);
+            uint4 a1 = vegajet::dev::vj_ldg_u32x4_stream(w0 + 64u + lane);
+            uint4 b1 = vegajet::dev::vj_ldg_u32x4_stream(w1 + 64u + lane);
+
+            uint4 x0 = xq4[lane];
+            float xd0 = x_d[lane];
+            int32_t adp0 = vegajet::dev::vj_sdot4(a0.w, x0.w, vegajet::dev::vj_sdot4(a0.z, x0.z, vegajet::dev::vj_sdot4(a0.y, x0.y, vegajet::dev::vj_sdot4(a0.x, x0.x, 0))));
+            int32_t bdp0 = vegajet::dev::vj_sdot4(b0.w, x0.w, vegajet::dev::vj_sdot4(b0.z, x0.z, vegajet::dev::vj_sdot4(b0.y, x0.y, vegajet::dev::vj_sdot4(b0.x, x0.x, 0))));
+            float acc0 = vegajet::dev::vj_fp16_to_f32(d0[lane >> 1]) * xd0 * static_cast<float>(adp0);
+            float acc1 = vegajet::dev::vj_fp16_to_f32(d1[lane >> 1]) * xd0 * static_cast<float>(bdp0);
+
+            uint4 x1 = xq4[64u + lane];
+            float xd1 = x_d[64u + lane];
+            int32_t adp1 = vegajet::dev::vj_sdot4(a1.w, x1.w, vegajet::dev::vj_sdot4(a1.z, x1.z, vegajet::dev::vj_sdot4(a1.y, x1.y, vegajet::dev::vj_sdot4(a1.x, x1.x, 0))));
+            int32_t bdp1 = vegajet::dev::vj_sdot4(b1.w, x1.w, vegajet::dev::vj_sdot4(b1.z, x1.z, vegajet::dev::vj_sdot4(b1.y, x1.y, vegajet::dev::vj_sdot4(b1.x, x1.x, 0))));
+            acc0 = fmaf(vegajet::dev::vj_fp16_to_f32(d0[(64u + lane) >> 1]) * xd1, static_cast<float>(adp1), acc0);
+            acc1 = fmaf(vegajet::dev::vj_fp16_to_f32(d1[(64u + lane) >> 1]) * xd1, static_cast<float>(bdp1), acc1);
+
+            if (lane < 32u) {
+                uint32_t b16 = 128u + lane;
+                uint4 a2 = vegajet::dev::vj_ldg_u32x4_stream(w0 + b16);
+                uint4 b2 = vegajet::dev::vj_ldg_u32x4_stream(w1 + b16);
+                uint4 x2 = xq4[b16];
+                float xd2 = x_d[b16];
+                int32_t adp2 = vegajet::dev::vj_sdot4(a2.w, x2.w, vegajet::dev::vj_sdot4(a2.z, x2.z, vegajet::dev::vj_sdot4(a2.y, x2.y, vegajet::dev::vj_sdot4(a2.x, x2.x, 0))));
+                int32_t bdp2 = vegajet::dev::vj_sdot4(b2.w, x2.w, vegajet::dev::vj_sdot4(b2.z, x2.z, vegajet::dev::vj_sdot4(b2.y, x2.y, vegajet::dev::vj_sdot4(b2.x, x2.x, 0))));
+                acc0 = fmaf(vegajet::dev::vj_fp16_to_f32(d0[b16 >> 1]) * xd2, static_cast<float>(adp2), acc0);
+                acc1 = fmaf(vegajet::dev::vj_fp16_to_f32(d1[b16 >> 1]) * xd2, static_cast<float>(bdp2), acc1);
+            }
+            float s0 = vegajet::dev::vj_wave64_sum(acc0);
+            float s1 = vegajet::dev::vj_wave64_sum(acc1);
+            if (lane == 0u) {
+                if (s0 > best_v) { best_v = s0; best_id = static_cast<int32_t>(row_offset + r0); }
+                if (r0 + 1u < eff_rows && s1 > best_v) { best_v = s1; best_id = static_cast<int32_t>(row_offset + r1); }
+            }
+        }
+    } else {
+        // Generic cols % 32 == 0 path (works for any VegaJet model!)
+        #pragma nounroll
+        for (uint32_t r = g_wave; r < eff_rows; r += stride) {
+            const uint4*    w = qs4  + static_cast<uint64_t>(r) * row_u4;
+            const uint16_t* d = w_ds + static_cast<uint64_t>(r) * row_ds;
+            float acc = 0.0f;
+            #pragma nounroll
+            for (uint32_t i = lane; i < row_u4; i += 64u) {
+                uint4 wv = vegajet::dev::vj_ldg_u32x4_stream(w + i);
+                uint4 xv = xq4[i];
+                int32_t dp = vegajet::dev::vj_sdot4(wv.w, xv.w, vegajet::dev::vj_sdot4(wv.z, xv.z, vegajet::dev::vj_sdot4(wv.y, xv.y, vegajet::dev::vj_sdot4(wv.x, xv.x, 0))));
+                float xd_v = (x_d_stride16 != 0u) ? x_d[i] : x_d[i >> 1];
+                acc = fmaf(vegajet::dev::vj_fp16_to_f32(d[i >> 1]) * xd_v, static_cast<float>(dp), acc);
+            }
+            float s = vegajet::dev::vj_wave64_sum(acc);
+            if (lane == 0u && s > best_v) { best_v = s; best_id = static_cast<int32_t>(row_offset + r); }
+        }
+    }
+
+    if (lane == 0u) {
+        sm_v[wave] = best_v;
+        sm_i[wave] = best_id;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+        float bv = sm_v[0];
+        int32_t bi = sm_i[0];
+        for (int k = 1; k < 4; ++k) {
+            if (sm_v[k] > bv || (sm_v[k] == bv && sm_i[k] < bi)) { bv = sm_v[k]; bi = sm_i[k]; }
+        }
+        __builtin_nontemporal_store(__float_as_uint(bv), reinterpret_cast<uint32_t*>(block_vals) + blockIdx.x);
+        __builtin_nontemporal_store(static_cast<uint32_t>(bi), reinterpret_cast<uint32_t*>(block_ids) + blockIdx.x);
+        __threadfence_system();
+        if (trace_slot) {
+            uint32_t* cnt = reinterpret_cast<uint32_t*>(&trace_slot[10]);
+            uint32_t done = atomicAdd(cnt, 1u) + 1u;
+            if (done == gridDim.x) {
+                trace_slot[9] = __builtin_amdgcn_s_memrealtime();
+                atomicExch(cnt, 0u);
+            }
+        }
+    }
+}
+
+// ============================================================================
+// 7. Batched M-Token Vocab/LM-Head Argmax: VJ_Q8_DP4A (5-token micro-tile, uint4 streaming DP4A!)
+//    Reuses each weight uint4 across up to 5 tokens in VGPRs -> ~4.5x higher arithmetic intensity!
+// ============================================================================
+extern "C" __global__ __launch_bounds__(256, 4)
+void vj_vocab_q8_dp4a_argmax_batch_kernel(
+    const int8_t*   __restrict__ w_qs,        // [local_rows, cols]
+    const uint16_t* __restrict__ w_ds,        // [local_rows, cols/32]
+    const int8_t*   __restrict__ x_q8_M,      // [M, cols]
+    const float*    __restrict__ x_d_M,       // [M, cols/32] or [M, cols/16]
+    float*          __restrict__ block_vals_M,// [M, gridDim.x]
+    int32_t*        __restrict__ block_ids_M, // [M, gridDim.x]
+    uint32_t local_rows,
+    uint32_t cols,
+    uint32_t row_offset,
+    uint32_t valid_limit,
+    uint32_t M,
+    uint32_t x_d_stride16) {
+    __shared__ float   sm_v[5][4];
+    __shared__ int32_t sm_i[5][4];
+
+    const uint32_t wave   = threadIdx.x >> 6;
+    const uint32_t lane   = threadIdx.x & 63u;
+    const uint32_t g_wave = blockIdx.x * 4u + wave;
+    const uint32_t stride = gridDim.x * 4u;
+    const uint4*   qs4    = reinterpret_cast<const uint4*>(w_qs);
+    const uint4*   xq4    = reinterpret_cast<const uint4*>(x_q8_M);
+    const uint32_t row_u4 = cols >> 4;
+    const uint32_t row_ds = cols >> 5;
+    const uint32_t xd_row = (x_d_stride16 != 0u) ? row_u4 : row_ds;
+    const uint32_t eff_rows = (row_offset < valid_limit)
+                            ? ((local_rows < (valid_limit - row_offset)) ? local_rows : (valid_limit - row_offset))
+                            : 0u;
+
+    #define VJ_VB_STEP(K, ACC) do { \
+        uint32_t mk = m0 + (K); \
+        uint4 xv = xq4[static_cast<uint64_t>(mk) * row_u4 + i]; \
+        int32_t dp = vegajet::dev::vj_sdot4(wv.w, xv.w, vegajet::dev::vj_sdot4(wv.z, xv.z, vegajet::dev::vj_sdot4(wv.y, xv.y, vegajet::dev::vj_sdot4(wv.x, xv.x, 0)))); \
+        float xdv = x_d_M[static_cast<uint64_t>(mk) * xd_row + ((x_d_stride16 != 0u) ? i : (i >> 1))]; \
+        (ACC) = fmaf(wd * xdv, static_cast<float>(dp), (ACC)); \
+    } while (0)
+    #define VJ_VB_UPD(ACC, BV, BI) do { \
+        float val = vegajet::dev::vj_wave64_sum((ACC)); \
+        if (lane == 0u && val > (BV)) { (BV) = val; (BI) = static_cast<int32_t>(gid); } \
+    } while (0)
+
+    for (uint32_t m0 = 0u; m0 < M; m0 += 5u) {
+        const uint32_t cm = (M - m0 < 5u) ? (M - m0) : 5u;
+        float   bv0 = -1e30f, bv1 = -1e30f, bv2 = -1e30f, bv3 = -1e30f, bv4 = -1e30f;
+        int32_t bi0 = -1,     bi1 = -1,     bi2 = -1,     bi3 = -1,     bi4 = -1;
+
+        #pragma nounroll
+        for (uint32_t r = g_wave; r < eff_rows; r += stride) {
+            const uint32_t gid = row_offset + r;
+            const uint4*    w = qs4  + static_cast<uint64_t>(r) * row_u4;
+            const uint16_t* d = w_ds + static_cast<uint64_t>(r) * row_ds;
+            float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f, a4 = 0.0f;
+            #pragma nounroll
+            for (uint32_t i = lane; i < row_u4; i += 64u) {
+                uint4 wv = vegajet::dev::vj_ldg_u32x4_stream(w + i);
+                float wd = vegajet::dev::vj_fp16_to_f32(d[i >> 1]);
+                VJ_VB_STEP(0u, a0);
+                if (cm > 1u) VJ_VB_STEP(1u, a1);
+                if (cm > 2u) VJ_VB_STEP(2u, a2);
+                if (cm > 3u) VJ_VB_STEP(3u, a3);
+                if (cm > 4u) VJ_VB_STEP(4u, a4);
+            }
+            VJ_VB_UPD(a0, bv0, bi0);
+            if (cm > 1u) VJ_VB_UPD(a1, bv1, bi1);
+            if (cm > 2u) VJ_VB_UPD(a2, bv2, bi2);
+            if (cm > 3u) VJ_VB_UPD(a3, bv3, bi3);
+            if (cm > 4u) VJ_VB_UPD(a4, bv4, bi4);
+        }
+
+        if (lane == 0u) {
+            sm_v[0][wave] = bv0; sm_i[0][wave] = bi0;
+            if (cm > 1u) { sm_v[1][wave] = bv1; sm_i[1][wave] = bi1; }
+            if (cm > 2u) { sm_v[2][wave] = bv2; sm_i[2][wave] = bi2; }
+            if (cm > 3u) { sm_v[3][wave] = bv3; sm_i[3][wave] = bi3; }
+            if (cm > 4u) { sm_v[4][wave] = bv4; sm_i[4][wave] = bi4; }
+        }
+        __syncthreads();
+        if (threadIdx.x < cm) {
+            uint32_t k = threadIdx.x;
+            float bv = sm_v[k][0]; int32_t bi = sm_i[k][0];
+            for (uint32_t w = 1u; w < 4u; ++w) {
+                if (sm_v[k][w] > bv || (sm_v[k][w] == bv && sm_i[k][w] < bi)) { bv = sm_v[k][w]; bi = sm_i[k][w]; }
+            }
+            __builtin_nontemporal_store(__float_as_uint(bv), reinterpret_cast<uint32_t*>(block_vals_M) + (m0 + k) * gridDim.x + blockIdx.x);
+            __builtin_nontemporal_store(static_cast<uint32_t>(bi), reinterpret_cast<uint32_t*>(block_ids_M) + (m0 + k) * gridDim.x + blockIdx.x);
+            __threadfence_system();
+        }
+        __syncthreads();
+    }
+    #undef VJ_VB_STEP
+    #undef VJ_VB_UPD
+}
+
+// ============================================================================
+// 8. Phase 3 Prefill VegaJet Reusable Device/Global Tiled GEMMs (L2 ON glc=0 slc=0!)
+//    - vj_gemm_q8_dp4a_tiled_32x32_persistent: Reusable persistent device helper (for fused super-kernels!)
+//    - vj_gemm_q8_dp4a_tiled_64x32_kernel:     High-AI 64x32x32 (4x2 thread tile, zero bank conflicts, v_dot4_i32_i8)
+//    - vj_gemm_q8_dp4a_tiled_16x16_w64_kernel: Wave64 16x16x32 (for medium N=320 like hc_down, optional scale+SiLU)
+//    - vj_gemm_f16_fdot2_tiled_kernel:         FP16 32x32x32 (native v_dot2_f32_f16, optional router row-512 sigmoid)
+// ============================================================================
+namespace vegajet {
+namespace dev {
+
+typedef __fp16 vj_half2_v __attribute__((ext_vector_type(2)));
+
+__device__ __forceinline__ float vj_fdot2_u32(uint32_t a, uint32_t b, float acc) {
+    union { uint32_t u; vj_half2_v h; } ua{a}, ub{b};
+    return __builtin_amdgcn_fdot2(ua.h, ub.h, acc, false);
+}
+
+__device__ __forceinline__ float vj_silu(float x) {
+    return x / (1.0f + __expf(-x));
+}
+
+__device__ __forceinline__ float vj_sigmoid(float x) {
+    return 1.0f / (1.0f + __expf(-x));
+}
+
+// Persistent-grid 32x32x128 LDS-tiled VJ_Q8_DP4A GEMM (128-bit dwordx4 + ds_write_b128/ds_read_b128, N-major L2 reuse!)
+// Caller provides 10.75 KiB LDS struct (fits inside gdn_wy_prefill_super's union with 0 extra LDS!)
+struct VjQ8Tile32Sm {
+    alignas(16) uint32_t sm_w[32][36]; // 32 rows x 128 int8 (32 u32 + 4 pad -> 16B aligned ds_read_b128/ds_write_b128!)
+    alignas(16) uint32_t sm_x[32][36]; // 32 toks x 128 int8
+    float    sm_wd[32][4]; // 4 b=32 scales/row
+    float    sm_xd[32][8]; // 8 b=16 scales/tok
+};
+
+__device__ __forceinline__ void vj_gemm_q8_dp4a_tiled_32x32_persistent(
+    VjQ8Tile32Sm& sm,
+    const int8_t*   __restrict__ w_qs,
+    const uint16_t* __restrict__ w_ds,
+    const int8_t*   __restrict__ x_q8,
+    const float*    __restrict__ x_d,
+    float*          __restrict__ y_out,
+    uint32_t N, uint32_t K, uint32_t M,
+    uint32_t x_d_stride16,
+    uint32_t wg_id, uint32_t n_wgs, uint32_t tid) {
+    const uint32_t tn    = tid & 15u;
+    const uint32_t tm    = tid >> 4;
+    const uint32_t ld_r  = tid >> 3;       // 0..31
+    const uint32_t ld_k4 = tid & 7u;       // 0..7 -> 1 uint4 (16 B) per thread -> 128 B contiguous burst per row!
+    const uint32_t nb128 = K >> 7;         // BK = 128
+    const uint32_t nb32  = K >> 5;
+    const uint32_t ku4   = K >> 4;
+    const uint32_t n_nt  = (N + 31u) >> 5;
+    const uint32_t n_mt  = (M + 31u) >> 5;
+    const uint32_t tot_tiles = n_nt * n_mt;
+
+    const uint4* w4 = reinterpret_cast<const uint4*>(w_qs);
+    const uint4* x4 = reinterpret_cast<const uint4*>(x_q8);
+
+    #pragma nounroll
+    for (uint32_t tile = wg_id; tile < tot_tiles; tile += n_wgs) {
+        // N-major schedule: adjacent CUs run (nt, mt=0) & (nt, mt=1) simultaneously -> 100% L2 hit on w_qs!
+        const uint32_t nt = tile / n_mt;
+        const uint32_t mt = tile - nt * n_mt;
+        const uint32_t n0 = nt * 32u;
+        const uint32_t m0 = mt * 32u;
+
+        float c00 = 0.0f, c01 = 0.0f, c10 = 0.0f, c11 = 0.0f;
+        const uint32_t gn = n0 + ld_r;
+        const uint32_t gm = m0 + ld_r;
+
+        #pragma nounroll
+        for (uint32_t b = 0u; b < nb128; ++b) {
+            uint4 wv = (gn < N) ? w4[static_cast<uint64_t>(gn) * ku4 + b * 8u + ld_k4] : make_uint4(0u, 0u, 0u, 0u);
+            uint4 xv = (gm < M) ? x4[static_cast<uint64_t>(gm) * ku4 + b * 8u + ld_k4] : make_uint4(0u, 0u, 0u, 0u);
+            reinterpret_cast<uint4*>(sm.sm_w[ld_r])[ld_k4] = wv;
+            reinterpret_cast<uint4*>(sm.sm_x[ld_r])[ld_k4] = xv;
+            if (ld_k4 < 4u) {
+                sm.sm_wd[ld_r][ld_k4] = (gn < N) ? vj_fp16_to_f32(w_ds[static_cast<uint64_t>(gn) * nb32 + b * 4u + ld_k4]) : 0.0f;
+            }
+            if (x_d_stride16 != 0u) {
+                sm.sm_xd[ld_r][ld_k4] = (gm < M) ? x_d[static_cast<uint64_t>(gm) * (nb32 * 2u) + b * 8u + ld_k4] : 0.0f;
+            } else {
+                sm.sm_xd[ld_r][ld_k4] = (gm < M) ? x_d[static_cast<uint64_t>(gm) * nb32 + b * 4u + (ld_k4 >> 1)] : 0.0f;
+            }
+            __syncthreads();
+
+            const uint32_t r0 = tn * 2u, r1 = r0 + 1u;
+            const uint32_t t0 = tm * 2u, t1 = t0 + 1u;
+            const uint4* wr0_4 = reinterpret_cast<const uint4*>(sm.sm_w[r0]);
+            const uint4* wr1_4 = reinterpret_cast<const uint4*>(sm.sm_w[r1]);
+            const uint4* xt0_4 = reinterpret_cast<const uint4*>(sm.sm_x[t0]);
+            const uint4* xt1_4 = reinterpret_cast<const uint4*>(sm.sm_x[t1]);
+            #pragma nounroll
+            for (uint32_t sub = 0u; sub < 8u; ++sub) {
+                uint4 x0 = xt0_4[sub], x1 = xt1_4[sub];
+                const float xd0 = sm.sm_xd[t0][sub], xd1 = sm.sm_xd[t1][sub];
+                {
+                    uint4 w0 = wr0_4[sub];
+                    int32_t a00 = vj_sdot4(w0.w, x0.w, vj_sdot4(w0.z, x0.z, vj_sdot4(w0.y, x0.y, vj_sdot4(w0.x, x0.x, 0))));
+                    int32_t a10 = vj_sdot4(w0.w, x1.w, vj_sdot4(w0.z, x1.z, vj_sdot4(w0.y, x1.y, vj_sdot4(w0.x, x1.x, 0))));
+                    const float wd0 = sm.sm_wd[r0][sub >> 1];
+                    c00 = fmaf(wd0 * xd0, static_cast<float>(a00), c00);
+                    c10 = fmaf(wd0 * xd1, static_cast<float>(a10), c10);
+                }
+                {
+                    uint4 w1 = wr1_4[sub];
+                    int32_t a01 = vj_sdot4(w1.w, x0.w, vj_sdot4(w1.z, x0.z, vj_sdot4(w1.y, x0.y, vj_sdot4(w1.x, x0.x, 0))));
+                    int32_t a11 = vj_sdot4(w1.w, x1.w, vj_sdot4(w1.z, x1.z, vj_sdot4(w1.y, x1.y, vj_sdot4(w1.x, x1.x, 0))));
+                    const float wd1 = sm.sm_wd[r1][sub >> 1];
+                    c01 = fmaf(wd1 * xd0, static_cast<float>(a01), c01);
+                    c11 = fmaf(wd1 * xd1, static_cast<float>(a11), c11);
+                }
+            }
+            __syncthreads();
+        }
+        const uint32_t gn0 = n0 + tn * 2u, gn1 = gn0 + 1u;
+        const uint32_t gm0 = m0 + tm * 2u, gm1 = gm0 + 1u;
+        if (gm0 < M && gn0 < N) y_out[static_cast<uint64_t>(gm0) * N + gn0] = c00;
+        if (gm0 < M && gn1 < N) y_out[static_cast<uint64_t>(gm0) * N + gn1] = c01;
+        if (gm1 < M && gn0 < N) y_out[static_cast<uint64_t>(gm1) * N + gn0] = c10;
+        if (gm1 < M && gn1 < N) y_out[static_cast<uint64_t>(gm1) * N + gn1] = c11;
+    }
+}
+
+// Persistent-grid 32x64x64 LDS-tiled VJ_Q8_DP4A GEMM (BN=32, BM=64, BK=64 -> 1.0x weight load at M=64, 2x4 tile!)
+// Fits in 8.1 KiB LDS (<= VjQ8Tile32Sm -> 0 extra LDS in gdn_wy_prefill_super!), <= 64 VGPRs!
+struct VjQ8Tile32x64Sm {
+    uint32_t sm_w[32][17]; // 2,176 B (32 rows x 64 int8 + 1 pad -> 0 bank conflicts!)
+    uint32_t sm_x[64][17]; // 4,352 B (64 toks x 64 int8 + 1 pad)
+    float    sm_wd[32][2]; //   256 B
+    float    sm_xd[64][4]; // 1,024 B -> Total: 7,808 B (7.6 KiB!)
+};
+
+__device__ __forceinline__ void vj_gemm_q8_dp4a_tiled_32x64_persistent(
+    VjQ8Tile32x64Sm& sm,
+    const int8_t*   __restrict__ w_qs,
+    const uint16_t* __restrict__ w_ds,
+    const int8_t*   __restrict__ x_q8,
+    const float*    __restrict__ x_d,
+    float*          __restrict__ y_out,
+    uint32_t N, uint32_t K, uint32_t M,
+    uint32_t x_d_stride16,
+    uint32_t wg_id, uint32_t n_wgs, uint32_t tid) {
+    const uint32_t tn   = tid & 15u;       // 0..15 -> 2 N rows
+    const uint32_t tm   = tid >> 4;        // 0..15 -> 4 M toks (2x4 = 8 outputs/thread!)
+    const uint32_t ld_r = tid >> 2;        // 0..63
+    const uint32_t ld_k = tid & 3u;        // 0..3 -> 1 uint4 = 16 B -> 64 B contiguous burst per row/tok!
+    const uint32_t nb64 = K >> 6;          // BK = 64
+    const uint32_t nb32 = K >> 5;
+    const uint32_t ku4  = K >> 4;
+    const uint32_t n_nt = (N + 31u) >> 5;
+    const uint32_t n_mt = (M + 63u) >> 6;
+    const uint32_t tot_tiles = n_nt * n_mt;
+
+    const uint4* w4 = reinterpret_cast<const uint4*>(w_qs);
+    const uint4* x4 = reinterpret_cast<const uint4*>(x_q8);
+
+    #pragma nounroll
+    for (uint32_t tile = wg_id; tile < tot_tiles; tile += n_wgs) {
+        const uint32_t nt = tile / n_mt;
+        const uint32_t mt = tile - nt * n_mt;
+        const uint32_t n0 = nt * 32u;
+        const uint32_t m0 = mt * 64u;
+
+        float c00=0, c01=0, c10=0, c11=0, c20=0, c21=0, c30=0, c31=0;
+        const uint32_t gn = n0 + ld_r;
+        const uint32_t gm = m0 + ld_r;
+
+        #pragma nounroll
+        for (uint32_t b = 0u; b < nb64; ++b) {
+            if (ld_r < 32u) {
+                uint4 wv = (gn < N) ? w4[static_cast<uint64_t>(gn) * ku4 + b * 4u + ld_k] : make_uint4(0u, 0u, 0u, 0u);
+                sm.sm_w[ld_r][ld_k * 4u + 0u] = wv.x; sm.sm_w[ld_r][ld_k * 4u + 1u] = wv.y;
+                sm.sm_w[ld_r][ld_k * 4u + 2u] = wv.z; sm.sm_w[ld_r][ld_k * 4u + 3u] = wv.w;
+                if (ld_k < 2u) {
+                    sm.sm_wd[ld_r][ld_k] = (gn < N) ? vj_fp16_to_f32(w_ds[static_cast<uint64_t>(gn) * nb32 + b * 2u + ld_k]) : 0.0f;
+                }
+            }
+            uint4 xv = (gm < M) ? x4[static_cast<uint64_t>(gm) * ku4 + b * 4u + ld_k] : make_uint4(0u, 0u, 0u, 0u);
+            sm.sm_x[ld_r][ld_k * 4u + 0u] = xv.x; sm.sm_x[ld_r][ld_k * 4u + 1u] = xv.y;
+            sm.sm_x[ld_r][ld_k * 4u + 2u] = xv.z; sm.sm_x[ld_r][ld_k * 4u + 3u] = xv.w;
+            if (x_d_stride16 != 0u) {
+                sm.sm_xd[ld_r][ld_k] = (gm < M) ? x_d[static_cast<uint64_t>(gm) * (nb32 * 2u) + b * 4u + ld_k] : 0.0f;
+            } else {
+                sm.sm_xd[ld_r][ld_k] = (gm < M) ? x_d[static_cast<uint64_t>(gm) * nb32 + b * 2u + (ld_k >> 1)] : 0.0f;
+            }
+            __syncthreads();
+
+            const uint32_t r0 = tn * 2u, r1 = r0 + 1u;
+            const uint32_t t0 = tm * 4u, t1 = t0 + 1u, t2 = t0 + 2u, t3 = t0 + 3u;
+            #pragma unroll
+            for (uint32_t sub = 0u; sub < 4u; ++sub) {
+                int32_t a00=0, a01=0, a10=0, a11=0, a20=0, a21=0, a30=0, a31=0;
+                const uint32_t kb = sub * 4u;
+                #pragma unroll
+                for (uint32_t k = 0u; k < 4u; ++k) {
+                    uint32_t w0 = sm.sm_w[r0][kb + k], w1 = sm.sm_w[r1][kb + k];
+                    uint32_t x0 = sm.sm_x[t0][kb + k], x1 = sm.sm_x[t1][kb + k];
+                    uint32_t x2 = sm.sm_x[t2][kb + k], x3 = sm.sm_x[t3][kb + k];
+                    a00 = vj_sdot4(w0, x0, a00); a01 = vj_sdot4(w1, x0, a01);
+                    a10 = vj_sdot4(w0, x1, a10); a11 = vj_sdot4(w1, x1, a11);
+                    a20 = vj_sdot4(w0, x2, a20); a21 = vj_sdot4(w1, x2, a21);
+                    a30 = vj_sdot4(w0, x3, a30); a31 = vj_sdot4(w1, x3, a31);
+                }
+                const float wd0 = sm.sm_wd[r0][sub >> 1], wd1 = sm.sm_wd[r1][sub >> 1];
+                const float xd0 = sm.sm_xd[t0][sub], xd1 = sm.sm_xd[t1][sub];
+                const float xd2 = sm.sm_xd[t2][sub], xd3 = sm.sm_xd[t3][sub];
+                c00 = fmaf(wd0 * xd0, static_cast<float>(a00), c00); c01 = fmaf(wd1 * xd0, static_cast<float>(a01), c01);
+                c10 = fmaf(wd0 * xd1, static_cast<float>(a10), c10); c11 = fmaf(wd1 * xd1, static_cast<float>(a11), c11);
+                c20 = fmaf(wd0 * xd2, static_cast<float>(a20), c20); c21 = fmaf(wd1 * xd2, static_cast<float>(a21), c21);
+                c30 = fmaf(wd0 * xd3, static_cast<float>(a30), c30); c31 = fmaf(wd1 * xd3, static_cast<float>(a31), c31);
+            }
+            __syncthreads();
+        }
+        const uint32_t gn0 = n0 + tn * 2u, gn1 = gn0 + 1u;
+        const uint32_t gm0 = m0 + tm * 4u;
+        if (gm0 + 0u < M) { if (gn0 < N) y_out[static_cast<uint64_t>(gm0 + 0u) * N + gn0] = c00; if (gn1 < N) y_out[static_cast<uint64_t>(gm0 + 0u) * N + gn1] = c01; }
+        if (gm0 + 1u < M) { if (gn0 < N) y_out[static_cast<uint64_t>(gm0 + 1u) * N + gn0] = c10; if (gn1 < N) y_out[static_cast<uint64_t>(gm0 + 1u) * N + gn1] = c11; }
+        if (gm0 + 2u < M) { if (gn0 < N) y_out[static_cast<uint64_t>(gm0 + 2u) * N + gn0] = c20; if (gn1 < N) y_out[static_cast<uint64_t>(gm0 + 2u) * N + gn1] = c21; }
+        if (gm0 + 3u < M) { if (gn0 < N) y_out[static_cast<uint64_t>(gm0 + 3u) * N + gn0] = c30; if (gn1 < N) y_out[static_cast<uint64_t>(gm0 + 3u) * N + gn1] = c31; }
+    }
+}
+
+} // namespace dev
+} // namespace vegajet
+
+// High-AI Prefill Tiled GEMM: VJ_Q8_DP4A (BN=64, BM=32, BK=128, 128-bit dwordx4 loads, full unroll, 14.7 KiB LDS, 0 B spill!)
+// Grid: (ceil(M/32)*256, ceil(N/64), 1) -> schedules mt=0 & mt=1 for same N-tile together for 100% L2 hit on w_qs!
+extern "C" __global__ __launch_bounds__(256, 3)
+void vj_gemm_q8_dp4a_tiled_64x32_kernel(
+    const int8_t*   __restrict__ w_qs,
+    const uint16_t* __restrict__ w_ds,
+    const int8_t*   __restrict__ x_q8,
+    const float*    __restrict__ x_d,
+    float*          __restrict__ y_out,
+    uint32_t N,
+    uint32_t K,
+    uint32_t M,
+    uint32_t x_d_stride16) {
+    __shared__ uint32_t sm_w[64][33]; // 8,448 B
+    __shared__ uint32_t sm_x[32][33]; // 4,224 B
+    __shared__ float    sm_wd[64][4]; // 1,024 B
+    __shared__ float    sm_xd[32][8]; // 1,024 B -> total 14.7 KiB LDS!
+
+    const uint32_t tid   = threadIdx.x;
+    const uint32_t tn    = tid & 15u;       // 0..15 -> 4 N rows
+    const uint32_t tm    = tid >> 4;        // 0..15 -> 2 M toks
+    const uint32_t m0    = blockIdx.x * 32u;
+    const uint32_t n0    = blockIdx.y * 64u;
+    const uint32_t nb128 = K >> 7;
+    const uint32_t nb32  = K >> 5;
+    const uint32_t ku4   = K >> 4;
+    const uint32_t ld_r  = tid >> 3;        // 0..31
+    const uint32_t ld_k4 = tid & 7u;        // 0..7 -> 1 uint4 = 16 B -> 128 B contiguous burst per row!
+
+    const uint4* w4 = reinterpret_cast<const uint4*>(w_qs);
+    const uint4* x4 = reinterpret_cast<const uint4*>(x_q8);
+
+    float c00 = 0.0f, c01 = 0.0f, c02 = 0.0f, c03 = 0.0f;
+    float c10 = 0.0f, c11 = 0.0f, c12 = 0.0f, c13 = 0.0f;
+
+    const uint32_t gn_a = n0 + ld_r;
+    const uint32_t gn_b = n0 + 32u + ld_r;
+    const uint32_t gm   = m0 + ld_r;
+
+    #pragma nounroll
+    for (uint32_t b = 0u; b < nb128; ++b) {
+        uint4 wa = (gn_a < N) ? w4[static_cast<uint64_t>(gn_a) * ku4 + b * 8u + ld_k4] : make_uint4(0u, 0u, 0u, 0u);
+        uint4 wb = (gn_b < N) ? w4[static_cast<uint64_t>(gn_b) * ku4 + b * 8u + ld_k4] : make_uint4(0u, 0u, 0u, 0u);
+        uint4 xv = (gm < M)   ? x4[static_cast<uint64_t>(gm)   * ku4 + b * 8u + ld_k4] : make_uint4(0u, 0u, 0u, 0u);
+        sm_w[ld_r][ld_k4 * 4u + 0u]       = wa.x; sm_w[ld_r][ld_k4 * 4u + 1u]       = wa.y;
+        sm_w[ld_r][ld_k4 * 4u + 2u]       = wa.z; sm_w[ld_r][ld_k4 * 4u + 3u]       = wa.w;
+        sm_w[32u + ld_r][ld_k4 * 4u + 0u] = wb.x; sm_w[32u + ld_r][ld_k4 * 4u + 1u] = wb.y;
+        sm_w[32u + ld_r][ld_k4 * 4u + 2u] = wb.z; sm_w[32u + ld_r][ld_k4 * 4u + 3u] = wb.w;
+        sm_x[ld_r][ld_k4 * 4u + 0u]       = xv.x; sm_x[ld_r][ld_k4 * 4u + 1u]       = xv.y;
+        sm_x[ld_r][ld_k4 * 4u + 2u]       = xv.z; sm_x[ld_r][ld_k4 * 4u + 3u]       = xv.w;
+        if (ld_k4 < 4u) {
+            sm_wd[ld_r][ld_k4]       = (gn_a < N) ? vegajet::dev::vj_fp16_to_f32(w_ds[static_cast<uint64_t>(gn_a) * nb32 + b * 4u + ld_k4]) : 0.0f;
+            sm_wd[32u + ld_r][ld_k4] = (gn_b < N) ? vegajet::dev::vj_fp16_to_f32(w_ds[static_cast<uint64_t>(gn_b) * nb32 + b * 4u + ld_k4]) : 0.0f;
+        }
+        if (x_d_stride16 != 0u) {
+            sm_xd[ld_r][ld_k4] = (gm < M) ? x_d[static_cast<uint64_t>(gm) * (nb32 * 2u) + b * 8u + ld_k4] : 0.0f;
+        } else {
+            sm_xd[ld_r][ld_k4] = (gm < M) ? x_d[static_cast<uint64_t>(gm) * nb32 + b * 4u + (ld_k4 >> 1)] : 0.0f;
+        }
+        __syncthreads();
+
+        const uint32_t r0 = tn * 4u, r1 = r0 + 1u, r2 = r0 + 2u, r3 = r0 + 3u;
+        const uint32_t t0 = tm * 2u, t1 = t0 + 1u;
+        #pragma unroll
+        for (uint32_t sub = 0u; sub < 8u; ++sub) {
+            int32_t a00 = 0, a01 = 0, a02 = 0, a03 = 0;
+            int32_t a10 = 0, a11 = 0, a12 = 0, a13 = 0;
+            const uint32_t kb = sub * 4u;
+            #pragma unroll
+            for (uint32_t k = 0u; k < 4u; ++k) {
+                uint32_t wr0 = sm_w[r0][kb + k], wr1 = sm_w[r1][kb + k], wr2 = sm_w[r2][kb + k], wr3 = sm_w[r3][kb + k];
+                uint32_t xt0 = sm_x[t0][kb + k], xt1 = sm_x[t1][kb + k];
+                a00 = vegajet::dev::vj_sdot4(wr0, xt0, a00); a01 = vegajet::dev::vj_sdot4(wr1, xt0, a01);
+                a02 = vegajet::dev::vj_sdot4(wr2, xt0, a02); a03 = vegajet::dev::vj_sdot4(wr3, xt0, a03);
+                a10 = vegajet::dev::vj_sdot4(wr0, xt1, a10); a11 = vegajet::dev::vj_sdot4(wr1, xt1, a11);
+                a12 = vegajet::dev::vj_sdot4(wr2, xt1, a12); a13 = vegajet::dev::vj_sdot4(wr3, xt1, a13);
+            }
+            const float wd0 = sm_wd[r0][sub >> 1], wd1 = sm_wd[r1][sub >> 1], wd2 = sm_wd[r2][sub >> 1], wd3 = sm_wd[r3][sub >> 1];
+            const float x0  = sm_xd[t0][sub],      x1  = sm_xd[t1][sub];
+            c00 = fmaf(wd0 * x0, static_cast<float>(a00), c00); c01 = fmaf(wd1 * x0, static_cast<float>(a01), c01);
+            c02 = fmaf(wd2 * x0, static_cast<float>(a02), c02); c03 = fmaf(wd3 * x0, static_cast<float>(a03), c03);
+            c10 = fmaf(wd0 * x1, static_cast<float>(a10), c10); c11 = fmaf(wd1 * x1, static_cast<float>(a11), c11);
+            c12 = fmaf(wd2 * x1, static_cast<float>(a12), c12); c13 = fmaf(wd3 * x1, static_cast<float>(a13), c13);
+        }
+        __syncthreads();
+    }
+
+    const uint32_t gn0 = n0 + tn * 4u;
+    const uint32_t gm0 = m0 + tm * 2u, gm1 = gm0 + 1u;
+    if (gm0 < M) {
+        if (gn0 + 0u < N) y_out[static_cast<uint64_t>(gm0) * N + gn0 + 0u] = c00;
+        if (gn0 + 1u < N) y_out[static_cast<uint64_t>(gm0) * N + gn0 + 1u] = c01;
+        if (gn0 + 2u < N) y_out[static_cast<uint64_t>(gm0) * N + gn0 + 2u] = c02;
+        if (gn0 + 3u < N) y_out[static_cast<uint64_t>(gm0) * N + gn0 + 3u] = c03;
+    }
+    if (gm1 < M) {
+        if (gn0 + 0u < N) y_out[static_cast<uint64_t>(gm1) * N + gn0 + 0u] = c10;
+        if (gn0 + 1u < N) y_out[static_cast<uint64_t>(gm1) * N + gn0 + 1u] = c11;
+        if (gn0 + 2u < N) y_out[static_cast<uint64_t>(gm1) * N + gn0 + 2u] = c12;
+        if (gn0 + 3u < N) y_out[static_cast<uint64_t>(gm1) * N + gn0 + 3u] = c13;
+    }
+}
+
+// Deterministic Split-K 32x32x128 Tiled VJ_Q8_DP4A GEMM (for small-N / large-K like hc_down [320, 10240]!)
+// Grid: (ceil(N/32)*256, ceil(M/32), split_k) -> 160 WGs x 4 waves = 640 waves for hc_down, 128-bit dwordx4 + ds_read_b128!
+extern "C" __global__ __launch_bounds__(256, 4)
+void vj_gemm_q8_dp4a_tiled_32x32x128_splitk_kernel(
+    const int8_t*   __restrict__ w_qs,
+    const uint16_t* __restrict__ w_ds,
+    const int8_t*   __restrict__ x_q8,
+    const float*    __restrict__ x_d,
+    float*          __restrict__ y_split,
+    uint32_t N,
+    uint32_t K,
+    uint32_t M,
+    uint32_t x_d_stride16,
+    uint32_t split_k,
+    float    scale_out) {
+    __shared__ vegajet::dev::VjQ8Tile32Sm sm; // 10.75 KiB LDS -> 4 WGs/CU!
+
+    const uint32_t tid   = threadIdx.x;
+    const uint32_t tn    = tid & 15u;
+    const uint32_t tm    = tid >> 4;
+    const uint32_t ld_r  = tid >> 3;
+    const uint32_t ld_k4 = tid & 7u;
+    const uint32_t n0    = blockIdx.x * 32u;
+    const uint32_t m0    = blockIdx.y * 32u;
+    const uint32_t sk    = blockIdx.z;
+    const uint32_t nb128 = K >> 7;
+    const uint32_t nb32  = K >> 5;
+    const uint32_t ku4   = K >> 4;
+    const uint32_t b_per = (nb128 + split_k - 1u) / split_k;
+    const uint32_t b_beg = sk * b_per;
+    const uint32_t b_end = (b_beg + b_per < nb128) ? (b_beg + b_per) : nb128;
+
+    const uint4* w4 = reinterpret_cast<const uint4*>(w_qs);
+    const uint4* x4 = reinterpret_cast<const uint4*>(x_q8);
+
+    float c00 = 0.0f, c01 = 0.0f, c10 = 0.0f, c11 = 0.0f;
+    const uint32_t gn = n0 + ld_r;
+    const uint32_t gm = m0 + ld_r;
+
+    #pragma nounroll
+    for (uint32_t b = b_beg; b < b_end; ++b) {
+        uint4 wv = (gn < N) ? w4[static_cast<uint64_t>(gn) * ku4 + b * 8u + ld_k4] : make_uint4(0u, 0u, 0u, 0u);
+        uint4 xv = (gm < M) ? x4[static_cast<uint64_t>(gm) * ku4 + b * 8u + ld_k4] : make_uint4(0u, 0u, 0u, 0u);
+        reinterpret_cast<uint4*>(sm.sm_w[ld_r])[ld_k4] = wv;
+        reinterpret_cast<uint4*>(sm.sm_x[ld_r])[ld_k4] = xv;
+        if (ld_k4 < 4u) {
+            sm.sm_wd[ld_r][ld_k4] = (gn < N) ? vegajet::dev::vj_fp16_to_f32(w_ds[static_cast<uint64_t>(gn) * nb32 + b * 4u + ld_k4]) : 0.0f;
+        }
+        if (x_d_stride16 != 0u) {
+            sm.sm_xd[ld_r][ld_k4] = (gm < M) ? x_d[static_cast<uint64_t>(gm) * (nb32 * 2u) + b * 8u + ld_k4] : 0.0f;
+        } else {
+            sm.sm_xd[ld_r][ld_k4] = (gm < M) ? x_d[static_cast<uint64_t>(gm) * nb32 + b * 4u + (ld_k4 >> 1)] : 0.0f;
+        }
+        __syncthreads();
+
+        const uint32_t r0 = tn * 2u, r1 = r0 + 1u;
+        const uint32_t t0 = tm * 2u, t1 = t0 + 1u;
+        #pragma unroll
+        for (uint32_t sub = 0u; sub < 8u; ++sub) {
+            int32_t a00 = 0, a01 = 0, a10 = 0, a11 = 0;
+            const uint32_t kb = sub * 4u;
+            #pragma unroll
+            for (uint32_t k = 0u; k < 4u; ++k) {
+                uint32_t wr0 = sm.sm_w[r0][kb + k], wr1 = sm.sm_w[r1][kb + k];
+                uint32_t xt0 = sm.sm_x[t0][kb + k], xt1 = sm.sm_x[t1][kb + k];
+                a00 = vegajet::dev::vj_sdot4(wr0, xt0, a00);
+                a01 = vegajet::dev::vj_sdot4(wr1, xt0, a01);
+                a10 = vegajet::dev::vj_sdot4(wr0, xt1, a10);
+                a11 = vegajet::dev::vj_sdot4(wr1, xt1, a11);
+            }
+            const float wd0 = sm.sm_wd[r0][sub >> 1], wd1 = sm.sm_wd[r1][sub >> 1];
+            const float xd0 = sm.sm_xd[t0][sub],      xd1 = sm.sm_xd[t1][sub];
+            c00 = fmaf(wd0 * xd0, static_cast<float>(a00), c00);
+            c01 = fmaf(wd1 * xd0, static_cast<float>(a01), c01);
+            c10 = fmaf(wd0 * xd1, static_cast<float>(a10), c10);
+            c11 = fmaf(wd1 * xd1, static_cast<float>(a11), c11);
+        }
+        __syncthreads();
+    }
+
+    float* y_plane = y_split + static_cast<uint64_t>(sk) * M * N;
+    const uint32_t gn0 = n0 + tn * 2u, gn1 = gn0 + 1u;
+    const uint32_t gm0 = m0 + tm * 2u, gm1 = gm0 + 1u;
+    if (gm0 < M && gn0 < N) y_plane[static_cast<uint64_t>(gm0) * N + gn0] = c00 * scale_out;
+    if (gm0 < M && gn1 < N) y_plane[static_cast<uint64_t>(gm0) * N + gn1] = c01 * scale_out;
+    if (gm1 < M && gn0 < N) y_plane[static_cast<uint64_t>(gm1) * N + gn0] = c10 * scale_out;
+    if (gm1 < M && gn1 < N) y_plane[static_cast<uint64_t>(gm1) * N + gn1] = c11 * scale_out;
+}
+
+// Prefill LDS-Tiled FP16 GEMM: native v_dot2_f32_f16 (BN=16, BM=32, BK=64 fp16, 128-bit dwordx4 loads, 66 WGs for Router!)
+// When sh_gate_out != nullptr, rows 0..(N-2) write to y_out with stride (N-1), and row (N-1) writes sigmoid to sh_gate_out[m]!
+extern "C" __global__ __launch_bounds__(256, 4)
+void vj_gemm_f16_fdot2_tiled_kernel(
+    const uint16_t* __restrict__ w_f16,       // [N, K]
+    const uint16_t* __restrict__ x_f16,       // [M, K]
+    float*          __restrict__ y_out,       // [M, y_stride]
+    float*          __restrict__ sh_gate_out, // optional [M] (row N-1 sigmoid for merged router!)
+    uint32_t N,
+    uint32_t K,
+    uint32_t M) {
+    __shared__ uint32_t sm_w[16][33]; // 16 rows x 64 fp16 (32 half2 u32 + 1 pad = 2,112 B)
+    __shared__ uint32_t sm_x[32][33]; // 32 toks x 64 fp16 (32 half2 u32 + 1 pad = 4,224 B) -> 6.3 KiB LDS!
+
+    const uint32_t tid   = threadIdx.x;
+    const uint32_t tn    = tid & 15u;       // 0..15 -> 1 N row
+    const uint32_t tm    = tid >> 4;        // 0..15 -> 2 M toks
+    const uint32_t n0    = blockIdx.x * 16u;
+    const uint32_t m0    = blockIdx.y * 32u;
+    const uint32_t ld_r  = tid >> 3;        // 0..31
+    const uint32_t ld_k4 = tid & 7u;        // 0..7 -> 1 uint4 = 8 fp16 = 16 B -> 128 B burst per row!
+    const uint32_t ku4   = K >> 3;          // uint4 (8 fp16) stride per row
+    const uint32_t nb64  = K >> 6;          // BK = 64 fp16 per step (40 iters for K=2560!)
+
+    const uint4* w4 = reinterpret_cast<const uint4*>(w_f16);
+    const uint4* x4 = reinterpret_cast<const uint4*>(x_f16);
+
+    float c0 = 0.0f, c1 = 0.0f;
+    const uint32_t gn_ld = n0 + ld_r;
+    const uint32_t gm_ld = m0 + ld_r;
+
+    #pragma nounroll
+    for (uint32_t b = 0u; b < nb64; ++b) {
+        if (ld_r < 16u) {
+            uint4 wv = (gn_ld < N) ? w4[static_cast<uint64_t>(gn_ld) * ku4 + b * 8u + ld_k4] : make_uint4(0u, 0u, 0u, 0u);
+            sm_w[ld_r][ld_k4 * 4u + 0u] = wv.x; sm_w[ld_r][ld_k4 * 4u + 1u] = wv.y;
+            sm_w[ld_r][ld_k4 * 4u + 2u] = wv.z; sm_w[ld_r][ld_k4 * 4u + 3u] = wv.w;
+        }
+        uint4 xv = (gm_ld < M) ? x4[static_cast<uint64_t>(gm_ld) * ku4 + b * 8u + ld_k4] : make_uint4(0u, 0u, 0u, 0u);
+        sm_x[ld_r][ld_k4 * 4u + 0u] = xv.x; sm_x[ld_r][ld_k4 * 4u + 1u] = xv.y;
+        sm_x[ld_r][ld_k4 * 4u + 2u] = xv.z; sm_x[ld_r][ld_k4 * 4u + 3u] = xv.w;
+        __syncthreads();
+
+        const uint32_t t0 = tm * 2u, t1 = t0 + 1u;
+        #pragma unroll
+        for (uint32_t k = 0u; k < 32u; ++k) {
+            uint32_t wr = sm_w[tn][k];
+            c0 = vegajet::dev::vj_fdot2_u32(wr, sm_x[t0][k], c0);
+            c1 = vegajet::dev::vj_fdot2_u32(wr, sm_x[t1][k], c1);
+        }
+        __syncthreads();
+    }
+
+    const uint32_t y_stride = (sh_gate_out != nullptr) ? (N - 1u) : N;
+    const uint32_t gn  = n0 + tn;
+    const uint32_t gm0 = m0 + tm * 2u, gm1 = gm0 + 1u;
+    if (gn < N) {
+        if (gm0 < M) {
+            if (sh_gate_out != nullptr && gn == N - 1u) sh_gate_out[gm0] = vegajet::dev::vj_sigmoid(c0);
+            else y_out[static_cast<uint64_t>(gm0) * y_stride + gn] = c0;
+        }
+        if (gm1 < M) {
+            if (sh_gate_out != nullptr && gn == N - 1u) sh_gate_out[gm1] = vegajet::dev::vj_sigmoid(c1);
+            else y_out[static_cast<uint64_t>(gm1) * y_stride + gn] = c1;
+        }
+    }
+}
+
+// ============================================================================
+// Priority 2: Deterministic 2-Phase 2D Split-K Streaming GEMV (VJ_Q8_DP4A)
+// Eliminates tail-wave quantization on skinny GEMVs (e.g. N=128..512 on 60-CU MI50)
+// ZERO global FP atomics -> 100% bit-exact deterministic reduction across runs!
+// VGPR <= 48 (5 waves/SIMD), 0 B spill!
+// ============================================================================
+extern "C" __global__ __launch_bounds__(256, 5)
+void vj_gemv_q8_dp4a_splitk_p1_kernel(
+    const int8_t*   __restrict__ w_qs,
+    const uint16_t* __restrict__ w_ds,
+    const int8_t*   __restrict__ x_q8,
+    const float*    __restrict__ x_d,
+    float*          __restrict__ partials, // [split_k, rows]
+    uint32_t rows,
+    uint32_t cols,
+    uint32_t split_k) {
+    const uint32_t wave = threadIdx.x >> 6;
+    const uint32_t lane = threadIdx.x & 63u;
+    const uint32_t row  = blockIdx.x * 4u + wave;
+    const uint32_t sk   = blockIdx.y;
+    if (row >= rows || sk >= split_k) return;
+
+    const uint32_t nb32_tot = cols >> 5;
+    const uint32_t nb32_per = (nb32_tot + split_k - 1u) / split_k;
+    const uint32_t b32_beg  = sk * nb32_per;
+    const uint32_t b32_end  = min(nb32_tot, b32_beg + nb32_per);
+    const uint32_t i_beg    = b32_beg << 1; // 16-byte chunks
+    const uint32_t i_end    = b32_end << 1;
+
+    const uint4*    w4 = reinterpret_cast<const uint4*>(w_qs + static_cast<uint64_t>(row) * cols);
+    const uint16_t* ds = w_ds + static_cast<uint64_t>(row) * nb32_tot;
+    const uint4*    x4 = reinterpret_cast<const uint4*>(x_q8);
+
+    float acc = 0.0f;
+    #pragma nounroll
+    for (uint32_t i = i_beg + lane; i < i_end; i += 64u) {
+        uint4 wv = vegajet::dev::vj_ldg_u32x4_stream(w4 + i);
+        uint4 xv = x4[i];
+        int32_t dp = vegajet::dev::vj_sdot4(wv.w, xv.w,
+                     vegajet::dev::vj_sdot4(wv.z, xv.z,
+                     vegajet::dev::vj_sdot4(wv.y, xv.y,
+                     vegajet::dev::vj_sdot4(wv.x, xv.x, 0))));
+        float sc = vegajet::dev::vj_fp16_to_f32(ds[i >> 1]) * x_d[i >> 1];
+        acc = fmaf(sc, static_cast<float>(dp), acc);
+    }
+    acc = vegajet::dev::vj_wave64_sum(acc);
+    if (lane == 0u) partials[static_cast<uint64_t>(sk) * rows + row] = acc;
+}
+
+extern "C" __global__ __launch_bounds__(256, 8)
+void vj_splitk_reduce_f32_kernel(
+    const float* __restrict__ partials, // [split_k, rows]
+    float*       __restrict__ y_out,    // [rows]
+    uint32_t rows,
+    uint32_t split_k) {
+    const uint32_t row = blockIdx.x * 256u + threadIdx.x;
+    if (row >= rows) return;
+    float sum = 0.0f;
+    #pragma nounroll
+    for (uint32_t s = 0u; s < split_k; ++s) {
+        sum += partials[static_cast<uint64_t>(s) * rows + row];
+    }
+    y_out[row] = sum;
+}
+
+// ============================================================================
+// Engine-wide Deterministic 2D Split-K Streaming GEMV for VJ_Q4_A8
+//   - Grid: (ceil(rows / 8) * 256, split_k, 1), Block: 256 (8 rows/WG, 32 lanes/row)
+//   - Supports odd-256B TCC anti-camping on BOTH qs (qs_stride_bytes) and dm (dm_stride_u32)
+//   - Supports optional per-WG k_start staggering (flags & 1) across K tiles
+//   - glc=1 slc=1 weight streams, <= 48 VGPRs (5 waves/SIMD), 0 B spill, ZERO FP atomics!
+//   - When split_k == 1, writes directly to partials_or_y[row] (no reduce pass needed).
+// ============================================================================
+extern "C" __global__ __launch_bounds__(256, 5)
+void vj_gemv_q4a8_splitk_p1_kernel(
+    const uint8_t*  __restrict__ w_qs,
+    const uint32_t* __restrict__ w_dm,
+    const int8_t*   __restrict__ x_q8,
+    const float2*   __restrict__ x_ds,
+    float*          __restrict__ partials_or_y, // [split_k, rows] (or [rows] if split_k == 1)
+    uint32_t rows,
+    uint32_t cols,
+    uint32_t qs_stride_bytes,
+    uint32_t dm_stride_u32,
+    uint32_t split_k,
+    uint32_t flags) {
+    const uint32_t grp  = threadIdx.x >> 5;  // 0..7 (8 rows/WG)
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t row  = blockIdx.x * 8u + grp;
+    const uint32_t sk   = blockIdx.y;
+    if (row >= rows || sk >= split_k) return;
+
+    const uint32_t nb    = cols >> 5;
+    const uint32_t dm_st = dm_stride_u32 ? dm_stride_u32 : nb;
+    const uint32_t b_beg = (sk * nb) / split_k;
+    const uint32_t b_end = ((sk + 1u) * nb) / split_k;
+    const uint32_t n_blk = b_end - b_beg;
+    if (n_blk == 0u) {
+        if (lane == 0u) partials_or_y[static_cast<uint64_t>(sk) * rows + row] = 0.0f;
+        return;
+    }
+
+    const uint4*    w4 = reinterpret_cast<const uint4*>(w_qs + static_cast<uint64_t>(row) * qs_stride_bytes);
+    const uint32_t* dm = w_dm + static_cast<uint64_t>(row) * dm_st;
+    const uint4*    x4 = reinterpret_cast<const uint4*>(x_q8);
+
+    // Optional per-WG k_start stagger across K tiles (spreads concurrent WGs across HBM2 channels).
+    const uint32_t k_rot = ((flags & 1u) != 0u && n_blk > 32u) ? ((blockIdx.x * 16u) % n_blk) : 0u;
+    const uint32_t b_last = b_end - 1u;
+
+    float acc = 0.0f;
+    #pragma nounroll
+    for (uint32_t off0 = lane; off0 < n_blk; off0 += 64u) {
+        const uint32_t off1 = off0 + 32u;
+        uint32_t r0 = off0 + k_rot; if (r0 >= n_blk) r0 -= n_blk;
+        uint32_t r1 = off1 + k_rot; if (r1 >= n_blk) r1 -= n_blk;
+        const uint32_t b0 = b_beg + r0;
+        const uint32_t b1 = (off1 < n_blk) ? (b_beg + r1) : b_last;
+
+        const uint4    wv0 = vegajet::dev::vj_ldg_u32x4_stream(w4 + b0);
+        const uint32_t dm0 = vegajet::dev::vj_ldg_u32_stream(dm + b0);
+        const uint4    wv1 = vegajet::dev::vj_ldg_u32x4_stream(w4 + b1);
+        const uint32_t dm1 = vegajet::dev::vj_ldg_u32_stream(dm + b1);
+        {
+            const uint4  xa  = x4[b0 * 2u], xb = x4[b0 * 2u + 1u];
+            const float2 xds = x_ds[b0];
+            int32_t dp = vegajet::dev::vj_sdot4(wv0.x & 0x0F0F0F0Fu, xa.x, 0);
+            dp         = vegajet::dev::vj_sdot4(wv0.y & 0x0F0F0F0Fu, xa.y, dp);
+            dp         = vegajet::dev::vj_sdot4(wv0.z & 0x0F0F0F0Fu, xa.z, dp);
+            dp         = vegajet::dev::vj_sdot4(wv0.w & 0x0F0F0F0Fu, xa.w, dp);
+            dp         = vegajet::dev::vj_sdot4((wv0.x >> 4) & 0x0F0F0F0Fu, xb.x, dp);
+            dp         = vegajet::dev::vj_sdot4((wv0.y >> 4) & 0x0F0F0F0Fu, xb.y, dp);
+            dp         = vegajet::dev::vj_sdot4((wv0.z >> 4) & 0x0F0F0F0Fu, xb.z, dp);
+            dp         = vegajet::dev::vj_sdot4((wv0.w >> 4) & 0x0F0F0F0Fu, xb.w, dp);
+            const float wd = vegajet::dev::vj_fp16_to_f32(static_cast<uint16_t>(dm0 & 0xFFFFu));
+            const float wm = vegajet::dev::vj_fp16_to_f32(static_cast<uint16_t>(dm0 >> 16));
+            acc = fmaf(wd * xds.x, static_cast<float>(dp), fmaf(wm, xds.y, acc));
+        }
+        if (off1 < n_blk) {
+            const uint4  xa  = x4[b1 * 2u], xb = x4[b1 * 2u + 1u];
+            const float2 xds = x_ds[b1];
+            int32_t dp = vegajet::dev::vj_sdot4(wv1.x & 0x0F0F0F0Fu, xa.x, 0);
+            dp         = vegajet::dev::vj_sdot4(wv1.y & 0x0F0F0F0Fu, xa.y, dp);
+            dp         = vegajet::dev::vj_sdot4(wv1.z & 0x0F0F0F0Fu, xa.z, dp);
+            dp         = vegajet::dev::vj_sdot4(wv1.w & 0x0F0F0F0Fu, xa.w, dp);
+            dp         = vegajet::dev::vj_sdot4((wv1.x >> 4) & 0x0F0F0F0Fu, xb.x, dp);
+            dp         = vegajet::dev::vj_sdot4((wv1.y >> 4) & 0x0F0F0F0Fu, xb.y, dp);
+            dp         = vegajet::dev::vj_sdot4((wv1.z >> 4) & 0x0F0F0F0Fu, xb.z, dp);
+            dp         = vegajet::dev::vj_sdot4((wv1.w >> 4) & 0x0F0F0F0Fu, xb.w, dp);
+            const float wd = vegajet::dev::vj_fp16_to_f32(static_cast<uint16_t>(dm1 & 0xFFFFu));
+            const float wm = vegajet::dev::vj_fp16_to_f32(static_cast<uint16_t>(dm1 >> 16));
+            acc = fmaf(wd * xds.x, static_cast<float>(dp), fmaf(wm, xds.y, acc));
+        }
+    }
+    acc = vegajet::dev::vj_block32_sum(acc);
+    if (lane == 0u) partials_or_y[static_cast<uint64_t>(sk) * rows + row] = acc;
+}
+
+// Deterministic Split-K FP32 reduction + optional coalesced 16-B FP16 BAR0 prepush (512 B/WG bursts).
+extern "C" __global__ __launch_bounds__(256, 8)
+void vj_splitk_reduce_prepush_f32_kernel(
+    const float* __restrict__ partials, // [split_k, rows]
+    float*       __restrict__ y_out,    // [rows]
+    uint16_t*    __restrict__ peer_tx,  // optional FP16 BAR0 mailbox (nullptr to skip)
+    uint32_t rows,
+    uint32_t split_k) {
+    __shared__ float sm[256];
+    const uint32_t tid = threadIdx.x;
+    const uint32_t row = blockIdx.x * 256u + tid;
+    float sum = 0.0f;
+    if (row < rows) {
+        #pragma nounroll
+        for (uint32_t s = 0u; s < split_k; ++s) {
+            sum += partials[static_cast<uint64_t>(s) * rows + row];
+        }
+        y_out[row] = sum;
+    }
+    if (peer_tx != nullptr && (rows & 7u) == 0u) {
+        sm[tid] = sum;
+        __syncthreads();
+        if (tid < 32u) {
+            const uint32_t o = tid * 8u;
+            const uint32_t dst_row = blockIdx.x * 256u + o;
+            if (dst_row < rows) {
+                const __half2 h0 = __float22half2_rn(make_float2(sm[o + 0u], sm[o + 1u]));
+                const __half2 h1 = __float22half2_rn(make_float2(sm[o + 2u], sm[o + 3u]));
+                const __half2 h2 = __float22half2_rn(make_float2(sm[o + 4u], sm[o + 5u]));
+                const __half2 h3 = __float22half2_rn(make_float2(sm[o + 6u], sm[o + 7u]));
+                vegajet::dev::vj_u32x4 pv = {
+                    *reinterpret_cast<const uint32_t*>(&h0),
+                    *reinterpret_cast<const uint32_t*>(&h1),
+                    *reinterpret_cast<const uint32_t*>(&h2),
+                    *reinterpret_cast<const uint32_t*>(&h3)
+                };
+                __builtin_nontemporal_store(pv, reinterpret_cast<vegajet::dev::vj_u32x4*>(peer_tx + dst_row));
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Engine-wide Wave64-per-row VJ_Q4_A8 Streaming GEMV (64 lanes/row -> 2x K-parallelism in 1 dispatch!)
+//   Eliminates tail-wave quantization on medium-N GEMVs (e.g. N=2048..4096, K>=2048) with ZERO reduce dispatch,
+//   ZERO global partials, <= 44 VGPRs (5-6 waves/SIMD), 0 B spill, odd-256B qs + dm strides.
+// ============================================================================
+extern "C" __global__ __launch_bounds__(256, 6)
+void vj_gemv_q4a8_w64_kernel(
+    const uint8_t*  __restrict__ w_qs,
+    const uint32_t* __restrict__ w_dm,
+    const int8_t*   __restrict__ x_q8,
+    const float2*   __restrict__ x_ds,
+    float*          __restrict__ y_out,
+    uint32_t rows,
+    uint32_t cols,
+    uint32_t qs_stride_bytes,
+    uint32_t dm_stride_u32,
+    uint16_t*       __restrict__ peer_tx) {
+    const uint32_t wave = threadIdx.x >> 6;  // 0..3 (4 rows/WG)
+    const uint32_t lane = threadIdx.x & 63u;
+    const uint32_t row  = blockIdx.x * 4u + wave;
+    if (row >= rows) return;
+
+    const uint32_t nb    = cols >> 5;
+    const uint32_t dm_st = dm_stride_u32 ? dm_stride_u32 : nb;
+    const uint4*    w4   = reinterpret_cast<const uint4*>(w_qs + static_cast<uint64_t>(row) * qs_stride_bytes);
+    const uint32_t* dm   = w_dm + static_cast<uint64_t>(row) * dm_st;
+    const uint4*    x4   = reinterpret_cast<const uint4*>(x_q8);
+
+    float acc = 0.0f;
+    if (nb == 128u) {
+        // Uniform 2-block-per-lane fast path (cols=4096): both HBM2 requests issued together, zero loop/branches!
+        const uint32_t b0 = lane;
+        const uint32_t b1 = lane + 64u;
+        const uint4    wv0 = vegajet::dev::vj_ldg_u32x4_stream(w4 + b0);
+        const uint32_t dm0 = vegajet::dev::vj_ldg_u32_stream(dm + b0);
+        const uint4    wv1 = vegajet::dev::vj_ldg_u32x4_stream(w4 + b1);
+        const uint32_t dm1 = vegajet::dev::vj_ldg_u32_stream(dm + b1);
+        {
+            const uint4  xa  = x4[b0 * 2u], xb = x4[b0 * 2u + 1u];
+            const float2 xds = x_ds[b0];
+            int32_t dp = vegajet::dev::vj_sdot4(wv0.x & 0x0F0F0F0Fu, xa.x, 0);
+            dp         = vegajet::dev::vj_sdot4(wv0.y & 0x0F0F0F0Fu, xa.y, dp);
+            dp         = vegajet::dev::vj_sdot4(wv0.z & 0x0F0F0F0Fu, xa.z, dp);
+            dp         = vegajet::dev::vj_sdot4(wv0.w & 0x0F0F0F0Fu, xa.w, dp);
+            dp         = vegajet::dev::vj_sdot4((wv0.x >> 4) & 0x0F0F0F0Fu, xb.x, dp);
+            dp         = vegajet::dev::vj_sdot4((wv0.y >> 4) & 0x0F0F0F0Fu, xb.y, dp);
+            dp         = vegajet::dev::vj_sdot4((wv0.z >> 4) & 0x0F0F0F0Fu, xb.z, dp);
+            dp         = vegajet::dev::vj_sdot4((wv0.w >> 4) & 0x0F0F0F0Fu, xb.w, dp);
+            const float wd = vegajet::dev::vj_fp16_to_f32(static_cast<uint16_t>(dm0 & 0xFFFFu));
+            const float wm = vegajet::dev::vj_fp16_to_f32(static_cast<uint16_t>(dm0 >> 16));
+            acc = fmaf(wd * xds.x, static_cast<float>(dp), fmaf(wm, xds.y, acc));
+        }
+        {
+            const uint4  xa  = x4[b1 * 2u], xb = x4[b1 * 2u + 1u];
+            const float2 xds = x_ds[b1];
+            int32_t dp = vegajet::dev::vj_sdot4(wv1.x & 0x0F0F0F0Fu, xa.x, 0);
+            dp         = vegajet::dev::vj_sdot4(wv1.y & 0x0F0F0F0Fu, xa.y, dp);
+            dp         = vegajet::dev::vj_sdot4(wv1.z & 0x0F0F0F0Fu, xa.z, dp);
+            dp         = vegajet::dev::vj_sdot4(wv1.w & 0x0F0F0F0Fu, xa.w, dp);
+            dp         = vegajet::dev::vj_sdot4((wv1.x >> 4) & 0x0F0F0F0Fu, xb.x, dp);
+            dp         = vegajet::dev::vj_sdot4((wv1.y >> 4) & 0x0F0F0F0Fu, xb.y, dp);
+            dp         = vegajet::dev::vj_sdot4((wv1.z >> 4) & 0x0F0F0F0Fu, xb.z, dp);
+            dp         = vegajet::dev::vj_sdot4((wv1.w >> 4) & 0x0F0F0F0Fu, xb.w, dp);
+            const float wd = vegajet::dev::vj_fp16_to_f32(static_cast<uint16_t>(dm1 & 0xFFFFu));
+            const float wm = vegajet::dev::vj_fp16_to_f32(static_cast<uint16_t>(dm1 >> 16));
+            acc = fmaf(wd * xds.x, static_cast<float>(dp), fmaf(wm, xds.y, acc));
+        }
+    } else {
+        #pragma nounroll
+        for (uint32_t b = lane; b < nb; b += 64u) {
+            const uint4    wv  = vegajet::dev::vj_ldg_u32x4_stream(w4 + b);
+            const uint32_t dmv = vegajet::dev::vj_ldg_u32_stream(dm + b);
+            const uint4    xa  = x4[b * 2u], xb = x4[b * 2u + 1u];
+            const float2   xds = x_ds[b];
+            int32_t dp = vegajet::dev::vj_sdot4(wv.x & 0x0F0F0F0Fu, xa.x, 0);
+            dp         = vegajet::dev::vj_sdot4(wv.y & 0x0F0F0F0Fu, xa.y, dp);
+            dp         = vegajet::dev::vj_sdot4(wv.z & 0x0F0F0F0Fu, xa.z, dp);
+            dp         = vegajet::dev::vj_sdot4(wv.w & 0x0F0F0F0Fu, xa.w, dp);
+            dp         = vegajet::dev::vj_sdot4((wv.x >> 4) & 0x0F0F0F0Fu, xb.x, dp);
+            dp         = vegajet::dev::vj_sdot4((wv.y >> 4) & 0x0F0F0F0Fu, xb.y, dp);
+            dp         = vegajet::dev::vj_sdot4((wv.z >> 4) & 0x0F0F0F0Fu, xb.z, dp);
+            dp         = vegajet::dev::vj_sdot4((wv.w >> 4) & 0x0F0F0F0Fu, xb.w, dp);
+            const float wd = vegajet::dev::vj_fp16_to_f32(static_cast<uint16_t>(dmv & 0xFFFFu));
+            const float wm = vegajet::dev::vj_fp16_to_f32(static_cast<uint16_t>(dmv >> 16));
+            acc = fmaf(wd * xds.x, static_cast<float>(dp), fmaf(wm, xds.y, acc));
+        }
+    }
+    acc = vegajet::dev::vj_wave64_sum(acc);
+    if (lane == 0u) y_out[row] = acc;
+    if (peer_tx != nullptr && (rows & 3u) == 0u) {
+        __shared__ float sm_out[4];
+        if (lane == 0u) sm_out[wave] = acc;
+        __syncthreads();
+        if (threadIdx.x == 0u) {
+            const __half2 h0 = __float22half2_rn(make_float2(sm_out[0], sm_out[1]));
+            const __half2 h1 = __float22half2_rn(make_float2(sm_out[2], sm_out[3]));
+            typedef uint32_t u32x2_t __attribute__((ext_vector_type(2)));
+            u32x2_t pv = {*reinterpret_cast<const uint32_t*>(&h0), *reinterpret_cast<const uint32_t*>(&h1)};
+            __builtin_nontemporal_store(pv, reinterpret_cast<u32x2_t*>(peer_tx + blockIdx.x * 4u));
+        }
+    }
+}
+
+// 1-Wave64-per-WG (64 threads/WG, 6 waves/SIMD = 24 WGs/CU = 1,440 resident WGs on MI50, ZERO LDS/barrier!)
+extern "C" __global__ __launch_bounds__(64, 6)
+void vj_gemv_q4a8_w64_1r_kernel(
+    const uint8_t*  __restrict__ w_qs,
+    const uint32_t* __restrict__ w_dm,
+    const int8_t*   __restrict__ x_q8,
+    const float2*   __restrict__ x_ds,
+    float*          __restrict__ y_out,
+    uint32_t rows,
+    uint32_t cols,
+    uint32_t qs_stride_bytes,
+    uint32_t dm_stride_u32,
+    uint16_t*       __restrict__ peer_tx) {
+    const uint32_t row  = blockIdx.x;
+    const uint32_t lane = threadIdx.x;
+    if (row >= rows) return;
+
+    const uint32_t nb    = cols >> 5;
+    const uint32_t dm_st = dm_stride_u32 ? dm_stride_u32 : nb;
+    const uint4*    w4   = reinterpret_cast<const uint4*>(w_qs + static_cast<uint64_t>(row) * qs_stride_bytes);
+    const uint32_t* dm   = w_dm + static_cast<uint64_t>(row) * dm_st;
+    const uint4*    x4   = reinterpret_cast<const uint4*>(x_q8);
+
+    float acc = 0.0f;
+    if (nb == 128u) {
+        const uint4    wv0 = vegajet::dev::vj_ldg_u32x4_stream(w4 + lane);
+        const uint32_t dm0 = vegajet::dev::vj_ldg_u32_stream(dm + lane);
+        const uint4    wv1 = vegajet::dev::vj_ldg_u32x4_stream(w4 + lane + 64u);
+        const uint32_t dm1 = vegajet::dev::vj_ldg_u32_stream(dm + lane + 64u);
+        {
+            const uint4 xa = x4[lane * 2u], xb = x4[lane * 2u + 1u];
+            const float2 xds = x_ds[lane];
+            int32_t dp = vegajet::dev::vj_sdot4(wv0.x & 0x0F0F0F0Fu, xa.x, 0);
+            dp         = vegajet::dev::vj_sdot4(wv0.y & 0x0F0F0F0Fu, xa.y, dp);
+            dp         = vegajet::dev::vj_sdot4(wv0.z & 0x0F0F0F0Fu, xa.z, dp);
+            dp         = vegajet::dev::vj_sdot4(wv0.w & 0x0F0F0F0Fu, xa.w, dp);
+            dp         = vegajet::dev::vj_sdot4((wv0.x >> 4) & 0x0F0F0F0Fu, xb.x, dp);
+            dp         = vegajet::dev::vj_sdot4((wv0.y >> 4) & 0x0F0F0F0Fu, xb.y, dp);
+            dp         = vegajet::dev::vj_sdot4((wv0.z >> 4) & 0x0F0F0F0Fu, xb.z, dp);
+            dp         = vegajet::dev::vj_sdot4((wv0.w >> 4) & 0x0F0F0F0Fu, xb.w, dp);
+            const float wd = vegajet::dev::vj_fp16_to_f32(static_cast<uint16_t>(dm0 & 0xFFFFu));
+            const float wm = vegajet::dev::vj_fp16_to_f32(static_cast<uint16_t>(dm0 >> 16));
+            acc = fmaf(wd * xds.x, static_cast<float>(dp), fmaf(wm, xds.y, acc));
+        }
+        {
+            const uint32_t b1 = lane + 64u;
+            const uint4 xa = x4[b1 * 2u], xb = x4[b1 * 2u + 1u];
+            const float2 xds = x_ds[b1];
+            int32_t dp = vegajet::dev::vj_sdot4(wv1.x & 0x0F0F0F0Fu, xa.x, 0);
+            dp         = vegajet::dev::vj_sdot4(wv1.y & 0x0F0F0F0Fu, xa.y, dp);
+            dp         = vegajet::dev::vj_sdot4(wv1.z & 0x0F0F0F0Fu, xa.z, dp);
+            dp         = vegajet::dev::vj_sdot4(wv1.w & 0x0F0F0F0Fu, xa.w, dp);
+            dp         = vegajet::dev::vj_sdot4((wv1.x >> 4) & 0x0F0F0F0Fu, xb.x, dp);
+            dp         = vegajet::dev::vj_sdot4((wv1.y >> 4) & 0x0F0F0F0Fu, xb.y, dp);
+            dp         = vegajet::dev::vj_sdot4((wv1.z >> 4) & 0x0F0F0F0Fu, xb.z, dp);
+            dp         = vegajet::dev::vj_sdot4((wv1.w >> 4) & 0x0F0F0F0Fu, xb.w, dp);
+            const float wd = vegajet::dev::vj_fp16_to_f32(static_cast<uint16_t>(dm1 & 0xFFFFu));
+            const float wm = vegajet::dev::vj_fp16_to_f32(static_cast<uint16_t>(dm1 >> 16));
+            acc = fmaf(wd * xds.x, static_cast<float>(dp), fmaf(wm, xds.y, acc));
+        }
+    } else {
+        #pragma nounroll
+        for (uint32_t b = lane; b < nb; b += 64u) {
+            const uint4    wv  = vegajet::dev::vj_ldg_u32x4_stream(w4 + b);
+            const uint32_t dmv = vegajet::dev::vj_ldg_u32_stream(dm + b);
+            const uint4    xa  = x4[b * 2u], xb = x4[b * 2u + 1u];
+            const float2   xds = x_ds[b];
+            int32_t dp = vegajet::dev::vj_sdot4(wv.x & 0x0F0F0F0Fu, xa.x, 0);
+            dp         = vegajet::dev::vj_sdot4(wv.y & 0x0F0F0F0Fu, xa.y, dp);
+            dp         = vegajet::dev::vj_sdot4(wv.z & 0x0F0F0F0Fu, xa.z, dp);
+            dp         = vegajet::dev::vj_sdot4(wv.w & 0x0F0F0F0Fu, xa.w, dp);
+            dp         = vegajet::dev::vj_sdot4((wv.x >> 4) & 0x0F0F0F0Fu, xb.x, dp);
+            dp         = vegajet::dev::vj_sdot4((wv.y >> 4) & 0x0F0F0F0Fu, xb.y, dp);
+            dp         = vegajet::dev::vj_sdot4((wv.z >> 4) & 0x0F0F0F0Fu, xb.z, dp);
+            dp         = vegajet::dev::vj_sdot4((wv.w >> 4) & 0x0F0F0F0Fu, xb.w, dp);
+            const float wd = vegajet::dev::vj_fp16_to_f32(static_cast<uint16_t>(dmv & 0xFFFFu));
+            const float wm = vegajet::dev::vj_fp16_to_f32(static_cast<uint16_t>(dmv >> 16));
+            acc = fmaf(wd * xds.x, static_cast<float>(dp), fmaf(wm, xds.y, acc));
+        }
+    }
+    acc = vegajet::dev::vj_wave64_sum(acc);
+    if (lane == 0u) {
+        y_out[row] = acc;
+        if (peer_tx != nullptr) __builtin_nontemporal_store(__half_as_ushort(__float2half(acc)), peer_tx + row);
+    }
+}
+
+// ============================================================================
+// Wave 4B: Native 4.5 bpw GGML Q4_K Streaming Dense GEMV (<= 48 VGPRs, 0 B spill, glc=1 slc=1).
+//   Reads native GGML block_q4_K (144 B / 256 weights = 4.50 bpw -> 10% less HBM2 traffic than VJ_Q4_A8 5.0 bpw!)
+//   with zero weight repacking, 32 threads/row (8 rows/WG), v_dot4_i32_i8 against INT8 x_q8 + float2 x_ds.
+//   row_stride_bytes: stride between consecutive rows (multiple of 144 B, or padded odd-256B for TCC anti-camping).
+// ============================================================================
+extern "C" __global__ __launch_bounds__(256, 5)
+void vj_gemv_q4k_stream_kernel(
+    const uint8_t* __restrict__ w_q4k,
+    const int8_t*  __restrict__ x_q8,
+    const float2*  __restrict__ x_ds,
+    float*         __restrict__ y_out,
+    uint32_t rows,
+    uint32_t cols,
+    uint32_t row_stride_bytes,
+    uint16_t*      __restrict__ peer_tx) {
+    const uint32_t grp   = threadIdx.x >> 5;  // 0..7 (8 rows/WG)
+    const uint32_t lane  = threadIdx.x & 31u; // 0..31 (4 chunks x 8 lanes = 256 weights/superblock)
+    const uint32_t row   = blockIdx.x * 8u + grp;
+    if (row >= rows) return;
+
+    const uint32_t nsb   = cols >> 8;         // cols / 256 superblocks (16 for 4096, 12 for 3072)
+    const uint32_t chunk = lane >> 3;         // 0..3 (each chunk = 64 weights = 32 B of qs)
+    const uint32_t u     = lane & 7u;         // 0..7 (4 bytes of qs = 4 lo + 4 hi nibbles)
+    const uint32_t s_lo  = chunk * 2u;        // sub-block 0,2,4,6
+    const uint32_t s_hi  = s_lo + 1u;         // sub-block 1,3,5,7
+    const uint8_t* rptr  = w_q4k + static_cast<uint64_t>(row) * row_stride_bytes;
+    const uint32_t* x32  = reinterpret_cast<const uint32_t*>(x_q8);
+
+    float acc = 0.0f;
+    #pragma nounroll
+    for (uint32_t sb = 0u; sb < nsb; sb += 2u) {
+        const uint8_t* bp0 = rptr + sb * 144u;
+        const uint8_t* bp1 = bp0 + 144u;
+        // Broadcast 16-byte superblock header via cached load (all 32 lanes read the exact same 16 B -> 1 L1/L2 line,
+        // NOT 32 redundant non-temporal HBM2 requests!) and prefetch both 4-byte qs words in parallel for HBM2 MLP.
+        const uint4    hdr0 = *reinterpret_cast<const uint4*>(bp0);
+        const uint32_t q4_0 = vegajet::dev::vj_ldg_u32_stream(reinterpret_cast<const uint32_t*>(bp0 + 16u + chunk * 32u + u * 4u));
+        const uint4    hdr1 = *reinterpret_cast<const uint4*>(bp1);
+        const uint32_t q4_1 = vegajet::dev::vj_ldg_u32_stream(reinterpret_cast<const uint32_t*>(bp1 + 16u + chunk * 32u + u * 4u));
+
+        auto accum_sb = [&](uint32_t sb_i, const uint4& hdr, uint32_t q4) {
+            const float d    = vegajet::dev::vj_fp16_to_f32(static_cast<uint16_t>(hdr.x & 0xFFFFu));
+            const float dmin = vegajet::dev::vj_fp16_to_f32(static_cast<uint16_t>(hdr.x >> 16));
+            uint32_t sc0, m0, sc1, m1;
+            if (chunk < 2u) {
+                const uint32_t sh0 = s_lo * 8u;
+                const uint32_t sh1 = s_hi * 8u;
+                sc0 = (hdr.y >> sh0) & 63u;
+                m0  = (hdr.z >> sh0) & 63u;
+                sc1 = (hdr.y >> sh1) & 63u;
+                m1  = (hdr.z >> sh1) & 63u;
+            } else {
+                const uint32_t j0  = s_lo - 4u;
+                const uint32_t j1  = s_hi - 4u;
+                const uint32_t sh0 = j0 * 8u;
+                const uint32_t sh1 = j1 * 8u;
+                const uint32_t b80 = (hdr.w >> sh0) & 0xFFu;
+                const uint32_t b81 = (hdr.w >> sh1) & 0xFFu;
+                sc0 = (b80 & 0xFu) | (((hdr.y >> (sh0 + 6u)) & 3u) << 4);
+                m0  = (b80 >> 4)   | (((hdr.z >> (sh0 + 6u)) & 3u) << 4);
+                sc1 = (b81 & 0xFu) | (((hdr.y >> (sh1 + 6u)) & 3u) << 4);
+                m1  = (b81 >> 4)   | (((hdr.z >> (sh1 + 6u)) & 3u) << 4);
+            }
+            const uint32_t b_lo = sb_i * 8u + s_lo;
+            const uint32_t b_hi = sb_i * 8u + s_hi;
+            const uint32_t x_lo = x32[b_lo * 8u + u];
+            const uint32_t x_hi = x32[b_hi * 8u + u];
+            const int32_t dp_lo = vegajet::dev::vj_sdot4(q4 & 0x0F0F0F0Fu, x_lo, 0);
+            const int32_t dp_hi = vegajet::dev::vj_sdot4((q4 >> 4) & 0x0F0F0F0Fu, x_hi, 0);
+            const float2 ds_lo = x_ds[b_lo];
+            const float2 ds_hi = x_ds[b_hi];
+            acc = fmaf(d * static_cast<float>(sc0) * ds_lo.x, static_cast<float>(dp_lo), acc);
+            acc = fmaf(d * static_cast<float>(sc1) * ds_hi.x, static_cast<float>(dp_hi), acc);
+            if (u == 0u) {
+                acc = fmaf(-dmin * static_cast<float>(m0), ds_lo.y, acc);
+                acc = fmaf(-dmin * static_cast<float>(m1), ds_hi.y, acc);
+            }
+        };
+        accum_sb(sb,      hdr0, q4_0);
+        accum_sb(sb + 1u, hdr1, q4_1);
+    }
+
+    acc += __shfl_xor(acc, 16, 32);
+    acc += __shfl_xor(acc,  8, 32);
+    acc += __shfl_xor(acc,  4, 32);
+    acc += __shfl_xor(acc,  2, 32);
+    acc += __shfl_xor(acc,  1, 32);
+    if (lane == 0u) {
+        y_out[row] = acc;
+        if (peer_tx != nullptr) __builtin_nontemporal_store(__half_as_ushort(__float2half(acc)), peer_tx + row);
+    }
+}
