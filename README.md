@@ -1,14 +1,22 @@
 # VegaJet
 
-A bare-metal LLM inference engine for AMD gfx906 GPUs (Vega 20). VegaJet talks to `/dev/kfd` directly instead of
-going through the HIP runtime. It repacks GGUF weights at load time into three native formats, `VJ_Q8_DP4A`,
-`VJ_Q4_DOT8` and `VJ_IQ_PACKED`, and runs tensor-parallel decode with peer-to-peer AllReduce over PCIe BAR.
+I had two 32 GB AMD Instinct MI50s and wanted to know how fast they could run a 122B model in my own machine. That question turned into VegaJet. It talks directly to the Linux GPU driver through `/dev/kfd`, without the ROCm runtime in the inference path. It repacks GGUF weights into native `gfx906` layouts (`VJ_Q8_DP4A`, `VJ_Q4_DOT8`, `VJ_IQ_PACKED`) and serves Ornith-122B to OpenAI- and Anthropic-compatible clients. My tuned two-card runs hit **165.22 tok/s raw** at 100 dispatches per token and **357.07 tok/s with Hybrid** on repeated code.
 
-> **Alpha scope (`v0.1.0-alpha.1`).** GPU execution and live GPU serving in this release cover the hand-scheduled
-> Ornith hybrid-MoE backend on exactly **two 32 GB gfx906 cards**. The CPU toolchain (build, tests, `inspect`,
-> `plan`, `doctor`, `serve --mock`, `top`, `chat`) is portable. One-GPU, 16 GB, Radeon VII, 3–4 GPU execution and
-> multi-slot GPU continuous batching are on the [Roadmap](#roadmap). Full caveats are in
-> [`release/ALPHA_NOTES.md`](release/ALPHA_NOTES.md).
+| Ornith-122B on 2× MI50 32 GB | Recorded result | Build / workload |
+| :--- | ---: | :--- |
+| Raw decode, zero overrides, 128 output tokens | **159.33 tok/s** | `496e61b`; baseline |
+| Raw fast path, 128 / 512 output tokens | **165.22 / 156.41 tok/s** | `69ca5eb`; `GU_Q3`, `VA_CLUSTER`, `VOCAB_MUBUF` |
+| Hybrid speculative decode, 128 / 512 output tokens | **357.07 / 346.27 tok/s** | `d7bc240`; repeated code, FR-Spec 64K, `--spec-gdn`, suffix drafting |
+| DFlash2 alone / with Hybrid | **217.60 / 350.72 tok/s** | `d7bc240`; K=7 drafter on GPU 1, target on **both** cards; solo mean acceptance 5.10 |
+| Batched prefill, 512 / 2,048 input tokens | **1,264.57 / 1,344.55 tok/s** | `71cd00e`; first-token IDs 314 / 9338 respectively. ~1,700 tok/s is a W4A8 tiled target, not either measurement. |
+
+These tuned results are from development builds, not a benchmark of the downloadable binary. The speculative run used an external drafter, `--fr-spec 65536 --spec-gdn --zero-tax-catchup --suffix-max-draft 15`, and `VEGAJET_NO_AUTO_DOT8=1`. The tuned code comparisons reported **129/129 greedy tokens matching raw decode** (`first_diff=-1`). That is a token comparison, not a guarantee for every prompt or a 512-token parity test. In the separate zero-override run (`496e61b`), Hybrid accepted 100% of the draft on the repeated-code prompt and measured **311.04 / 295.43 tok/s**. The qualification recorded **0 UE / 0 DE** across the six monitored RAS blocks. The [full scorecard](#full-benchmarks) keeps the other parity oracles and ECC counts separate.
+
+**[Download the Linux bundle](https://github.com/VelaguezSzpiech/vegajet/releases/download/v0.1.0-alpha.1/vegajet-0.1.0-alpha.1-linux-x86_64.tar.gz) · [Two-command quickstart](#quickstart-install-and-serve-a-local-bundle) · [Full benchmarks and parity](#full-benchmarks)**
+
+## Why I built it
+
+I came to this through PC hardware, then 3D and software, then local inference. I like getting everything I can out of hardware I already own. With 64 GB of HBM2 across the pair, I could fit a local 122B MoE. Finding out how fast it could *generate* took more than fitting the weights. I wrote persistent `gfx906` kernels, repacked weights at load time, and measured how much time the two cards spent exchanging results over their 32 GiB BAR0 peer link. I built the server so you can install it, point your own harness at a streaming endpoint, and try the same model without changing clients.
 
 > **License: PolyForm Noncommercial 1.0.0.** VegaJet is *source-available, not open source*. You may use, modify
 > and share it for noncommercial purposes under [`LICENSE`](LICENSE). Commercial use needs a separate license from
@@ -30,13 +38,15 @@ CPU-tooling targets in this alpha.
 
 ## Quickstart: install and serve a local bundle
 
-With the release tarball `vegajet-0.1.0-alpha.1-linux-x86_64.tar.gz` in your current directory (outside any source
+Download the [Linux bundle](https://github.com/VelaguezSzpiech/vegajet/releases/download/v0.1.0-alpha.1/vegajet-0.1.0-alpha.1-linux-x86_64.tar.gz) and its [SHA-256 checksum](https://github.com/VelaguezSzpiech/vegajet/releases/download/v0.1.0-alpha.1/vegajet-0.1.0-alpha.1-linux-x86_64.tar.gz.sha256). With the tarball `vegajet-0.1.0-alpha.1-linux-x86_64.tar.gz` in your current directory (outside any source
 checkout), installing and serving a local model is two commands (no `sudo` required):
 
 ```sh
 tar -xzf vegajet-0.1.0-alpha.1-linux-x86_64.tar.gz && ./vegajet-0.1.0-alpha.1-linux-x86_64/install.sh --prefix "$HOME/.local"
-"$HOME/.local/bin/vegajet" serve <model-file> --tp 2 --port 8080
+"$HOME/.local/bin/vegajet" serve "/path/to/your/Ornith-model" --tp 2 --port 8080
 ```
+
+Replace the quoted model path with your compatible local Ornith GGUF; the bundle does not include weights. For an OpenAI-compatible client, use `http://127.0.0.1:8080/v1` and the local API key `vegajet-local`. For an Anthropic-compatible client, use `http://127.0.0.1:8080`. Set the model in either client to the ID printed at startup (`Ornith-122B-AD-D4` in the qualified run).
 
 For CPU-only evaluation without gfx906 hardware, replace the second command with
 `"$HOME/.local/bin/vegajet" serve --mock --port 8080` (or run `"$HOME/.local/bin/stream-test"`).
@@ -133,7 +143,11 @@ Package a relocatable Linux bundle from a tested build (see [`release/linux/READ
 release/linux/make-bundle.sh --no-build --build-dir build-gpu --gpu-build --rocm-prefix /opt/rocm --out /tmp/vegajet-dist
 ```
 
+<a id="full-benchmarks"></a>
+
 ## Recorded 2× MI50 32 GB scorecard (`v0.1.0-alpha.1`)
+
+The zero-override scorecard below is from benchmark build `496e61b`, not a new benchmark of the release binary.
 
 Measured on dual AMD Instinct MI50 32 GB (`gfx906`, Linux 7.0, TheRock / ROCm 7.12.0, `512/512` MoE split,
 `120192/128128` bandwidth-proportional LM-head split, `<= 200 W` cap, PCIe Gen3 x8 + Gen3 x16 host links, dual
@@ -159,6 +173,10 @@ Measured on dual AMD Instinct MI50 32 GB (`gfx906`, Linux 7.0, TheRock / ROCm 7.
 | Packaged default `Hybrid` vs packaged default raw (`ENABLE_SUPER=1`) | `p_rep_code` (129 greedy tok) | **129/129 (`first_diff=-1`) PASS** |
 | Forced `ENABLE_SUPER=0` vs packaged default `ENABLE_SUPER=1` | `p_rep_code` (129 greedy tok) | **15/129 (`first_diff=12`)** — FP32 accumulation-order drift after token 11 |
 | Packaged default `MTP K=4` (`M=5` unfused verify) vs `ENABLE_SUPER=1` raw (`M=1`) | `"The capital of France is"` (129 tok) | **5/129 (`first_diff=2`)** — same unfused `M>1` vs super `M=1` FP32 drift |
+
+## Explore the engine with your coding agent
+
+Start with the [CPU-only build](#build-from-source). Ask your agent to trace one streamed request from [`cli/serve_cmd.cpp`](cli/serve_cmd.cpp) into [`core/server.cpp`](core/server.cpp), then run [`test_server_sse`](tests/test_server_sse.cpp) before changing it. For model work, start with the [onboarding playbook](agent/ONBOARD_MODEL.md).
 
 ## Layout
 
@@ -190,9 +208,26 @@ VegaJet drives the GPUs without the HIP runtime's guard rails. Before you run an
 
 The engine never writes sysfs and contains no clock, voltage, fan, VBIOS or memory-timing tooling.
 
-## Roadmap
+## Projected scaling: other models and rigs
 
-Items planned after `v0.1.0-alpha.1`:
+**Estimates, not benchmarks or alpha support.** These roofline scenarios assume the model-specific loaders and kernels are implemented. The two-card budget is 64 GiB HBM2; the three-card scenario assumes 96 GiB HBM2, 64 GiB host DDR4 and a 150 W cap per card. Speculative rates depend on draft acceptance; offloaded rates also depend on how often experts must be fetched. No three-card rate below has been measured.
+
+| Model and quantization | MI50s | Raw decode (tok/s) | Speculative decode (tok/s) | Prefill, 2,048 inputs (tok/s) | Assumed placement |
+| :--- | ---: | ---: | ---: | ---: | :--- |
+| Ornith-1.5-122B, Q4_0 / UD-Q4_K_XL | 3 | 225–333 | 450–612 | 1,620–3,420 | 70–74 GiB in HBM2 |
+| Qwen3.8-Flash-Next, IQ4_XS | 2 | 155–185 | 264–351 | 1,610–1,975 | Trunk in HBM2; 4-bit PLE in host RAM |
+| Qwen3.8-Flash-Next, UD-IQ4_XS | 3 | 318–373 | 550–836 | 3,000–6,833 | 62–70 GiB in HBM2; ~27 GiB pinned host RAM |
+| Tencent HY4-Flash, IQ2-AH / Q3_K | 3 | 276–334 | 514–732 | 1,593–3,628 | 67–86 GiB in HBM2; ~33 GiB for 4-bit Engram in RAM |
+| Ornith-1.5-35B-A3B, Q8_0 | 3 | 407–623 | 779–1,102 | 6,000–13,667 | 35.4 GiB in HBM2 |
+| Qwen3.8-27B Dense, W4A4 dot8 | 1 | ~45 | 85–110 | — | 17.5 GiB; fits on one card |
+| Qwen3.8-27B Dense, W4A4 dot8 | 3 | 109–158 | 333–396 | 889–1,519 | Three-card model parallelism, not three independent workers |
+| GLM-5.3-Flash (320B) / DeepSeek-V4.1-Flash (552B) | 3 | 35–62 | 55–95 | 450–600 | Cold experts streamed from host RAM or NVMe |
+
+The optimistic raw-decode scenarios for three cards reach 530+ tok/s for Qwen3.8-Flash-Next and 411+ tok/s for HY4-Flash; neither is a measured result. The experimental three-kernel Universal Engine is a starting point for this work, not a working loader for every model in the table.
+
+## What I’m working on next
+
+For v0.1.1 I’m aiming for **~200 tok/s raw decode** and **2,000+ tok/s prefill**. Those are targets, not measurements. Three-card scaling is still unmeasured. Other work ahead:
 
 - Intra-superkernel barrier/L2-cache refinement (Step 3B, deferred to `v0.1.1`).
 - GPU executor support for 1, 3 and 4 cards (including TP=3 using the sealed `vj_ar_tp3_alltoall` ISA header and
@@ -202,17 +237,9 @@ Items planned after `v0.1.0-alpha.1`:
 
 ## Credits and acknowledgments
 
-VegaJet `v0.1.0-alpha.1` was engineered collaboratively across three AI development lanes under human direction:
+I’m **Velaguez Szpiech (Vela)**, VegaJet’s creator and maintainer. **Gemini (Neon)** was my primary coding partner on the runtime, the kernels, and the live MI50 runs. **Claude** helped me build the serving APIs, platform tools, and CI. **Codex** worked with me on kernel and systems engineering, qualification, and packaging the installer.
 
-- **Gemini (Neon)** — bare-metal `/dev/kfd` runtime, gfx906 super-kernels, live 2× MI50 execution/serving,
-  hardware qualification, and release integration.
-- **Claude** — platform architecture, tokenization/sampling, OpenAI & Anthropic serving APIs, observability (`top`,
-  `chat`, `/metrics`), CI regression suite, and legal/export tooling.
-- **Codex** — gfx906 ISA forge deliverables, systems qualification (`M4`–`M6`, `M9`), universal VM 3-kernel zero-spill
-  redesign, guard-latch fixtures, and the offline Linux release bundler/installer.
-
-**Research acknowledgment:** Architectural design, gfx906/Vega 20 ISA analysis, HBM2/TCC anti-camping models, and
-speculative/hybrid-SSM strategies benefited from foundational synthesis produced with **Gemini Deep Research**.
+Thank you, **Gemini Deep Research**, for helping me understand the Vega 20 architecture and choose which experiments to run on my cards.
 
 ## Contributing
 

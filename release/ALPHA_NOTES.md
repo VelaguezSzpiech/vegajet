@@ -1,8 +1,19 @@
 # VegaJet v0.1.0-alpha.1
 
-VegaJet is a bare-metal LLM inference engine for AMD gfx906 (Vega 20) GPUs. It talks to `/dev/kfd` directly,
-repacks GGUF weights into native GPU formats, and runs tensor-parallel decode with peer-to-peer AllReduce over
-PCIe BAR. This is the first public alpha: a source release for evaluation, not a production serving release.
+I ran Ornith-122B on the two **32 GB AMD Instinct MI50s** in my machine. My raw fast-path runs reached **165.22 tok/s for 128 output tokens** and **156.41 for 512** (`69ca5eb`). With FR-Spec 64K, `--spec-gdn` and suffix drafting, Hybrid reached **357.07 / 346.27 tok/s** on repeated code (`d7bc240`). Those are development-build measurements, not a benchmark of the shipped binary. That’s the machine I built VegaJet for. This alpha lets you point your own streaming client at it.
+
+On `d7bc240`, the DFlash2 drafter ran on GPU 1 while the target used both cards: **217.60 tok/s** solo and **350.72 tok/s** with Hybrid. On `71cd00e`, batched prefill reached **1,264.57 / 1,344.55 tok/s** for 512 / 2,048 input tokens; ~1,700 tok/s is a separate tiled W4A8 target. All **22 shipped gfx906 code objects** passed the zero-private-spill and direct-to-LDS vector-load checks.
+
+[Download the Linux bundle](https://github.com/VelaguezSzpiech/vegajet/releases/download/v0.1.0-alpha.1/vegajet-0.1.0-alpha.1-linux-x86_64.tar.gz), bring a compatible local Ornith GGUF, and follow the [two-command quickstart](https://github.com/VelaguezSzpiech/vegajet#quickstart-install-and-serve-a-local-bundle). The server streams to OpenAI- and Anthropic-compatible clients. Here’s what the external harness got back from the installed binary:
+
+```text
+POST /v1/chat/completions SSE -> deltas=7 finish=stop done=True elapsed=0.13s
+  reply: 'The capital of France is Paris.'
+```
+
+The tuned 129-token code comparison matched raw decode exactly (`first_diff=-1`); it is not a claim of lossless parity on arbitrary chat. The separate zero-override benchmark on build `496e61b` recorded **159.33 tok/s** for 128 output tokens. Hybrid reached **311.04 / 295.43 tok/s** for 128 / 512 output tokens on the repeated-code prompt: 100% draft acceptance, with 129/129 tokens matching raw decode in the recorded comparison. See [performance and parity](#performance-and-parity) for the flags and named comparisons.
+
+This is an evaluation alpha for exactly two MI50 32 GB cards, not a production serving release.
 
 - **License:** PolyForm Noncommercial 1.0.0. VegaJet is source-available, not open source. See [`LICENSE`](../LICENSE).
 - **Binary version string:** `vegajet 0.1.0-alpha.1`; the CMake project version is
@@ -121,7 +132,7 @@ split, `<= 200 W` cap, calibrated soak ceiling `1,626.2 GB/s`, `0 B` private spi
 
 ## Roadmap
 
-These items are not part of v0.1.0-alpha.1:
+For v0.1.1 I’m aiming for ~200 tok/s raw decode and 2,000+ tok/s prefill. These are goals. Three-card scaling is unmeasured. Also outside this alpha:
 
 - Intra-superkernel barrier/L2-cache trim (Step 3B, deferred to `v0.1.1`).
 - GPU executor support for one, three and four cards, including a three-card TP=3 layout and a three-worker
@@ -129,13 +140,18 @@ These items are not part of v0.1.0-alpha.1:
 - Wiring multi-slot GPU continuous batching, host sampling chains, GBNF grammar masks and multi-format tool parsers
   into live GPU `vegajet serve <model-file>`.
 
-## Research acknowledgment
+## Acknowledgments
 
-Architectural design, gfx906/Vega 20 ISA analysis, HBM2/TCC anti-camping models, and speculative/hybrid-SSM
-strategies benefited from foundational synthesis produced with **Gemini Deep Research**.
+I’m **Velaguez Szpiech (Vela)**, VegaJet’s creator and maintainer. **Gemini (Neon)** was my primary coding partner on the runtime, the kernels, and the live MI50 runs. **Claude** helped me build the serving APIs, platform tools, and CI. **Codex** worked with me on kernel and systems engineering, qualification, and packaging the installer.
+
+Thank you, **Gemini Deep Research**, for helping me understand the Vega 20 architecture and choose which experiments to run on my cards.
 
 ## Reporting problems
 
 Include the exact command, the full error line, the `vegajet doctor` summary, the commit hash, the GPU model and
 VRAM, and the ROCm/TheRock toolchain label. Scrub user names, hostnames, mount paths, PCI addresses and model file
 names before posting. Stop on an uncorrectable ECC error or kernel fault and preserve the `dmesg` excerpt.
+
+## Build provenance
+
+The tag points to `75c4a64b3e6753047434e03df3004c3709c93ee6`. The GPU binary was built from `ac177850d73fe2b187ee35631d98e85358d729db`; the only change between them is how a CPU test fixture is compiled. The zero-override performance measurements are from `496e61b`.
