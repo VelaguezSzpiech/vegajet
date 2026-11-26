@@ -80,6 +80,9 @@ struct ServerOptions {
     size_t max_json_nodes = 65536;      // JSON values accepted per request body; beyond this 413
     size_t max_queue = 16;              // queued + running generations
     size_t max_connections = 256;
+    // Sockets kept open above max_connections for /health and /metrics only (so monitoring stays reachable when the
+    // connection pool is full), plus a few that only receive the 503 for their request instead of a bare RST.
+    size_t reserve_connections = 2;
     int idle_timeout_ms = 30000;        // idle keep-alive / slow-header connections are closed after this
     int send_timeout_ms = 10000;        // a client that stops reading for this long is dropped
     bool parse_reasoning = true;        // split a leading <think>...</think> into reasoning_content
