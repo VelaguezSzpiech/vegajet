@@ -801,6 +801,9 @@ private:
 // ================================================================================================= renderer
 constexpr size_t kMaxOutput = 32u << 20;
 constexpr int kMaxDepth = 64;
+// Nested range()/loop constructs can multiply out to billions of iterations: bound the total that a
+// single render may execute (a real chat template iterates over messages/tools, i.e. hundreds).
+constexpr uint64_t kMaxLoopIterations = 1000000;
 
 class Renderer {
 public:
@@ -846,6 +849,11 @@ public:
     }
 
 private:
+    // Total loop iterations of this render stay bounded, so nested range() loops cannot spin for hours.
+    void count_iteration() {
+        if (++loop_iters_ > kMaxLoopIterations)
+            fail("template loop budget exceeded (" + std::to_string(kMaxLoopIterations) + " iterations)");
+    }
     void write(const std::string& s) {
         out_ += s;
         if (out_.size() > kMaxOutput) fail("template output exceeds 32 MiB");
@@ -869,6 +877,7 @@ private:
         if (n->filter) {
             List kept;
             for (const auto& it : items) {
+                count_iteration();
                 scopes_.emplace_back();
                 bind(n->vars, it);
                 if (truthy(eval(n->filter))) kept.push_back(it);
@@ -879,6 +888,7 @@ private:
         if (items.empty()) { if (n->else_body) render(n->else_body); return; }
         const int64_t len = static_cast<int64_t>(items.size());
         for (int64_t k = 0; k < len; ++k) {
+            count_iteration();
             scopes_.emplace_back();
             Dict loop{{"index", V::integer(k + 1)}, {"index0", V::integer(k)}, {"revindex", V::integer(len - k)},
                       {"revindex0", V::integer(len - k - 1)}, {"first", V::boolean(k == 0)}, {"last", V::boolean(k == len - 1)},
@@ -1353,6 +1363,7 @@ private:
     std::string date_;
     std::vector<std::unordered_map<std::string, V>> scopes_;
     int depth_ = 0;
+    uint64_t loop_iters_ = 0;
 };
 
 V message_value(const ChatMessage& m) {
