@@ -2512,6 +2512,14 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                 }
                 if (ar_ts_on && M == 1u && ar_ts_idx < kArTsMax) ++ar_ts_idx;
                 disp += 1u;
+                // A single readiness word cannot hold two unconsumed slice epochs.
+                // Keep the single-slice fast path unchanged; drain BOTH ranks before reuse.
+                if (dispatch::collective_slice_needs_drain(m0, mc, M)) {
+                    if (!rt.submit_batch(0) || !rt.submit_batch(1) ||
+                        !rt.wait_idle(0) || !rt.wait_idle(1))
+                        fail_run("all-reduce slice completion failed or timed out before mailbox reuse");
+                    if (device_fault_check("all-reduce slice")) fail_run(res.error);
+                }
             }
         };
 

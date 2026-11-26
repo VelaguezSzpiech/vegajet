@@ -22,6 +22,21 @@ int main() {
     VJ_CHECK(!fused_verify_resident(true, 60u, 0u, 64u, 20000u, 4u));
     VJ_CHECK(!fused_verify_resident(true, 60u, 64u, 0u, 20000u, 4u));
     VJ_CHECK(!fused_verify_resident(true, 60u, 64u, 64u, 20000u, 0u));
+    using vegajet::dispatch::collective_slice_needs_drain;
+    VJ_CHECK(!collective_slice_needs_drain(0u, 1u, 1u));
+    VJ_CHECK(!collective_slice_needs_drain(0u, 128u, 128u));
+    VJ_CHECK(collective_slice_needs_drain(0u, 128u, 129u));
+    VJ_CHECK(!collective_slice_needs_drain(128u, 1u, 129u));
+    VJ_CHECK(collective_slice_needs_drain(UINT32_MAX - 128u, 127u, UINT32_MAX));
+    VJ_CHECK(!collective_slice_needs_drain(UINT32_MAX - 128u, 128u, UINT32_MAX));
+    for (uint32_t width : {128u, 512u}) {
+        for (uint32_t slices : {2u, 3u}) {
+            unsigned boundaries = 0;
+            for (uint32_t i = 0; i < slices; ++i)
+                boundaries += collective_slice_needs_drain(i * width, width, slices * width);
+            VJ_CHECK(boundaries == slices - 1u);
+        }
+    }
     // Two logical collectives per batch: both ranks must share epoch and slot.
     for (uint32_t start : {1u, 2u, std::numeric_limits<uint32_t>::max()}) {
         uint32_t next = start;
