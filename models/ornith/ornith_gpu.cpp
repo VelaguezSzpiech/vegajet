@@ -2276,6 +2276,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
     // out and leave a record in io_fault_host. Every step re-arms both slots and, once the queues have drained,
     // any record becomes a sticky host error so no token can ever be produced from a wedged grid.
     bool device_faulted = false;
+    uint64_t dense_persist_launches = 0;
     guard::RunState run_state;
     auto fail_run = [&](const std::string& message) -> void {
         run_state.latch(message);
@@ -2424,6 +2425,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                             M1W32PKA kap{w.qs_va, w.dm_va, xq, xds, y, w.rows, w.cols, w.row_stride_bytes, 0u,
                                          peer_tx, S[g].dense_q_va, n_tiles};
                             VJ_CHECK(rt.enqueue_kernel(g, *K[g].gemv_q4_w32p, pwgs * 256u, 1, 1, 256, 1, 1, &kap, sizeof(kap), barrier));
+                            ++dense_persist_launches;
                         } else {
                             const uint32_t gx = ((w.rows + 7u) / 8u) * 256u;
                             VJ_CHECK(rt.enqueue_kernel(g, *K[g].gemv_q4_w32, gx, 1, 1, 256, 1, 1, &ka, sizeof(ka), barrier));
@@ -2523,6 +2525,8 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                                    local_ff == 512u && D == 3072u &&
                                    K[0].m1_gdn_super && K[0].m1_gqa_super && K[0].m1_moe_super);
 
+        if (use_m1_super && v12_dense_persist())
+            fail_run("D13 is standalone-only: use VEGAJET_ENABLE_SUPER=0 for BOTH baseline and D13 runs");
         uint32_t gdn_idx = 0, attn_idx = 0;
         if (use_m1_super) {
             const char* swg_env = std::getenv("VEGAJET_SUPER_WGS");
@@ -6036,6 +6040,12 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         res.error = run_state.error();
         rt.abort_dispatches();
         res.ok = false;
+    }
+    if (v12_dense_persist()) {
+        std::printf("[D13] kernel=ornith_gemv_q4a8_m1_w32_persist_kernel launches=%llu\n",
+                    static_cast<unsigned long long>(dense_persist_launches));
+        if (dense_persist_launches == 0u && res.error.empty())
+            res.error = "D13 requested but no persistent GEMV launched";
     }
     device_fault_check("run end");   // latch while io_fault_host is still allocated
     res.ok = false;
