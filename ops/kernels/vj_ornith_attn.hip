@@ -623,6 +623,220 @@ void ornith_gdn_conv_recur_splitv_quant_m1_kernel(
 }
 
 // ============================================================================
+// 5b4. v1.2 D6 column-thread M=1 GDN ConvRec (VEGAJET_V12_GDN_SPLITV=1, default off).
+//      Same math, same FP32 state and the same summation order as 5b3, so state and quant
+//      output are bit-identical. The 128 state rows of one V column are owned by 8 lanes of
+//      ONE wave (16 rows each, 8 columns per wave) instead of 8 different waves, so the pred
+//      and o reductions are ordered __shfl broadcasts inside an 8-lane group: no LDS partials
+//      (sm_red is gone) and 4 fewer __syncthreads per token (7 -> 3).
+// ============================================================================
+// Ordered sum over the 8 lanes of a column group: lane k's 16-row partial is added left to
+// right, exactly the order of 5b3's LDS chain (row group 0 + 1 + ... + 7). A butterfly tree
+// would be 4 shfl shorter but would change the fp32 rounding of pred and o.
+__device__ __forceinline__ float vj_gdn_ct_group_sum8(float v) {
+    float s = __shfl(v, 0, 8);
+    s += __shfl(v, 1, 8);
+    s += __shfl(v, 2, 8);
+    s += __shfl(v, 3, 8);
+    s += __shfl(v, 4, 8);
+    s += __shfl(v, 5, 8);
+    s += __shfl(v, 6, 8);
+    s += __shfl(v, 7, 8);
+    return s;
+}
+
+extern "C" __global__ __launch_bounds__(256, 4)
+void ornith_gdn_conv_recur_colthread_quant_m1_kernel(
+    const float* __restrict__ qkv_gab_in,
+    const float* __restrict__ conv_w,
+    float*       __restrict__ conv_ring,
+    const float* __restrict__ dt_bias,
+    const float* __restrict__ ssm_a,
+    float*       __restrict__ ssm_ring,
+    const float* __restrict__ ssm_norm_w,
+    int8_t*      __restrict__ out_q8,
+    float2*      __restrict__ out_ds,
+    uint32_t*    __restrict__ bar,
+    float*       __restrict__ sq_scratch,
+    uint32_t nk,
+    uint32_t nv,
+    uint32_t conv_dim,
+    uint32_t stride_in,
+    uint32_t z_off,
+    uint32_t alpha_off,
+    uint32_t beta_off,
+    uint32_t conv_in_slot,
+    uint32_t conv_out_slot,
+    uint32_t ssm_ring_head,
+    uint32_t use_ring,
+    uint32_t sense,
+    float    eps) {
+    constexpr uint32_t kLpc  = 8u;   // lanes per state column
+    constexpr uint32_t kRows = 16u;  // state rows per lane = 128 / kLpc
+    const uint32_t hv   = blockIdx.x >> 2;
+    const uint32_t part = blockIdx.x & 3u;
+    const uint32_t tid  = threadIdx.x;
+    const uint32_t sub  = tid & (kLpc - 1u);  // lane inside the column group
+    const uint32_t lc   = tid >> 3;           // column inside the part, 0..31
+    const uint32_t col0 = part * 32u;
+    const uint32_t hk   = hv % nk;
+
+    __shared__ float sm_q[128];
+    __shared__ float sm_k[128];
+    __shared__ float sm_red[8];
+    __shared__ float sm_dv[32];
+    __shared__ float sm_o[32];
+    __shared__ float sm_gb[2];
+
+    // ---- Phase 0: Conv1D + SiLU + L2-norm (Q/K) + V conv + alpha/beta gate (unchanged) ----
+    {
+        const uint64_t cslot_stride = 3ULL * conv_dim;
+        const float*   cr_in  = conv_ring + static_cast<uint64_t>(conv_in_slot)  * cslot_stride;
+        float*         cr_out = conv_ring + static_cast<uint64_t>(conv_out_slot) * cslot_stride;
+
+        const uint32_t is_k = tid >> 7;        // 0=Q (tid 0..127), 1=K (tid 128..255)
+        const uint32_t l    = tid & 127u;
+        const uint32_t ch   = (is_k ? (nk + hk) : hk) * 128u + l;
+        const float4   w    = reinterpret_cast<const float4*>(conv_w)[ch];
+        const float    s0   = cr_in[0ULL * conv_dim + ch];
+        const float    s1   = cr_in[1ULL * conv_dim + ch];
+        const float    s2   = cr_in[2ULL * conv_dim + ch];
+        const float    x    = qkv_gab_in[ch];
+        if (hv < nk && part == 0u) {
+            cr_out[0ULL * conv_dim + ch] = s1;
+            cr_out[1ULL * conv_dim + ch] = s2;
+            cr_out[2ULL * conv_dim + ch] = x;
+        }
+        const float    acc  = fmaf(w.x, s0, fmaf(w.y, s1, fmaf(w.z, s2, w.w * x)));
+        float          y    = acc / (1.0f + __expf(-acc));
+
+        const float sq_w = vegajet::ornith_dev::wave64_sum(y * y);
+        if ((tid & 63u) == 0u) sm_red[tid >> 6] = sq_w;
+        __syncthreads();
+        float inv_n = rsqrtf(sm_red[is_k ? 2u : 0u] + sm_red[is_k ? 3u : 1u] + eps);
+        if (!is_k) inv_n *= 0.08838834764831845f; // 1/sqrt(128)
+        y *= inv_n;
+        if (!is_k) sm_q[l] = y; else sm_k[l] = y;
+
+        // Disjoint V channels (owned exclusively by (hv, part)): compute + update conv_ring immediately.
+        if (tid < 32u) {
+            const uint32_t ch_v = (2u * nk + hv) * 128u + col0 + tid;
+            const float4   wv   = reinterpret_cast<const float4*>(conv_w)[ch_v];
+            const float    sv0  = cr_in[0ULL * conv_dim + ch_v];
+            const float    sv1  = cr_in[1ULL * conv_dim + ch_v];
+            const float    sv2  = cr_in[2ULL * conv_dim + ch_v];
+            const float    xv   = qkv_gab_in[ch_v];
+            const float    av   = fmaf(wv.x, sv0, fmaf(wv.y, sv1, fmaf(wv.z, sv2, wv.w * xv)));
+            sm_dv[tid] = av / (1.0f + __expf(-av));
+            cr_out[0ULL * conv_dim + ch_v] = sv1;
+            cr_out[1ULL * conv_dim + ch_v] = sv2;
+            cr_out[2ULL * conv_dim + ch_v] = xv;
+        }
+        if (tid == 0u) {
+            const float a  = qkv_gab_in[alpha_off + hv] + dt_bias[hv];
+            const float sp = (a > 20.0f) ? a : log1pf(__expf(a));
+            sm_gb[0] = __expf(sp * ssm_a[hv]);                         // g_exp
+            sm_gb[1] = 1.0f / (1.0f + __expf(-qkv_gab_in[beta_off + hv])); // beta
+        }
+    }
+    __syncthreads();
+
+    // ---- Phase 1: column-thread recurrence (no LDS partials) ----
+    const uint64_t head_elems = 128ULL * 128ULL;
+    const uint64_t slot_elems = static_cast<uint64_t>(nv) * head_elems;
+    float* S_base = ssm_ring + static_cast<uint64_t>(ssm_ring_head) * slot_elems + static_cast<uint64_t>(hv) * head_elems;
+    const uint32_t i_beg = sub * kRows;
+    const uint32_t col   = col0 + lc;
+    float* S_thr = S_base + (i_beg + 8u) * 128u + col;
+
+    float s_reg[kRows];
+    #pragma unroll
+    for (uint32_t r = 0u; r < kRows; ++r) {
+        s_reg[r] = S_thr[(static_cast<int32_t>(r) - 8) * 128];
+    }
+
+    const float g_exp = sm_gb[0];
+    const float beta  = sm_gb[1];
+
+    float p = 0.0f;
+    #pragma unroll
+    for (uint32_t r = 0u; r < kRows; ++r) {
+        p = fmaf(s_reg[r], sm_k[i_beg + r], p);
+    }
+    const float pred = vj_gdn_ct_group_sum8(p);
+    const float vj   = sm_dv[lc];
+    const float dv   = beta * (vj - g_exp * pred);
+
+    float* S_out = (use_ring != 0u)
+        ? ssm_ring + static_cast<uint64_t>((ssm_ring_head + 1u) % VJ_GDN_RING_SLOTS) * slot_elems + static_cast<uint64_t>(hv) * head_elems + (i_beg + 8u) * 128u + col
+        : S_thr;
+
+    float o = 0.0f;
+    #pragma unroll
+    for (uint32_t r = 0u; r < kRows; ++r) {
+        const float ki = sm_k[i_beg + r];
+        const float qi = sm_q[i_beg + r];
+        const float sv = fmaf(ki, dv, g_exp * s_reg[r]);
+        S_out[(static_cast<int32_t>(r) - 8) * 128] = sv;
+        o = fmaf(sv, qi, o);
+    }
+    const float fo = vj_gdn_ct_group_sum8(o);
+
+    // ---- Phase 2: 4-WG head barrier + gated RMSNorm + Quant ----
+    if (sub == 0u) sm_o[lc] = fo;
+    // Sum-of-squares partials keep 5b3's layout sq[hv*64 + part*16 + t] with t = column pair.
+    // Pair (2t, 2t+1) lives in two adjacent groups of the same wave, so a plain wave broadcast
+    // replaces the LDS hand-off (no barrier is needed before the grid barrier).
+    const float fo_next = __shfl(fo, (tid + 8u) & 63u, 64);
+    float* sq = sq_scratch + static_cast<uint64_t>(hv) * 64u;
+    if (sub == 0u && (lc & 1u) == 0u) {
+        const float fo0 = fo;
+        const float fo1 = fo_next;
+        sq[part * 16u + (lc >> 1)] = fo0 * fo0 + fo1 * fo1;
+    }
+    __threadfence();
+    vegajet::ornith_dev::grid_barrier_m(bar + static_cast<uint64_t>(hv) * 32u, 4u, sense);
+    if (tid == 0u) asm volatile("buffer_wbinvl1\n" ::: "memory");
+    __syncthreads();
+
+    if (tid < 64u) {
+        const float lane_sq  = sq[tid];
+        const float total_sq = vegajet::ornith_dev::wave64_sum(lane_sq);
+        if (tid < 16u) {
+            const float inv_r = rsqrtf(total_sq * (1.0f / 128.0f) + eps);
+            const uint32_t j0 = col0 + tid * 2u;
+            const float fo0 = sm_o[tid * 2u];
+            const float fo1 = sm_o[tid * 2u + 1u];
+            const float* zp = qkv_gab_in + z_off + hv * 128u;
+            const float z0 = zp[j0], z1 = zp[j0 + 1u];
+            const float y0 = (fo0 * inv_r * ssm_norm_w[j0])      * (z0 / (1.0f + __expf(-z0)));
+            const float y1 = (fo1 * inv_r * ssm_norm_w[j0 + 1u]) * (z1 / (1.0f + __expf(-z1)));
+
+            float amax = fmaxf(fabsf(y0), fabsf(y1));
+            amax = fmaxf(amax, __shfl_xor(amax, 8, 16));
+            amax = fmaxf(amax, __shfl_xor(amax, 4, 16));
+            amax = fmaxf(amax, __shfl_xor(amax, 2, 16));
+            amax = fmaxf(amax, __shfl_xor(amax, 1, 16));
+
+            float bsum = y0 + y1;
+            bsum += __shfl_xor(bsum, 8, 16);
+            bsum += __shfl_xor(bsum, 4, 16);
+            bsum += __shfl_xor(bsum, 2, 16);
+            bsum += __shfl_xor(bsum, 1, 16);
+
+            const float d     = amax * (1.0f / 127.0f);
+            const float inv_d = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+            int8_t* oq = out_q8 + static_cast<uint64_t>(hv) * 128u;
+            oq[j0]      = static_cast<int8_t>(max(-127, min(127, __float2int_rn(y0 * inv_d))));
+            oq[j0 + 1u] = static_cast<int8_t>(max(-127, min(127, __float2int_rn(y1 * inv_d))));
+            if (tid == 0u) {
+                out_ds[static_cast<uint64_t>(hv) * 4u + part] = make_float2(d, bsum);
+            }
+        }
+    }
+}
+
+// ============================================================================
 // 5c. GDN Chunked WY/Neumann Prefill (C=16, ZERO SOLVE_TRI, 0 B spill!)
 // ============================================================================
 extern "C" __global__ __launch_bounds__(256, 3)

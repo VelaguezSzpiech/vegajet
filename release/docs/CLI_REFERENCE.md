@@ -281,6 +281,7 @@ Exit codes: 0 ok (end of input or `/quit`), 1 server unreachable (`GET /health` 
 | `VJ_SYSFS_ROOT` | `--gpu list`, GPU selection | Alternative root for the KFD topology scan (tests use a synthetic tree). |
 | `VJ_IO_URING` | table prefetch | `0` forces the thread-pool `preadv` backend instead of io_uring. |
 | `VEGAJET_ENABLE_SUPER` | Ornith GPU bench | Ornith M=1 super-kernels. On by default since `950c137`; `0` turns them off. At `b74f820` and earlier they were opt-in with `1`. |
+| `VEGAJET_V12_GDN_SPLITV` | Ornith GPU bench, `vegajet_layer_test` | `1`: raw M=1 GDN decode runs the column-thread ConvRec kernel (`ornith_gdn_conv_recur_colthread_quant_m1_kernel`) instead of the Split-V one. Same math and FP32 state, same fp32 summation order (bit-identical output); 8 state-row chains of a column live in one wave, so the pred/`o` reductions are 8-lane `__shfl` broadcasts and 4 `__syncthreads` per token disappear. Off by default. |
 | `VEGAJET_HSACO_DIR` | KFD runtime | Code-object directory when `--hsaco-dir` is not given. |
 | `VEGAJET_DISPATCH_LOG` | KFD runtime | Appends one line per kernel dispatch to this file. |
 | `VEGAJET_VRAM_QUARANTINE` | KFD runtime | `<gpu>:<offset_mib>+<len_mib>[,...]` VRAM ranges the allocator never hands out. |
