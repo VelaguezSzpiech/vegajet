@@ -178,7 +178,7 @@ static void fail_closed_toggle() {
     const std::string saved = old ? old : "";
     VJ_CHECK(setenv("VEGAJET_V12_TREE_VERIFY", "1", 1) == 0);
     const auto result = vegajet::ornith::run_ornith_gpu("/no/model/should/be/opened", "", {});
-    VJ_CHECK(!result.ok && result.error.find("S3 host planning only") != std::string::npos);
+    VJ_CHECK(!result.ok && result.error.find("VEGAJET_V12_TREE_VERIFY=1") != std::string::npos);
     if (had_old) VJ_CHECK(setenv("VEGAJET_V12_TREE_VERIFY", saved.c_str(), 1) == 0);
     else VJ_CHECK(unsetenv("VEGAJET_V12_TREE_VERIFY") == 0);
 }
