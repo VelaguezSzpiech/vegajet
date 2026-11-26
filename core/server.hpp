@@ -9,8 +9,9 @@
 //
 // Threads: one epoll I/O thread (accept, parse, small responses, keep-alive) and one generation worker. A GPU engine
 // runs one sequence at a time, so requests queue FIFO (up to max_queue; beyond that 503 + Retry-After).
-// The worker owns a connection while it generates; it detects client disconnects (send failure or POLLRDHUP) and
-// returns false from the TokenSink so the engine stops early. Stop sequences, max_tokens and UTF-8 boundaries are
+// The worker owns a connection while it generates; it detects a client that went away from a send failure and
+// returns false from the TokenSink so the engine stops early. A peer that only half-closed (SHUT_WR) is a normal
+// client: it still receives the full response. Stop sequences, max_tokens and UTF-8 boundaries are
 // enforced here, so every GenerateFn gets them for free.
 // Function calling and reasoning (core/tool_call_parser): requests may carry "tools" / "tool_choice" /
 // "parallel_tool_calls" and tool-call / tool-result messages; output passes through a StreamParser, so a leading

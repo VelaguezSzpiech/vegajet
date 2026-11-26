@@ -486,6 +486,25 @@ struct OpenAiServer::Impl {
         conns.erase(fd);
     }
 
+    // A half-closed peer (SHUT_WR) is a legal HTTP client: it has finished sending and still wants the response.
+    // Closing while unread request bytes are queued would make the kernel answer with a RST and drop the response
+    // already in the send buffer, so shut the write side first and drain what is left (S-M1).
+    static void close_graceful(int fd) {
+        ::shutdown(fd, SHUT_WR);
+        char buf[4096];
+        for (int i = 0; i < 32; ++i) {
+            const ssize_t n = ::recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
+            if (n <= 0) break;
+        }
+        ::close(fd);
+    }
+
+    void close_conn_graceful(int fd) {
+        epoll_ctl(ep, EPOLL_CTL_DEL, fd, nullptr);
+        close_graceful(fd);
+        conns.erase(fd);
+    }
+
     // Returns false if the connection was closed.
     bool flush_out(int fd) {
         auto it = conns.find(fd);
@@ -499,7 +518,7 @@ struct OpenAiServer::Impl {
             close_conn(fd);
             return false;
         }
-        if (c.close_after || c.peer_closed) { close_conn(fd); return false; }
+        if (c.close_after || c.peer_closed) { close_conn_graceful(fd); return false; }
         watch(fd, false, EPOLL_CTL_MOD);
         return true;
     }
@@ -691,7 +710,7 @@ struct OpenAiServer::Impl {
         process_input(fd);
         auto again = conns.find(fd);
         if (again != conns.end() && again->second.peer_closed && !again->second.busy && again->second.out.empty())
-            close_conn(fd);
+            close_conn_graceful(fd);
     }
 
     void drain_done() {
@@ -703,7 +722,7 @@ struct OpenAiServer::Impl {
             Conn& c = it->second;
             c.busy = false;
             if (!x.keep_alive || stopping || c.peer_closed) {
-                ::close(x.fd);  // already removed from epoll
+                close_graceful(x.fd);  // already removed from epoll; delivers the response to a half-closed client
                 conns.erase(it);
                 continue;
             }
@@ -771,9 +790,10 @@ struct OpenAiServer::Impl {
                     if (flush_out(fd)) process_input(fd);
                 }
                 if (conns.count(fd) && (e & EPOLLRDHUP)) {
+                    // Half-close only: the peer stopped sending, not listening (S-M1).
                     auto& c = conns[fd];
                     c.peer_closed = true;
-                    if (!c.busy && c.out.empty()) close_conn(fd);
+                    if (!c.busy && c.out.empty()) close_conn_graceful(fd);
                 }
             }
             const int64_t t = now_ms();
@@ -802,12 +822,6 @@ struct OpenAiServer::Impl {
             return false;  // EPIPE, ECONNRESET, or SO_SNDTIMEO expired
         }
         return true;
-    }
-
-    static bool peer_alive(int fd) {
-        pollfd p{fd, POLLRDHUP, 0};
-        if (::poll(&p, 1, 0) < 0) return true;
-        return (p.revents & (POLLRDHUP | POLLHUP | POLLERR | POLLNVAL)) == 0;
     }
 
     // v1.2 lever: bounded queue of already-formatted SSE bytes between the generation thread and the socket. The
@@ -1003,7 +1017,6 @@ struct OpenAiServer::Impl {
             if (sm.stopped()) return false;
             if (parser.done()) return false;  // parallel_tool_calls = false: the first call ends the turn
             if (static_cast<int32_t>(pieces) >= rq.max_tokens) { hit_length = true; return false; }
-            if (!peer_alive(fd)) { gone = true; return false; }
             return true;
         };
 
