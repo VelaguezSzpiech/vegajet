@@ -154,10 +154,13 @@ void MeasuredDepthGovernor::observe_accept(uint32_t proposed, uint32_t accepted)
 }
 
 double MeasuredDepthGovernor::alpha() const {
-    uint64_t prop = 0, acc = 0;
-    for (const auto& [p, a] : win_) { prop += p; acc += a; }
-    if (prop == 0) return std::clamp(0.5, cfg_.alpha_lo, cfg_.alpha_hi);
-    return std::clamp(static_cast<double>(acc) / static_cast<double>(prop), cfg_.alpha_lo, cfg_.alpha_hi);
+    uint64_t trials = 0, successes = 0;
+    for (const auto& [p, a] : win_) {
+        successes += a;
+        trials += a + (a < p ? 1u : 0u);  // only reached decisions are conditional trials
+    }
+    if (trials == 0) return std::clamp(0.5, cfg_.alpha_lo, cfg_.alpha_hi);
+    return std::clamp(static_cast<double>(successes) / static_cast<double>(trials), cfg_.alpha_lo, cfg_.alpha_hi);
 }
 
 double MeasuredDepthGovernor::measured_ms(uint32_t m) const {
