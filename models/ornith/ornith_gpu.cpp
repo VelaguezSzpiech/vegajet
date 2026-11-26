@@ -3626,8 +3626,186 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         VJ_CHECK(rt.enqueue_kernel(1, *K[1].memcpy_u32, gx, 1, 1, 256, 1, 1, &ka1, sizeof(ka1), true));
     };
 
-    // v1.2 C7+S1, default off: measured depth governor.
+    // v1.2 levers, both default off: C7+S1 measured depth governor, S2 batched drafter catch-up.
     const bool v12_spec_gov = (std::getenv("VEGAJET_V12_SPEC_GOV") != nullptr && std::getenv("VEGAJET_V12_SPEC_GOV")[0] == '1');
+    const bool v12_batch_catchup = (std::getenv("VEGAJET_V12_BATCH_CATCHUP") != nullptr &&
+                                    std::getenv("VEGAJET_V12_BATCH_CATCHUP")[0] == '1');
+
+    // v1.2 S2: ingest n <= kMaxSpecBatch blk.48 MTP tokens in ONE M-row forward instead of n M=1 forwards.
+    // Same kernels, buffers and order as step_mtp; only the grid gains the row dimension (attn_prep/spec_flash
+    // are already row-parallel) and the residual inputs are staged into the mtp_h_cur rows eh_proj overwrites.
+    // Positions must be consecutive (pos0 + j). Falls back to the per-token path when the M-row GEMVs are absent.
+    const bool v12_batch_ok = (K[0].gemm_q4_m8 != nullptr) && (K[1].gemm_q4_m8 != nullptr);
+    auto step_mtp_batch = [&](const std::vector<int32_t>& toks, uint32_t pos0,
+                              const std::vector<uint64_t>& hs0, const std::vector<uint64_t>& hs1,
+                              bool do_submit) -> bool {
+        const uint32_t n = static_cast<uint32_t>(toks.size());
+        if (n == 0u) return true;
+        if (n == 1u || !v12_batch_ok) {
+            for (uint32_t j = 0; j < n; ++j)
+                (void) step_mtp(toks[j], pos0 + j, hs0[j], hs1[j], false, false, j);
+            if (!do_submit) return false;
+            VJ_CHECK(rt.submit_batch(0) && rt.submit_batch(1));
+            VJ_CHECK(rt.wait_idle(0)    && rt.wait_idle(1));
+            return true;
+        }
+        if (n > kMaxSpecBatch) {
+            // Defensive: never drop rows, fall back to per-token ingestion.
+            for (uint32_t j = 0; j < n; ++j)
+                (void) step_mtp(toks[j], pos0 + j, hs0[j], hs1[j], false, false, j % kMaxSpecBatch);
+            if (!do_submit) return false;
+            VJ_CHECK(rt.submit_batch(0) && rt.submit_batch(1));
+            VJ_CHECK(rt.wait_idle(0)    && rt.wait_idle(1));
+            return true;
+        }
+
+        const uint32_t M = n;
+        const float eps = static_cast<float>(hp.rms_eps);
+        const float rope_base = static_cast<float>(hp.rope_base);
+        const uint64_t row_bytes = static_cast<uint64_t>(D) * 4ULL;
+        for (uint32_t j = 0; j < M; ++j) io_toks_host[j] = toks[j];
+        __atomic_thread_fence(__ATOMIC_RELEASE);
+
+        // Stage the per-row residual inputs; eh_cat reads them before eh_proj overwrites the same rows.
+        for (uint32_t j = 0; j < M; ++j)
+            gpu_copy_h_both(S[0].mtp_h_cur_va + static_cast<uint64_t>(j) * row_bytes, hs0[j],
+                            S[1].mtp_h_cur_va + static_cast<uint64_t>(j) * row_bytes, hs1[j]);
+
+        // M-row VJ_Q4_A8 GEMV: same kernel choice as enq_gemm_q4's M>1 branch.
+        auto enq_q4_mN = [&](size_t g, const Q4A8WeightDev& w, uint64_t xq, uint64_t xds, uint64_t y, bool barrier) {
+            const uint32_t gx8 = ((w.rows + 7u) / 8u) * 256u;
+            if (M <= 8u && K[g].gemm_q4_m8) {
+                struct GemmPpKA { uint64_t wq, wdm, xq, xds, y; uint32_t rows, cols, M, stride; uint64_t ptx; };
+                GemmPpKA pka{w.qs_va, w.dm_va, xq, xds, y, w.rows, w.cols, M, w.row_stride_bytes, 0ULL};
+                VJ_CHECK(rt.enqueue_kernel(g, *K[g].gemm_q4_m8, gx8, 1, 1, 256, 1, 1, &pka, sizeof(pka), barrier));
+            } else if (M <= 12u && K[g].gemm_q4_m12) {
+                struct GemmPpKA { uint64_t wq, wdm, xq, xds, y; uint32_t rows, cols, M, stride; uint64_t ptx; };
+                GemmPpKA pka{w.qs_va, w.dm_va, xq, xds, y, w.rows, w.cols, M, w.row_stride_bytes, 0ULL};
+                VJ_CHECK(rt.enqueue_kernel(g, *K[g].gemm_q4_m12, gx8, 1, 1, 256, 1, 1, &pka, sizeof(pka), barrier));
+            } else if (M <= 16u && K[g].gemm_q4_m16) {
+                struct GemmPpKA { uint64_t wq, wdm, xq, xds, y; uint32_t rows, cols, M, stride; uint64_t ptx; };
+                GemmPpKA pka{w.qs_va, w.dm_va, xq, xds, y, w.rows, w.cols, M, w.row_stride_bytes, 0ULL};
+                VJ_CHECK(rt.enqueue_kernel(g, *K[g].gemm_q4_m16, gx8, 1, 1, 256, 1, 1, &pka, sizeof(pka), barrier));
+            } else {
+                struct GemmKA { uint64_t wq, wdm, xq, xds, y; uint32_t rows, cols, M, stride; };
+                GemmKA ka{w.qs_va, w.dm_va, xq, xds, y, w.rows, w.cols, M, w.row_stride_bytes};
+                VJ_CHECK(rt.enqueue_kernel(g, *K[g].gemm_q4_tcc, gx8, (M + 15u) / 16u, 1, 256, 1, 1, &ka, sizeof(ka), barrier));
+            }
+        };
+
+        for (size_t g = 0; g < 2; ++g) {
+            const auto& ml = mtp[g];
+            struct EhCatKA { uint64_t eqs, eds, toks, hin, wen, whn, cq, cds; uint32_t M, D; float eps; };
+            EhCatKA ecka{emb_w[g].qs_va, emb_w[g].ds_va, io_toks_va, S[g].mtp_h_cur_va, ml.enorm_va, ml.hnorm_va,
+                         S[g].mtp_cat_q8_va, S[g].mtp_cat_ds_va, M, D, eps};
+            VJ_CHECK(rt.enqueue_kernel(g, *K[g].mtp_eh_cat, 256u, M, 1, 256, 1, 1, &ecka, sizeof(ecka), true));
+            enq_q4_mN(g, ml.w_eh_proj, S[g].mtp_cat_q8_va, S[g].mtp_cat_ds_va, S[g].mtp_h_cur_va, true);
+
+            struct RmsKA { uint64_t h, xa, w, xn, xq, xd; uint32_t M, D; float eps; };
+            RmsKA rka{S[g].mtp_h_cur_va, 0ULL, ml.attn_norm_va, S[g].x_norm_va, S[g].x_q8_va, S[g].x_ds_va, M, D, eps};
+            VJ_CHECK(rt.enqueue_kernel(g, *K[g].rms_quant, M * 256u, 1, 1, 256, 1, 1, &rka, sizeof(rka), true));
+
+            enq_q4_mN(g, ml.w_attn_qkv, S[g].x_q8_va, S[g].x_ds_va, S[g].attn_qkv_va, true);
+            struct PrepKA { uint64_t qkv, qw, kw, qo, go, kc, vc; uint32_t M, pos0, nq, nkv, rdims; float rbase, eps; };
+            PrepKA pka{S[g].attn_qkv_va, ml.q_norm_va, ml.k_norm_va,
+                       S[g].q_buf_va, S[g].gate_buf_va, S[g].mtp_k_cache_va, S[g].mtp_v_cache_va,
+                       M, pos0, 16u, 1u, hp.rope_dims, rope_base, eps};
+            VJ_CHECK(rt.enqueue_kernel(g, *K[g].attn_prep, 17u * 256u, M, 1, 256, 1, 1, &pka, sizeof(pka), true));
+
+            if (opt.spec_flash && K[g].spec_flash_part) {
+                const uint32_t span = pos0 + M;
+                const uint32_t chunk_len = (span <= 1920u) ? 32u : ((span <= 3840u) ? 64u : ((span <= 7680u) ? 128u : 256u));
+                const uint32_t n_chunks  = std::max<uint32_t>(1u, (span + chunk_len - 1u) / chunk_len);
+                struct SfPartKA { uint64_t qo, kc, vc, po, pml; uint32_t M, pos0, nq, nkv, nc, cl; };
+                struct SfMrgKA  { uint64_t po, pml, go, oq, od; uint32_t M, nq, nc; };
+                const SfPartKA pka2{S[g].q_buf_va, S[g].mtp_k_cache_va, S[g].mtp_v_cache_va,
+                                    S[g].spec_fl_part_o_va, S[g].spec_fl_part_ml_va, M, pos0, 16u, 1u, n_chunks, chunk_len};
+                const SfMrgKA  mka2{S[g].spec_fl_part_o_va, S[g].spec_fl_part_ml_va, S[g].gate_buf_va,
+                                    S[g].mid_q8_va, S[g].mid_ds_va, M, 16u, n_chunks};
+                VJ_CHECK(rt.enqueue_kernel(g, *K[g].spec_flash_part,  n_chunks * 512u, M, 1, 512, 1, 1, &pka2, sizeof(pka2), true));
+                VJ_CHECK(rt.enqueue_kernel(g, *K[g].spec_flash_merge, 16u * 256u, M, 1, 256, 1, 1, &mka2, sizeof(mka2), true));
+            } else {
+                struct FlKA { uint64_t qo, go, kc, vc, oq, od; uint32_t M, pos0, nq, nkv; };
+                FlKA fka{S[g].q_buf_va, S[g].gate_buf_va, S[g].mtp_k_cache_va, S[g].mtp_v_cache_va,
+                         S[g].mid_q8_va, S[g].mid_ds_va, M, pos0, 16u, 1u};
+                VJ_CHECK(rt.enqueue_kernel(g, *K[g].attn_flash, 16u * 256u, M, 1, 256, 1, 1, &fka, sizeof(fka), true));
+            }
+            enq_q4_mN(g, ml.w_o, S[g].mid_q8_va, S[g].mid_ds_va, S[g].partial_va, true);
+        }
+
+        // Post-attention AR + RMS over M rows (one slice, M <= 16), same slot as the M=1 path.
+        for (size_t g = 0; g < 2; ++g) {
+            const size_t peer = 1u - g;
+            const uint32_t ep = ar_epoch++;
+            const uint32_t pp = ep & 1u;
+            struct ArKA {
+                uint64_t xp, ptx, lrx, pfl, lfl, bar, h, w, xn, xq, xd;
+                uint32_t M, D, ep, dn;
+                float eps;
+            };
+            ArKA aka{S[g].partial_va,
+                     pay_base + peer * kfd::kArGpuBytes + pp * kfd::kArSlotBytes,
+                     pay_base + g    * kfd::kArGpuBytes + pp * kfd::kArSlotBytes,
+                     flg_base + peer * 4096ULL + (60u & 63u) * 64ULL,
+                     flg_base + g    * 4096ULL + (60u & 63u) * 64ULL,
+                     S[g].ar_bar_va, S[g].mtp_h_cur_va, (g == 0) ? mtp[0].post_attn_norm_va : mtp[1].post_attn_norm_va,
+                     S[g].x_norm_va, S[g].x_q8_va, S[g].x_ds_va, M, D, ep, 1u, eps};
+            VJ_CHECK(rt.enqueue_kernel(g, *K[g].p2p_ar_rms, M * 256u, 1, 1, 256, 1, 1, &aka, sizeof(aka), true));
+        }
+
+        for (size_t g = 0; g < 2; ++g) {
+            const auto& ml = mtp[g];
+            struct RLogKA { uint64_t wr, wsh, xn, lout, shg; uint32_t M, D; };
+            RLogKA rlka{ml.w_router_f16_va, ml.w_sh_gate_va, S[g].x_norm_va, S[g].router_log_va, S[g].sh_gate_sc_va, M, D};
+            VJ_CHECK(rt.enqueue_kernel(g, *K[g].moe_rtr_log, 33u * 256u, (M + 7u) / 8u, 1, 256, 1, 1, &rlka, sizeof(rlka), true));
+            enq_q4_mN(g, ml.w_sh_gu, S[g].x_q8_va, S[g].x_ds_va, S[g].sh_gu_va, false);
+
+            struct RTopKA { uint64_t lin, tids, tw; uint32_t M; };
+            RTopKA rtka{S[g].router_log_va, S[g].top_ids_va, S[g].top_w_va, M};
+            VJ_CHECK(rt.enqueue_kernel(g, *K[g].moe_rtr_top8, M * 256u, 1, 1, 256, 1, 1, &rtka, sizeof(rtka), true));
+            struct SwiKA { uint64_t gu, sc, oq, od; uint32_t M, lff; };
+            SwiKA ska{S[g].sh_gu_va, S[g].sh_gate_sc_va, S[g].sh_q8_va, S[g].sh_ds_va, M, local_ff};
+            VJ_CHECK(rt.enqueue_kernel(g, *K[g].swiglu_q8, M * 256u, 1, 1, 256, 1, 1, &ska, sizeof(ska), false));
+
+            struct GuQ4KA { uint64_t wgq, wgdm, wuq, wudm, xq, xds, tids, mq, mds; uint32_t M, lff, stride; };
+            GuQ4KA gka{ml.w_exp_gate.qs_va, ml.w_exp_gate.dm_va, ml.w_exp_up.qs_va, ml.w_exp_up.dm_va,
+                       S[g].x_q8_va, S[g].x_ds_va, S[g].top_ids_va, S[g].moe_q8_va, S[g].mtp_moe_ds_va,
+                       M, local_ff, ml.w_exp_gate.row_stride_bytes};
+            VJ_CHECK(rt.enqueue_kernel(g, *K[g].moe_gu_q4a8, 8u * (local_ff / 32u) * 256u, M, 1, 256, 1, 1, &gka, sizeof(gka), true));
+            enq_q4_mN(g, ml.w_sh_down, S[g].sh_q8_va, S[g].sh_ds_va, S[g].sh_down_va, false);
+
+            struct DnQ4KA { uint64_t wdq, wddm, mq, mds, tids, tw, shd, out; uint32_t M, D, stride; };
+            DnQ4KA dka{ml.w_exp_down.qs_va, ml.w_exp_down.dm_va, S[g].moe_q8_va, S[g].mtp_moe_ds_va,
+                       S[g].top_ids_va, S[g].top_w_va, S[g].sh_down_va, S[g].partial_va,
+                       M, D, ml.w_exp_down.row_stride_bytes};
+            VJ_CHECK(rt.enqueue_kernel(g, *K[g].moe_down_q4a8, ((D + 15u) / 16u) * 256u, M, 1, 256, 1, 1, &dka, sizeof(dka), true));
+        }
+
+        // Post-MoE AR + shared-head norm over M rows; no LM head here (catch-up only ingests).
+        for (size_t g = 0; g < 2; ++g) {
+            const size_t peer = 1u - g;
+            const uint32_t ep = ar_epoch++;
+            const uint32_t pp = ep & 1u;
+            struct ArKA {
+                uint64_t xp, ptx, lrx, pfl, lfl, bar, h, w, xn, xq, xd;
+                uint32_t M, D, ep, dn;
+                float eps;
+            };
+            ArKA aka{S[g].partial_va,
+                     pay_base + peer * kfd::kArGpuBytes + pp * kfd::kArSlotBytes,
+                     pay_base + g    * kfd::kArGpuBytes + pp * kfd::kArSlotBytes,
+                     flg_base + peer * 4096ULL + (61u & 63u) * 64ULL,
+                     flg_base + g    * 4096ULL + (61u & 63u) * 64ULL,
+                     S[g].ar_bar_va, S[g].mtp_h_cur_va, (g == 0) ? mtp[0].shared_head_norm_va : mtp[1].shared_head_norm_va,
+                     S[g].x_norm_va, S[g].x_q8_va, S[g].x_ds_va, M, D, ep, 0u, eps};
+            VJ_CHECK(rt.enqueue_kernel(g, *K[g].p2p_ar_rms, M * 256u, 1, 1, 256, 1, 1, &aka, sizeof(aka), true));
+        }
+
+        if (!do_submit) return false;
+        VJ_CHECK(rt.submit_batch(0) && rt.submit_batch(1));
+        VJ_CHECK(rt.wait_idle(0)    && rt.wait_idle(1));
+        return true;
+    };
 
     auto run_greedy_mtp = [&](const std::vector<int32_t>& prompt_ids, int n_gen, uint32_t K_draft,
                               bool use_hybrid_suffix, double* out_tps,
@@ -3667,10 +3845,28 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             // (each step_mtp enqueues 16 dispatches: 64 * 16 = 1024 << 2048).
             for (size_t j0 = 0; j0 < cnt; j0 += 64u) {
                 const size_t j_end = std::min<size_t>(cnt, j0 + 64u);
-                for (size_t j = j0; j < j_end; ++j) {
-                    uint64_t h0 = (j == 0) ? ((pos == 0) ? S[0].mtp_h_zero_va : S[0].mtp_h_pend_va) : (S[0].h_va + (j - 1u) * h_stride);
-                    uint64_t h1 = (j == 0) ? ((pos == 0) ? S[1].mtp_h_zero_va : S[1].mtp_h_pend_va) : (S[1].h_va + (j - 1u) * h_stride);
-                    (void) step_mtp(chunk[j], pos + static_cast<uint32_t>(j), h0, h1, false, false, static_cast<uint32_t>(j - j0));
+                if (v12_batch_catchup) {
+                    // One M-row forward per <= kMaxSpecBatch consecutive prompt tokens.
+                    for (size_t b0 = j0; b0 < j_end; b0 += kMaxSpecBatch) {
+                        const size_t b_end = std::min<size_t>(j_end, b0 + kMaxSpecBatch);
+                        std::vector<int32_t> bt;
+                        std::vector<uint64_t> bh0, bh1;
+                        bt.reserve(b_end - b0); bh0.reserve(b_end - b0); bh1.reserve(b_end - b0);
+                        for (size_t j = b0; j < b_end; ++j) {
+                            bt.push_back(chunk[j]);
+                            bh0.push_back((j == 0) ? ((pos == 0) ? S[0].mtp_h_zero_va : S[0].mtp_h_pend_va)
+                                                   : (S[0].h_va + (j - 1u) * h_stride));
+                            bh1.push_back((j == 0) ? ((pos == 0) ? S[1].mtp_h_zero_va : S[1].mtp_h_pend_va)
+                                                   : (S[1].h_va + (j - 1u) * h_stride));
+                        }
+                        (void) step_mtp_batch(bt, pos + static_cast<uint32_t>(b0), bh0, bh1, false);
+                    }
+                } else {
+                    for (size_t j = j0; j < j_end; ++j) {
+                        uint64_t h0 = (j == 0) ? ((pos == 0) ? S[0].mtp_h_zero_va : S[0].mtp_h_pend_va) : (S[0].h_va + (j - 1u) * h_stride);
+                        uint64_t h1 = (j == 0) ? ((pos == 0) ? S[1].mtp_h_zero_va : S[1].mtp_h_pend_va) : (S[1].h_va + (j - 1u) * h_stride);
+                        (void) step_mtp(chunk[j], pos + static_cast<uint32_t>(j), h0, h1, false, false, static_cast<uint32_t>(j - j0));
+                    }
                 }
                 if (j_end == cnt) {
                     gpu_copy_h_both(S[0].mtp_h_pend_va, S[0].h_va + (cnt - 1u) * h_stride,
@@ -3705,6 +3901,22 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         // v1.2 C7+S1: depth from the measured per-M verify time and the live accepted length.
         spec_policy::MeasuredDepthGovernor mtp_gov;
         uint32_t gov_depth_sum = 0u, gov_depth_n = 0u;
+        auto mtp_ingest = [&](const std::vector<std::pair<int32_t, uint32_t>>& tok_pos,
+                              const std::vector<uint64_t>& hs0, const std::vector<uint64_t>& hs1) {
+            // Split into maximal runs of consecutive positions: one M-row forward per run (<= kMaxSpecBatch rows).
+            size_t i = 0;
+            while (i < tok_pos.size()) {
+                size_t j = i + 1u;
+                while (j < tok_pos.size() && tok_pos[j].second == tok_pos[j - 1u].second + 1u &&
+                       (j - i) < kMaxSpecBatch) ++j;
+                std::vector<int32_t> bt;
+                std::vector<uint64_t> b0, b1;
+                bt.reserve(j - i); b0.reserve(j - i); b1.reserve(j - i);
+                for (size_t k = i; k < j; ++k) { bt.push_back(tok_pos[k].first); b0.push_back(hs0[k]); b1.push_back(hs1[k]); }
+                (void) step_mtp_batch(bt, tok_pos[i].second, b0, b1, false);
+                i = j;
+            }
+        };
         while (static_cast<int>(gen.size()) < n_gen) {
             const uint32_t rem = static_cast<uint32_t>(n_gen - static_cast<int>(gen.size()));
             uint32_t k_cur = std::min<uint32_t>({K_draft, kGdnRingSlots - 2u, (rem > 1u) ? (rem - 1u) : 0u});
@@ -3818,10 +4030,21 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                         gpu_copy_h_both(S[0].mtp_h_stash_va + static_cast<uint64_t>(sc.dst_slot) * h_stride, resolve_h_src(0, sc.src),
                                         S[1].mtp_h_stash_va + static_cast<uint64_t>(sc.dst_slot) * h_stride, resolve_h_src(1, sc.src));
                     }
-                    for (size_t c = 0; c < post.catchup.size(); ++c) {
-                        const auto& st = post.catchup[c];
-                        (void) step_mtp(st.token, st.pos, resolve_h_src(0, st.h), resolve_h_src(1, st.h),
-                                        false, false, static_cast<uint32_t>(c));
+                    if (v12_batch_catchup) {
+                        std::vector<std::pair<int32_t, uint32_t>> tp;
+                        std::vector<uint64_t> c0, c1;
+                        for (const auto& st : post.catchup) {
+                            tp.emplace_back(st.token, st.pos);
+                            c0.push_back(resolve_h_src(0, st.h));
+                            c1.push_back(resolve_h_src(1, st.h));
+                        }
+                        mtp_ingest(tp, c0, c1);
+                    } else {
+                        for (size_t c = 0; c < post.catchup.size(); ++c) {
+                            const auto& st = post.catchup[c];
+                            (void) step_mtp(st.token, st.pos, resolve_h_src(0, st.h), resolve_h_src(1, st.h),
+                                            false, false, static_cast<uint32_t>(c));
+                        }
                     }
                     gpu_copy_h_both(S[0].mtp_h_pend_va, S[0].h_va + acc * h_stride,
                                     S[1].mtp_h_pend_va, S[1].h_va + acc * h_stride);
@@ -3831,10 +4054,22 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                     if (used_suffix) {
                         (void) step_mtp(vtoks[0], pos, S[0].mtp_h_pend_va, S[1].mtp_h_pend_va, false, false, 0u);
                     }
-                    for (uint32_t j = 1u; j <= acc; ++j) {
-                        (void) step_mtp(vtoks[j], pos + j,
-                                        S[0].h_va + (j - 1u) * h_stride, S[1].h_va + (j - 1u) * h_stride,
-                                        false, false, j);
+                    if (v12_batch_catchup && acc > 0u) {
+                        // Rows vtoks[1..acc] at pos+1..pos+acc; the vtoks[0] row (suffix ingest) stays a single step.
+                        std::vector<std::pair<int32_t, uint32_t>> tp;
+                        std::vector<uint64_t> c0, c1;
+                        for (uint32_t j = 1u; j <= acc; ++j) {
+                            tp.emplace_back(vtoks[j], pos + j);
+                            c0.push_back(S[0].h_va + (j - 1u) * h_stride);
+                            c1.push_back(S[1].h_va + (j - 1u) * h_stride);
+                        }
+                        mtp_ingest(tp, c0, c1);
+                    } else {
+                        for (uint32_t j = 1u; j <= acc; ++j) {
+                            (void) step_mtp(vtoks[j], pos + j,
+                                            S[0].h_va + (j - 1u) * h_stride, S[1].h_va + (j - 1u) * h_stride,
+                                            false, false, j);
+                        }
                     }
                     gpu_copy_h_both(S[0].mtp_h_pend_va, S[0].h_va + acc * h_stride,
                                     S[1].mtp_h_pend_va, S[1].h_va + acc * h_stride);

@@ -289,6 +289,7 @@ Exit codes: 0 ok (end of input or `/quit`), 1 server unreachable (`GET /health` 
 | `VEGAJET_NO_AUTO_DOT8` | Ornith GPU bench | `1` disables automatic Gate+Up DOT8 promotion. |
 | `VEGAJET_EVICT_ADAPT` | Ornith GPU bench | `1` enables the adaptive draft-length / eviction controller. |
 | `VEGAJET_V12_SPEC_GOV` | Ornith GPU bench | `1`: drive the draft depth from the measured per-M verify time (`t_ver[M]`) and the live accepted length instead of the fabricated inflation constant, and feed the measured time inflation to `VEGAJET_EVICT_ADAPT`. Default off (off = unchanged behaviour). |
+| `VEGAJET_V12_BATCH_CATCHUP` | Ornith GPU bench | `1`: ingest accepted tokens (and prompt tokens) of the blk.48 MTP drafter in one M-row forward instead of one M=1 forward per token. Default off. |
 | `VEGAJET_SPEC_CASCADE` | speculative cascade router | `1`: route a draft cycle to the suffix-trie draft when it has enough confident tokens, else to the neural drafter (verification unchanged, lossless). `0` or unset: off. |
 | `VEGAJET_SPEC_CASCADE_MIN` | speculative cascade router | Confident suffix tokens needed for a suffix-only draft, 1..64 (default 4; other values ignored). |
 | `VEGAJET_PREFILL_CODEX_FA2` | Ornith GPU bench | `1`: use the 53-VGPR Codex GQA FlashAttention-2 prefill kernel (`vj_prefill_gqa_fa2`) on `M >= 16` prefill batches (default off). |
