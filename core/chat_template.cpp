@@ -323,7 +323,12 @@ public:
         if (t_[p_].k != Tok::End) fail("unexpected '" + t_[p_].s + "' in expression");
         return e;
     }
-    EP expr() { return cond(); }
+    // Every nested group / argument list / literal re-enters expr(), so a crafted template with
+    // 200 000 parentheses would otherwise recurse until the stack is gone.
+    EP expr() {
+        DepthGuard guard(this);
+        return cond();
+    }
     bool at_end() const { return t_[p_].k == Tok::End; }
     const Tok& peek(size_t o = 0) const { return t_[std::min(p_ + o, t_.size() - 1)]; }
     bool name_is(const char* n, size_t o = 0) const { return peek(o).k == Tok::Name && peek(o).s == n; }
@@ -333,6 +338,15 @@ public:
     size_t pos() const { return p_; }
 
 private:
+    static constexpr int kMaxExprDepth = 64;
+    // RAII depth counter: the parse is abandoned by the throw, so no unwinding bookkeeping is needed.
+    struct DepthGuard {
+        ExprParser* p;
+        explicit DepthGuard(ExprParser* q) : p(q) {
+            if (++p->depth_ > kMaxExprDepth) fail("expression nesting too deep (" + std::to_string(kMaxExprDepth) + " levels)");
+        }
+        ~DepthGuard() { --p->depth_; }
+    };
     static EP mk(Expr::K k) { auto e = std::make_shared<Expr>(); e->k = k; return e; }
     EP cond() {
         EP v = or_();
@@ -534,6 +548,7 @@ private:
     }
     std::vector<Tok> t_;
     size_t p_ = 0;
+    int depth_ = 0;
 };
 
 } // namespace
@@ -631,6 +646,14 @@ public:
     }
 
 private:
+    static constexpr int kMaxStmtDepth = 32;
+    struct DepthGuard {
+        StmtParser* p;
+        explicit DepthGuard(StmtParser* q) : p(q) {
+            if (++p->depth_ > kMaxStmtDepth) fail("template block nesting too deep (" + std::to_string(kMaxStmtDepth) + " levels)");
+        }
+        ~DepthGuard() { --p->depth_; }
+    };
     static std::string first_word(const std::string& s) {
         size_t a = 0;
         while (a < s.size() && std::isspace(static_cast<unsigned char>(s[a]))) ++a;
@@ -644,6 +667,7 @@ private:
     }
     // Parses nodes until a block tag whose first word is in `ends`; returns it via `term` (its full text in term_text_).
     NP body(const std::vector<std::string>& ends, std::string& term) {
+        DepthGuard guard(this);  // every nested {% if %} / {% for %} / {% macro %} re-enters here
         auto seq = std::make_shared<Node>();
         while (p_ < t_.size()) {
             const RawTag& t = t_[p_];
@@ -771,11 +795,15 @@ private:
     std::vector<RawTag> t_;
     size_t p_ = 0;
     std::string term_text_;
+    int depth_ = 0;
 };
 
 // ================================================================================================= renderer
 constexpr size_t kMaxOutput = 32u << 20;
 constexpr int kMaxDepth = 64;
+// Nested range()/loop constructs can multiply out to billions of iterations: bound the total that a
+// single render may execute (a real chat template iterates over messages/tools, i.e. hundreds).
+constexpr uint64_t kMaxLoopIterations = 1000000;
 
 class Renderer {
 public:
@@ -821,6 +849,11 @@ public:
     }
 
 private:
+    // Total loop iterations of this render stay bounded, so nested range() loops cannot spin for hours.
+    void count_iteration() {
+        if (++loop_iters_ > kMaxLoopIterations)
+            fail("template loop budget exceeded (" + std::to_string(kMaxLoopIterations) + " iterations)");
+    }
     void write(const std::string& s) {
         out_ += s;
         if (out_.size() > kMaxOutput) fail("template output exceeds 32 MiB");
@@ -844,6 +877,7 @@ private:
         if (n->filter) {
             List kept;
             for (const auto& it : items) {
+                count_iteration();
                 scopes_.emplace_back();
                 bind(n->vars, it);
                 if (truthy(eval(n->filter))) kept.push_back(it);
@@ -854,6 +888,7 @@ private:
         if (items.empty()) { if (n->else_body) render(n->else_body); return; }
         const int64_t len = static_cast<int64_t>(items.size());
         for (int64_t k = 0; k < len; ++k) {
+            count_iteration();
             scopes_.emplace_back();
             Dict loop{{"index", V::integer(k + 1)}, {"index0", V::integer(k)}, {"revindex", V::integer(len - k)},
                       {"revindex0", V::integer(len - k - 1)}, {"first", V::boolean(k == 0)}, {"last", V::boolean(k == len - 1)},
@@ -1328,6 +1363,7 @@ private:
     std::string date_;
     std::vector<std::unordered_map<std::string, V>> scopes_;
     int depth_ = 0;
+    uint64_t loop_iters_ = 0;
 };
 
 V message_value(const ChatMessage& m) {

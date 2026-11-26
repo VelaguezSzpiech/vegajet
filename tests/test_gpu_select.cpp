@@ -6,6 +6,7 @@
 // helpers (extract_gpu_option, apply_gpu_option exporting VJ_GPU_DEVICES, `--gpu list`).
 #include "cli/serve_cmd.hpp"
 #include "core/gpu_select.hpp"
+#include "core/kfd_runtime.hpp"
 #include "tests/test_common.hpp"
 
 #include <filesystem>
@@ -24,7 +25,7 @@ gpusel::Selection P(const std::string& s) {
 }
 
 struct FakeInfo {  // the fields kfd::DeviceInfo has that matter here
-    uint32_t node_id = 0, location_id = 0;
+    uint32_t node_id = 0, location_id = 0, pci_domain = 0;
 };
 
 void put(const fs::path& p, const std::string& text) {
@@ -131,6 +132,9 @@ int main() {
         VJ_CHECK(cli::apply_gpu_option(&f1, sel, &listed, &err) == 0 && !listed && gpusel::canonical(sel) == "0,2");
         VJ_CHECK(std::getenv("VJ_GPU_DEVICES") && std::string(std::getenv("VJ_GPU_DEVICES")) == "0,2");  // exported
         VJ_CHECK(cli::apply_gpu_option(nullptr, sel, &listed, &err) == 0 && sel.source == "VJ_GPU_DEVICES");
+        f1 = "0000:03:00.0,0000:43:00.0";
+        VJ_CHECK(cli::apply_gpu_option(&f1, sel, &listed, &err) == 0 && gpusel::canonical(sel) == f1);
+        VJ_CHECK(std::string(std::getenv("VJ_GPU_DEVICES")) == f1);
         std::string bad = "1-0";
         VJ_CHECK(cli::apply_gpu_option(&bad, sel, &listed, &err) == 2);
         unsetenv("VJ_GPU_DEVICES");
@@ -139,6 +143,53 @@ int main() {
         std::string lst = "list";
         VJ_CHECK(cli::apply_gpu_option(&lst, sel, &listed, &err) == 0 && listed && !std::getenv("VJ_GPU_DEVICES"));
         unsetenv("VJ_SYSFS_ROOT");
+    }
+    // BDF pinning is unchanged by insertion before, between or after the selected pair.
+    {
+        const auto selection = P("0000:03:00.0,0000:43:00.0");
+        VJ_CHECK(gpusel::canonical(selection) == "0000:03:00.0,0000:43:00.0");
+        for (uint32_t inserted : {0x100u, 0x2300u, 0x8300u}) {
+            const fs::path n = root / "sys/class/kfd/kfd/topology/nodes";
+            fs::remove_all(n);
+            auto card = [&](unsigned node, unsigned domain, unsigned loc, unsigned gpu) {
+                const auto dir = n / std::to_string(node);
+                put(dir / "properties", "gfx_target_version 90006\ndomain " + std::to_string(domain) +
+                    "\nlocation_id " + std::to_string(loc) + "\nsimd_count 240\n");
+                put(dir / "gpu_id", std::to_string(gpu));
+            };
+            card(1, 0, 0x300, 111); card(2, 0, 0x4300, 222); card(3, 0, inserted, 333);
+            const auto topology = gpusel::scan_topology(root.string());
+            auto selected = topology;
+            std::string err;
+            VJ_CHECK(gpusel::filter(selected, selection, &err));
+            VJ_CHECK(selected.size() == 2 && selected[0].gpu_id == 111 && selected[1].gpu_id == 222);
+            auto ordinal = topology;
+            VJ_CHECK(gpusel::filter(ordinal, P("0,1"), &err));
+            if (inserted < 0x4300) VJ_CHECK(ordinal[0].gpu_id != 111 || ordinal[1].gpu_id != 222);
+            card(4, 1, 0x300, 444); // same bus/device/function in a different PCI domain
+            selected = gpusel::scan_topology(root.string());
+            VJ_CHECK(gpusel::filter(selected, P("0001:03:00.0,0000:43:00.0"), &err));
+            VJ_CHECK(selected[0].gpu_id == 444 && selected[1].gpu_id == 222);
+            setenv("VJ_GPU_DEVICES", "0000:03:00.0,0000:43:00.0", 1);
+            selected = gpusel::scan_topology(root.string());
+            VJ_CHECK(gpusel::filter_from_env(selected, &err) && selected.size() == 2 && selected[0].gpu_id == 111);
+            unsetenv("VJ_GPU_DEVICES");
+            setenv("VJ_SYSFS_ROOT", root.c_str(), 1);
+            auto runtime_devs = kfd::Runtime::scan_gfx906_topology();
+            VJ_CHECK(gpusel::filter(runtime_devs, P("0001:03:00.0,0000:43:00.0"), &err));
+            VJ_CHECK(runtime_devs[0].gpu_id == 444 && runtime_devs[1].gpu_id == 222);
+            unsetenv("VJ_SYSFS_ROOT");
+            selected = topology;
+            VJ_CHECK(!gpusel::filter(selected, P("0002:03:00.0"), &err) && selected.size() == 3);
+            card(5, 0, 0x300, 555); // duplicate full identity is an ambiguity, never silently pick one
+            selected = gpusel::scan_topology(root.string());
+            VJ_CHECK(!gpusel::filter(selected, selection, &err) && err.find("ambiguous") != std::string::npos);
+        }
+        for (const auto* bad : {"03:00.0", "0000:03:20.0", "0000:03:00.8", "0000:03:00.g", "0,0000:03:00.0",
+                               "0000:03:00.0,1", "0000:03:00.0,0000:03:00.0", "0000:03:00.0-0000:43:00.0"}) {
+            gpusel::Selection s; std::string err;
+            VJ_CHECK(!gpusel::parse(bad, s, &err) && !err.empty());
+        }
     }
     fs::remove_all(root);
     std::printf("test_gpu_select: parsing, precedence, canonical, pick/filter, env filter (kfd hook), sysfs scan + order, "

@@ -13,6 +13,8 @@
 #include "core/engine_interface.hpp"
 #include "core/server.hpp"
 
+#include <algorithm>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 
@@ -20,8 +22,26 @@ namespace vegajet::serve {
 
 namespace detail {
 
+// Exact context check: the prompt is already tokenized here, so prompt_tokens + max_tokens against the model's
+// context length is the honest bound (S-M4), answered as 400 context_length_exceeded, not 500.
+inline bool context_fits(uint32_t prompt_tokens, int32_t max_tokens, uint32_t context_length,
+                         GenerateResult& res) {
+    if (context_length == 0) return true;
+    if (static_cast<uint64_t>(prompt_tokens) + static_cast<uint64_t>(std::max(0, max_tokens)) <= context_length) return true;
+    res.finish = FinishReason::Error;
+    res.http_status = 400;
+    res.error = "prompt uses " + std::to_string(prompt_tokens) + " tokens and max_tokens asks for " +
+                std::to_string(max_tokens) + ", more than the context length of " + std::to_string(context_length) +
+                " (code: context_length_exceeded)";
+    res.prompt_tokens = prompt_tokens;
+    return false;
+}
+
 inline GenerateResult run_engine(IEngine& engine, const std::vector<int32_t>& prompt, int32_t eos_id,
                                  const GenerateRequest& r, const TokenSink& sink) {
+    GenerateResult res;
+    if (!context_fits(static_cast<uint32_t>(prompt.size()), r.max_tokens, engine.model_info().context_length, res))
+        return res;
     GenerationParams gp;
     gp.max_tokens = r.max_tokens;
     gp.temperature = r.sampling.temperature;
@@ -29,7 +49,6 @@ inline GenerateResult run_engine(IEngine& engine, const std::vector<int32_t>& pr
     gp.seed = r.sampling.seed;
     gp.stream = r.stream;
     // Stop sequences stay in the server's StopMatcher (it also handles pieces that straddle tokens).
-    GenerateResult res;
     res.prompt_tokens = static_cast<uint32_t>(prompt.size());
     res.finish = FinishReason::Length;
     engine.generate(prompt, gp, [&](const TokenEvent& ev) {
@@ -38,7 +57,14 @@ inline GenerateResult run_engine(IEngine& engine, const std::vector<int32_t>& pr
         res.prefill_ms = ev.prefill_ms;
         res.decode_ms = ev.decode_ms;
         const bool eos_token = ev.token_id >= 0 && ev.token_id == eos_id;
-        if (!ev.text.empty() && !eos_token && !sink(ev.text)) return false;
+        if (!ev.text.empty() && !eos_token) {
+            const SinkResult sr = sink(ev.text);
+            if (!sr) {
+                // S-M2: the metrics layer records Cancelled as status 499 + cancelled_total.
+                if (sr.client_gone) res.finish = FinishReason::Cancelled;
+                return false;
+            }
+        }
         if (ev.is_eos) {
             res.finish = (!eos_token && static_cast<int32_t>(ev.completion_tokens) >= r.max_tokens) ? FinishReason::Length
                                                                                                    : FinishReason::Stop;

@@ -26,6 +26,9 @@ int32_t layer_of(const std::string& name) {
 
 bool arch_ok(const std::string& a) { return a == "qwen35moe" || a == "qwen3_5_moe" || a == "ornith"; }
 
+// A 512-layer cap is far above anything real and keeps the per-layer loops below bounded.
+constexpr uint32_t kMaxBlockCount = 512;
+
 } // namespace
 
 bool OrnithModel::can_load(const GgufFile& f) const {
@@ -47,6 +50,10 @@ bool OrnithModel::parse_hparams(const GgufFile& f, std::string* err) {
     double d = 0;
     auto need = [&](const char* key, uint32_t& out) {
         if (!f.get_arch_u64(key, u)) { if (err) *err = "missing " + h.arch + "." + key; return false; }
+        if (u > 0xFFFFFFFFull) {
+            if (err) *err = h.arch + "." + key + " out of range: " + std::to_string(u);
+            return false;
+        }
         out = static_cast<uint32_t>(u);
         return true;
     };
@@ -57,8 +64,53 @@ bool OrnithModel::parse_hparams(const GgufFile& f, std::string* err) {
         !need("ssm.group_count", h.ssm_groups) || !need("ssm.time_step_rank", h.ssm_v_heads) ||
         !need("ssm.inner_size", h.ssm_inner))
         return false;
-    h.n_nextn = f.get_arch_u64("nextn_predict_layers", u) ? static_cast<uint32_t>(u) : 0;
+    h.n_nextn = 0;
+    if (f.get_arch_u64("nextn_predict_layers", u)) {
+        if (u > 0xFFFFFFFFull) {
+            if (err) *err = h.arch + ".nextn_predict_layers out of range: " + std::to_string(u);
+            return false;
+        }
+        h.n_nextn = static_cast<uint32_t>(u);
+    }
+    // Layer counts index recurrent[] and every per-block loop: validate before any arithmetic.
+    if (h.n_block == 0 || h.n_block > kMaxBlockCount) {
+        if (err) *err = h.arch + ".block_count out of range: " + std::to_string(h.n_block);
+        return false;
+    }
+    if (h.n_nextn > h.n_block) {
+        if (err) *err = h.arch + ".nextn_predict_layers (" + std::to_string(h.n_nextn) +
+                        ") > block_count (" + std::to_string(h.n_block) + ")";
+        return false;
+    }
     h.n_trunk = h.n_block - h.n_nextn;
+    if (h.n_trunk == 0) {
+        if (err) *err = h.arch + ".nextn_predict_layers leaves no trunk layers";
+        return false;
+    }
+    // Division sites below (n_embd / n_head, (i + 1) % full_attn_interval): refuse zero divisors
+    // instead of raising SIGFPE deep inside load().
+    if (h.n_embd == 0) {
+        if (err) *err = h.arch + ".embedding_length is zero";
+        return false;
+    }
+    if (h.n_head == 0) {
+        if (err) *err = h.arch + ".attention.head_count is zero";
+        return false;
+    }
+    if (h.n_head_kv == 0) {
+        if (err) *err = h.arch + ".attention.head_count_kv is zero";
+        return false;
+    }
+    if (h.n_head_kv > h.n_head) {
+        if (err) *err = h.arch + ".attention.head_count_kv (" + std::to_string(h.n_head_kv) +
+                        ") > attention.head_count (" + std::to_string(h.n_head) + ")";
+        return false;
+    }
+    if (h.n_embd % h.n_head != 0) {
+        if (err) *err = h.arch + ".embedding_length (" + std::to_string(h.n_embd) +
+                        ") is not a multiple of attention.head_count (" + std::to_string(h.n_head) + ")";
+        return false;
+    }
     h.head_dim_k = f.get_arch_u64("attention.key_length", u) ? static_cast<uint32_t>(u) : h.n_embd / h.n_head;
     h.head_dim_v = f.get_arch_u64("attention.value_length", u) ? static_cast<uint32_t>(u) : h.head_dim_k;
     h.rope_dims = f.get_arch_u64("rope.dimension_count", u) ? static_cast<uint32_t>(u) : h.head_dim_k;
@@ -67,6 +119,10 @@ bool OrnithModel::parse_hparams(const GgufFile& f, std::string* err) {
     h.n_ff_exp = f.get_arch_u64("expert_feed_forward_length", u) ? static_cast<uint32_t>(u) : 0;
     h.n_ff_shexp = f.get_arch_u64("expert_shared_feed_forward_length", u) ? static_cast<uint32_t>(u) : 0;
     h.full_attn_interval = f.get_arch_u64("full_attention_interval", u) ? static_cast<uint32_t>(u) : 4;
+    if (h.full_attn_interval == 0) {  // modulo divisor for the recurrent-layer pattern
+        if (err) *err = h.arch + ".full_attention_interval is zero";
+        return false;
+    }
     h.context_length = f.get_arch_u64("context_length", u) ? u : 0;
     if (const GgufValue* v = f.find(h.arch + ".rope.dimension_sections"))
         for (double x : v->arr_num) h.rope_sections.push_back(static_cast<uint32_t>(x));

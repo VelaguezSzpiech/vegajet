@@ -61,6 +61,7 @@ add_library(vegajet_core STATIC
     core/host_preflight.cpp
     core/hsaco_gate.cpp
     core/hsaco_bundle.cpp
+    core/hsaco_loader.cpp
     core/gguf_arch_detect.cpp
     core/fr_spec.cpp
     core/spec_policy.cpp
@@ -79,6 +80,7 @@ add_library(vegajet_core STATIC
     core/dflash_host.cpp
     core/ssm_state.cpp
     core/spec_engine.cpp
+    core/spec_tree.cpp
     core/grid_planner.cpp
     core/launch_planner.cpp
     core/sampler.cpp
@@ -146,6 +148,7 @@ if(NOT VEGAJET_CPU_ONLY)
     set(VEGAJET_HSACO_COMMON_DEPS
         "${CMAKE_CURRENT_SOURCE_DIR}/core/ggml_iq_tables.hpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/ops/kernels/vj_moe_dot8.hiph"
+        "${CMAKE_CURRENT_SOURCE_DIR}/ops/kernels/vj_device_fault.hiph"
         "${CMAKE_CURRENT_SOURCE_DIR}/ops/kernels/vj_moe_down_grouped.hiph"
         "${CMAKE_CURRENT_SOURCE_DIR}/ops/kernels/vj_ornith_super_desc.hpp"
     )
@@ -193,6 +196,7 @@ if(NOT VEGAJET_CPU_ONLY)
         vj_add_hsaco(vj_ornith_attn    ops/kernels/vj_ornith_attn.hip)
         vj_add_hsaco(vj_ornith_moe     ops/kernels/vj_ornith_moe.hip)
         vj_add_hsaco(vj_ornith_moe_m1  ops/kernels/vj_ornith_moe_m1.hip)
+        vj_add_hsaco(vj_moe_asym       ops/kernels/vj_moe_asym.hip)
         vj_add_hsaco(vj_ornith_vocab   ops/kernels/vj_ornith_vocab.hip)
         vj_add_hsaco(vj_spec_flash     ops/kernels/vj_spec_flash.hip)
         vj_add_hsaco(vj_spec_gdn       ops/kernels/vj_spec_gdn.hip)
@@ -204,6 +208,12 @@ if(NOT VEGAJET_CPU_ONLY)
         vj_add_hsaco(vj_moe_down_grouped ops/kernels/vj_moe_down_grouped.hip)
         vj_add_hsaco(vj_dflash2        ops/kernels/vj_dflash2.hip)
         vj_add_hsaco(vj_ornith_super   ops/kernels/vj_ornith_super.hip)
+        # v1.2 opt-in variants: same source, own symbol suffix (see VJ_KNAME), own gate lines.
+        # VEGAJET_V12_BARRIER_VOL=1 binds *_vol (buffer_wbinvl1_vol stage barriers).
+        vj_add_hsaco(vj_ornith_super_vol ops/kernels/vj_ornith_super.hip -DVJ_V12_WBINVL1_VOL -DVJ_KERNEL_SUFFIX=_vol)
+        # VEGAJET_V12_IQ2S_REG=1 binds *_iq2sreg (IQ2_S Gate+Up decodes from the L1-resident 4 KiB
+        # grid table, no LDS copy -> 8,896 B -> 4,800 B LDS per WG).
+        vj_add_hsaco(vj_ornith_super_iq2sreg ops/kernels/vj_ornith_super.hip -DVJ_V12_IQ2S_REG -DVJ_KERNEL_SUFFIX=_iq2sreg)
     endif()
     add_custom_target(vegajet_hsacos DEPENDS ${VEGAJET_HSACO_TARGETS})
 endif()
@@ -254,6 +264,16 @@ endfunction()
 
 vj_test(test_tokenizer)
 vj_test(test_gguf_reader)
+# v1.2 parser hardening (AUDIT-parsers.md): malformed GGUF / tokenizer / template inputs.
+vj_test(test_parser_gguf_overflow)
+vj_test(test_parser_gguf_ne)
+vj_test(test_parser_gguf_tensor_count)
+vj_test(test_parser_ornith_nextn)
+vj_test(test_parser_ornith_div0)
+vj_test(test_parser_tok_count)
+vj_test(test_parser_tok_nested)
+vj_test(test_parser_tpl_depth)
+vj_test(test_parser_tpl_loops)
 vj_test(test_quant_repacker)
 # Keep synthetic fixture rounding identical to the golden inputs on FMA-capable hosts.
 target_compile_options(test_quant_repacker PRIVATE -ffp-contract=off)
@@ -263,29 +283,49 @@ target_sources(vegajet PRIVATE cli/plan_rig.cpp)
 vj_test(test_quant_registry_plan)
 vj_test(test_kfd_arena_tiers)
 vj_test(test_aql_ring_deadlock)
+# Compile the live host path against fake ioctls, including in CPU-only builds.
+add_executable(test_runtime_fail_closed tests/test_runtime_fail_closed.cpp core/kfd_runtime.cpp)
+target_link_libraries(test_runtime_fail_closed PRIVATE vegajet_core Threads::Threads)
+target_compile_options(test_runtime_fail_closed PRIVATE -UVEGAJET_CPU_ONLY ${VJ_WARN})
+target_link_options(test_runtime_fail_closed PRIVATE -Wl,--wrap=ioctl -Wl,--wrap=open)
+add_test(NAME test_runtime_fail_closed COMMAND test_runtime_fail_closed)
+set_tests_properties(test_runtime_fail_closed PROPERTIES TIMEOUT 30)
 vj_test(test_quant_unpackers)
 vj_test(test_ornith_loader)
 vj_test(test_sharder)
 vj_test(test_topology_planner)
 vj_test(test_grid_planner)
 vj_test(test_hsaco_gate)
+# v1.2 C1/C3: device fault-record decoding + token-id bounds guard (host side).
+vj_test(test_device_guard)
+vj_test(test_v12_dispatch)
+vj_test(test_ornith_expert_layout)
+vj_test(test_iq2s_perm4)
 # ---- Pre-tokenizer families + SPM, Jinja-subset chat templates, full sampler stack (core_tokenizer_samplers) ----
 target_sources(vegajet_core PRIVATE core/pretok_families.cpp core/chat_template.cpp core/sampler_stack.cpp)
 vj_test(test_tokenizer_samplers)
 # Its 248K-vocabulary latency gate (< 150 us per token) must not share the CPU with other tests.
 set_tests_properties(test_tokenizer_samplers PROPERTIES RUN_SERIAL TRUE)
 vj_test(test_spec_engine)
+vj_test(test_spec_tree)
+target_link_libraries(test_spec_tree PRIVATE vegajet_models)
 vj_test(test_fr_spec)
 vj_test(test_spec_policy)
+vj_test(test_spec_governor)
 vj_test(test_spec_flash_ref)
 vj_test(test_hsaco_bundle)
+vj_test(test_hsaco_loader)
 vj_test(test_dflash_host)
 vj_test(test_spec_gdn_ref)
+vj_test(test_gdn_recur_colthread_ref)
+vj_test(test_gemv_q4a8_mn_ref)
 vj_test(test_q4_dot8)
 # ---- Radix prefix cache (KV blocks + recurrent-state snapshots) and B=1..8 continuous batching (serving_prefix_batching) ----
 target_sources(vegajet_core PRIVATE core/prefix_cache.cpp core/cont_batch.cpp)
 vj_test(test_prefix_batching)
 vj_test(test_decode_vocab_mubuf_argmax)
+vj_test(test_decode_vocab_ilp_argmax)
+vj_test(test_dense_persist_tiles)
 vj_test(test_moe_route_group)
 vj_test(test_prefill_planner)
 vj_test(test_prefill_ref)
@@ -294,10 +334,16 @@ vj_test(test_audit_invariants)
 vj_test(test_tcc_anti_camping)
 vj_test(test_grid_planner_splitk)
 vj_test(test_asymmetric_sharder)
+vj_test(test_asym_experts)
 vj_test(test_opgraph_multi_arch)
 vj_test(test_sampler)
 vj_test(test_host_preflight)
 vj_test(test_server_sse)
+# v1.2 serving levers: greedy-only 400s, bounded async SSE output queue (byte-identical, ordered, disconnect-safe).
+vj_test(test_serve_v12)
+# v1.2 HTTP server reliability (AUDIT-server.md): bounded JSON parse, connection limit, half-close, cancellation
+# accounting, model validation, prompt/max_tokens caps, optional auth and CORS.
+vj_test(test_serve_reliability)
 vj_test(test_declarative_template)
 vj_test(test_hsaco_isa_scan)
 vj_test(test_vram_planner)
@@ -355,6 +401,8 @@ set_source_files_properties(tests/test_moe_route_group.cpp core/moe_route_group.
 
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_FOUND)
+    add_test(NAME test_v12_fix_contracts
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/test_v12_fix_contracts.py)
     add_test(NAME test_tools
              COMMAND ${Python3_EXECUTABLE} -m unittest discover -s tests -p "test_tools*.py"
              WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})

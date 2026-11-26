@@ -51,6 +51,10 @@ public:
     virtual ModelInfo model_info() const = 0;
     virtual const BpeTokenizer& tokenizer() const = 0;
     virtual std::string format_chat(const std::vector<ChatMessage>& messages) const = 0;
+    // False when generate() always returns the greedy argmax sequence (sampling parameters are not implemented).
+    // `vegajet serve` then answers HTTP 400 to sampling parameters that differ from the greedy defaults instead of
+    // silently returning greedy text for a request that asked for sampling.
+    virtual bool supports_sampling() const { return true; }
     virtual void generate(const std::vector<int32_t>& prompt_tokens,
                           const GenerationParams& params,
                           const TokenCallback& on_token) = 0;

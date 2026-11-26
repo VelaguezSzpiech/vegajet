@@ -38,10 +38,23 @@ complete.
 
 ### GPU selection (`--gpu`, `VJ_GPU_DEVICES`)
 
-`SPEC` is `all` (the default), a list of indices and ranges such as `0`, `1`, `0,1`, `0-1`, or `list`. Indices are
-positions in the gfx906 enumeration: KFD topology nodes with `gfx_target_version 90006`, ordered by PCI location,
-the same order the runtime uses. Duplicates, reversed ranges, indices above 63 and anything else are usage errors
-(exit 2), as is an index beyond the GPUs present (the message names the source and the valid range).
+`SPEC` is `all` (the default), ordinals/ranges such as `0`, `1`, `0,1`, `0-1`, a comma-separated list of full PCI
+identities such as `0000:03:00.0,0000:43:00.0`, or `list`. Both `--gpu SPEC` and `--gpu=SPEC` work.
+Full BDFs include the PCI domain (`dddd:bb:dd.f`); their list order defines TP ranks and survives insertion of a
+third card before, between or after them. Ordinals are positions in the gfx906 KFD topology sorted by PCI domain
+then bus/device/function, **not stable card identities**. When ordinals select fewer cards than exist, the runtime
+prints a warning. Mixing ordinals with BDFs, duplicates, malformed BDFs, reversed ranges and indices above 63 are
+usage errors (exit 2); missing or ambiguous BDFs fail closed rather than falling back to an ordinal.
+
+The Ornith TP=2 runner requires **exactly two selected devices**, checked before opening devices or allocating
+arenas. On a three-MI50 machine, select the intended pair explicitly; `all` is rejected. Only selected cards have
+arenas, queues and mappings created. Startup logs show the full BDF for each selected rank. Pin two cards with:
+
+```sh
+vegajet bench <model-file> --gpu 0000:03:00.0,0000:43:00.0
+# Equivalent environment form (also inherited by the runtime and children):
+VJ_GPU_DEVICES=0000:03:00.0,0000:43:00.0 vegajet bench <model-file>
+```
 
 * Precedence: `--gpu` beats `VJ_GPU_DEVICES`, which beats `all`. The CLI exports the resolved selection as
   `VJ_GPU_DEVICES` (canonical form) so the KFD runtime and child processes see the same set.
@@ -226,6 +239,9 @@ selection and `--tp`, then exits 3 naming the architecture (a CPU-only build say
 | `--reasoning-format F` | `auto` (split `<think>` into `reasoning_content`) or `none`. |
 | `--request-log FILE` | Append one JSON line per request (`ts`, `id`, `status`, `finish`, token counts, `ttft_ms`, `tpot_ms`, `e2e_ms`, `cancelled`); never prompt or reply text. File created 0600. |
 | `--metrics-hw` | Add read-only GPU sysfs telemetry to `GET /metrics`: edge / junction / memory temperature, power, RAS UE / CE counts of umc, sdma, gfx, mmhub, pcie_bif, hdp. |
+| `--max-tokens-cap N` | Cap a request's `max_tokens`, 1..1048576 (default: the `--ctx` context length). `max_tokens` is further capped to what the prompt leaves free, and a prompt that does not fit the context answers 400 `context_length_exceeded` (the tokenizer gives the exact count; a request body above 1 MiB answers 413). |
+| `--api-key` VALUE | Require this value on every endpoint except `GET /health` and `GET /metrics`: the `Authorization` header (`Bearer` scheme) or `x-api-key`, compared in constant time. Default: no authentication (also `VEGAJET_API_KEY`; the flag wins). The startup banner states which of the two is in effect. |
+| `--cors-origin ORIGIN` | Send `Access-Control-Allow-Origin: ORIGIN` (one origin, never `*`) and answer `OPTIONS` preflights. Default: no CORS headers (an unconfigured server allows no cross-origin caller). |
 
 `GET /metrics` (always on) serves the Prometheus text format: request / failure / cancellation and token counters,
 TTFT, TPOT and end-to-end histograms, active batch and queue gauges, prefix-cache and MoE LRU hit rates,
@@ -281,13 +297,18 @@ Exit codes: 0 ok (end of input or `/quit`), 1 server unreachable (`GET /health` 
 | `VJ_SYSFS_ROOT` | `--gpu list`, GPU selection | Alternative root for the KFD topology scan (tests use a synthetic tree). |
 | `VJ_IO_URING` | table prefetch | `0` forces the thread-pool `preadv` backend instead of io_uring. |
 | `VEGAJET_ENABLE_SUPER` | Ornith GPU bench | Ornith M=1 super-kernels. On by default since `950c137`; `0` turns them off. At `b74f820` and earlier they were opt-in with `1`. |
+| `VEGAJET_V12_GDN_SPLITV` | Ornith GPU bench, `vegajet_layer_test` | `1`: raw M=1 GDN decode runs the column-thread ConvRec kernel (`ornith_gdn_conv_recur_colthread_quant_m1_kernel`) instead of the Split-V one. Same math and FP32 state, same fp32 summation order (bit-identical output); 8 state-row chains of a column live in one wave, so the pred/`o` reductions are 8-lane `__shfl` broadcasts and 4 `__syncthreads` per token disappear. Off by default. |
 | `VEGAJET_HSACO_DIR` | KFD runtime | Code-object directory when `--hsaco-dir` is not given. |
 | `VEGAJET_DISPATCH_LOG` | KFD runtime | Appends one line per kernel dispatch to this file. |
 | `VEGAJET_VRAM_QUARANTINE` | KFD runtime | `<gpu>:<offset_mib>+<len_mib>[,...]` VRAM ranges the allocator never hands out. |
 | `VEGAJET_TELEM_MS` | Ornith GPU bench | Telemetry sampling period in ms; `0` disables sampling. |
 | `VEGAJET_MOE_LRU` | Ornith GPU bench | MoE expert LRU cache slots (default 44 with `--spec-gdn`, else 0). |
 | `VEGAJET_NO_AUTO_DOT8` | Ornith GPU bench | `1` disables automatic Gate+Up DOT8 promotion. |
+| `VEGAJET_V12_ASYM_EXPERTS` | Ornith GPU bench | `1` enables bandwidth-proportional, 32-row-aligned routed/shared expert TP (1024 total, each rank nonempty); unset/other values retain 512/512 and the legacy kernels. Uses calibrated per-BDF HBM bandwidth, not MCLK. The fused back path needs `--back-wgs 224`; other sizes use generic Down. Shape-specific grouped/tiled Down and the monolithic superkernel are bypassed; legacy `--dot8-ab`/`--dump-golden-layers` are rejected. See [D1 verification](../../docs/V12_ASYM_EXPERTS.md). |
 | `VEGAJET_EVICT_ADAPT` | Ornith GPU bench | `1` enables the adaptive draft-length / eviction controller. |
+| `VEGAJET_V12_SPEC_GOV` | Ornith GPU bench | `1`: drive the draft depth from the measured per-M verify time (`t_ver[M]`) and the live accepted length instead of the fabricated inflation constant, and feed the measured time inflation to `VEGAJET_EVICT_ADAPT`. Default off (off = unchanged behaviour). |
+| `VEGAJET_V12_BATCH_CATCHUP` | Ornith GPU bench | `1`: ingest accepted tokens (and prompt tokens) of the blk.48 MTP drafter in one M-row forward instead of one M=1 forward per token. Default off. |
+| `VEGAJET_V12_TREE_VERIFY` | Ornith GPU runner | Exactly `1`: request S3 tree verification; currently fails closed with a host-planning-only error (GPU integration unfinished). `0` or unset: unchanged chain path. See `docs/v12-tree-verify.md`. |
 | `VEGAJET_SPEC_CASCADE` | speculative cascade router | `1`: route a draft cycle to the suffix-trie draft when it has enough confident tokens, else to the neural drafter (verification unchanged, lossless). `0` or unset: off. |
 | `VEGAJET_SPEC_CASCADE_MIN` | speculative cascade router | Confident suffix tokens needed for a suffix-only draft, 1..64 (default 4; other values ignored). |
 | `VEGAJET_PREFILL_CODEX_FA2` | Ornith GPU bench | `1`: use the 53-VGPR Codex GQA FlashAttention-2 prefill kernel (`vj_prefill_gqa_fa2`) on `M >= 16` prefill batches (default off). |
@@ -306,13 +327,23 @@ Exit codes: 0 ok (end of input or `/quit`), 1 server unreachable (`GET /health` 
 | `VEGAJET_VA_CLUSTER` | KFD runtime | `1`: map the always-read (HOT) tensors into the first arena chunks (default 5 x 512 MiB) for TLB locality. Off by default. |
 | `VEGAJET_VA_HOT_MIB` | KFD runtime | HOT-tier size in MiB with `VEGAJET_VA_CLUSTER` (overrides the default 2560); `0` turns clustering off. |
 | `VEGAJET_VOCAB_MUBUF` | Ornith GPU bench | `1`: M=1 greedy vocab argmax through the MUBUF kernel variant. Off by default. |
+| `VEGAJET_V12_VOCAB_ILP` | Ornith GPU bench | `1`: M=1 greedy vocab argmax through the ILP kernel variant (two independent dp4a accumulator chains and two 16 B weight loads in flight per lane; same argmax, only the fp32 summation order changes). Off by default. |
+| `VEGAJET_V12_DENSE_PERSIST` | Ornith GPU bench | `1`: dense M=1 GEMV through the persistent work-stealing variant (a resident 224-240-workgroup grid pulls 8-row tiles from an atomic counter instead of launching one workgroup per tile). Off by default. |
+| `VEGAJET_V12_DENSE_WGS` | Ornith GPU bench | Resident workgroups for `VEGAJET_V12_DENSE_PERSIST`, 96..240 (default 224; other values ignored). |
 | `VEGAJET_SUPER_WGS` | Ornith GPU bench | Workgroups per M=1 super-kernel launch, 192..240 (default 240; other values ignored). |
 | `VEGAJET_MOE_Q3_FAST` | Ornith GPU bench | `0` turns off the dedicated Q3 MoE super-kernel. On by default; it is used only at 240 workgroups on layers whose Gate+Up is in the VJ_Q3_IQ2S layout (`VEGAJET_GU_Q3`). |
 | `VEGAJET_SUPER_PROFILE` | Ornith GPU bench | `1`: after the raw bench, a per-stage `s_memrealtime` profile of the super-kernels (diagnostic). |
+| `VEGAJET_V12_BARRIER_VOL` | Ornith GPU bench | `1`: bind the `vj_ornith_super_vol` super-kernels, whose stage barriers use `buffer_wbinvl1_vol` instead of `buffer_wbinvl1`. Same source, separate `.hsaco`; off by default and unverified on hardware. |
+| `VEGAJET_V12_IQ2S_REG` | Ornith GPU bench | `1`: bind the `vj_ornith_super_iq2sreg` super-kernels, which decode IQ2_S Gate+Up from the 4 KiB `iq2s_grid32` table held in L1D instead of a 4 KiB LDS copy (8,896 B -> 4,800 B LDS, bit-exact). Off by default; mutually exclusive with `VEGAJET_V12_BARRIER_VOL`. |
 | `VEGAJET_RAW_TG512` | Ornith GPU bench | `1`: also measure raw M=1 over 512 tokens after tg128. |
 | `VEGAJET_RAW_ONLY` | Ornith GPU bench | `1`: raw M=1 only; skips the MTP head and uses the smaller raw-only VRAM budget for DOT8 promotion. |
+| `VEGAJET_V12_SERVE_SPEC` | `vegajet serve` (Ornith GPU engine) | `1`: serve through the suffix-tree speculative driver (`tg128 Suffix` verify path, greedy-lossless) and keep `VEGAJET_RAW_ONLY` off; unset or `0`: plain greedy M=1 serving. Default off. |
+| `VEGAJET_V12_ASYNC_OUT` | server worker (all engines) | SSE/JSON token bytes go through a bounded queue drained by a writer thread, so socket writes stay off the generation thread. On by default in v1.2; `0` restores the inline writer. |
+| `VEGAJET_API_KEY` | `vegajet serve` | Bearer key required on every endpoint except `GET /health` and `GET /metrics` (same as `--api-key`, which wins). Unset: no authentication, which is why the default bind is 127.0.0.1. |
 | `VEGAJET_GU_DOT8_LAYERS` | Ornith GPU bench | Number of Gate+Up layers to promote to DOT8 (overrides the automatic choice; `0` = automatic). |
 | `VEGAJET_GU_Q3` | Ornith GPU bench | `1` (any value > 0): routed Gate+Up as lossless 3-bit VJ_Q3_IQ2S in place on all 48 layers. Off by default. |
+| `VEGAJET_V12_NARROW_VERIFY` | Ornith GPU bench | `1`: v1.2 S4, the M=2..16 verify batches use the narrow multi-column Q4A8 GEMV (`ornith_gemv_q4a8_mn_kernel`, one weight pass for all draft rows) instead of the m8/m12/m16 GEMMs. Off by default. |
+| `VEGAJET_V12_VERIFY_FUSED_NQ` | Ornith GPU bench | `1`: v1.2 S5, the spec-verify path runs the GDN verify and its norm+quant in one launch (one grid barrier) instead of two dispatches per GDN layer. Off by default. |
 | `HOME` | doctor, roofline profile | Location of `~/.config/vegajet/hw_profile.json` (unset: a file under `/tmp`). |
 
 ## Exit codes

@@ -133,6 +133,97 @@ EvictDecision plan_evict(const std::vector<double>& cond, const VerifyCostModel&
 }
 
 // ---------------------------------------------------------------------------------------------------------
+MeasuredDepthGovernor::MeasuredDepthGovernor(MeasuredDepthConfig cfg) : cfg_(cfg) {
+    if (cfg_.min_samples == 0) cfg_.min_samples = 1;
+    if (cfg_.k_min == 0) cfg_.k_min = 1;
+    ms_.assign(18, 0.0);
+    n_.assign(18, 0u);
+}
+
+void MeasuredDepthGovernor::observe_verify(uint32_t m, double ms) {
+    if (m == 0 || !(ms > 0.0) || m >= 64u) return;
+    if (ms_.size() <= m) { ms_.resize(m + 1, 0.0); n_.resize(m + 1, 0u); }
+    ms_[m] = (n_[m] == 0) ? ms : (1.0 - cfg_.ema) * ms_[m] + cfg_.ema * ms;
+    ++n_[m];
+}
+
+void MeasuredDepthGovernor::observe_accept(uint32_t proposed, uint32_t accepted) {
+    if (proposed == 0) return;
+    win_.emplace_back(proposed, std::min(accepted, proposed));
+    while (win_.size() > std::max<uint32_t>(1u, cfg_.alpha_window)) win_.pop_front();
+}
+
+double MeasuredDepthGovernor::alpha() const {
+    uint64_t trials = 0, successes = 0;
+    for (const auto& [p, a] : win_) {
+        successes += a;
+        trials += a + (a < p ? 1u : 0u);  // only reached decisions are conditional trials
+    }
+    if (trials == 0) return std::clamp(0.5, cfg_.alpha_lo, cfg_.alpha_hi);
+    return std::clamp(static_cast<double>(successes) / static_cast<double>(trials), cfg_.alpha_lo, cfg_.alpha_hi);
+}
+
+double MeasuredDepthGovernor::measured_ms(uint32_t m) const {
+    if (m >= ms_.size() || n_[m] < cfg_.min_samples) return 0.0;
+    return ms_[m];
+}
+
+double MeasuredDepthGovernor::est_ms(uint32_t m) const {
+    if (m == 0) return 0.0;
+    const double exact = measured_ms(m);
+    if (exact > 0.0) return exact;
+    // Nearest trusted measurements on each side.
+    uint32_t lo = 0, hi = 0;
+    double v_lo = 0.0, v_hi = 0.0;
+    for (uint32_t k = 1; k < ms_.size() && k < 64u; ++k) {
+        const double v = measured_ms(k);
+        if (v <= 0.0) continue;
+        if (k <= m) { lo = k; v_lo = v; }
+        else if (hi == 0) { hi = k; v_hi = v; }
+    }
+    const VerifyCostModel param;  // unmeasured-M shape: dense + expert union growth
+    if (lo == 0) {
+        if (hi == 0) return 0.0;
+        // Below the smallest measured M: keep the parametric shape, scaled onto the measurement.
+        return v_hi * param.cost_ms(m) / std::max(param.cost_ms(hi), 1e-9);
+    }
+    if (hi == 0) {
+        // Above the largest measured M: extend the last measured slope (>= 0), never extrapolate downward.
+        const double base = param.cost_ms(m) - param.cost_ms(lo);
+        const double slope = std::max(0.0, (v_lo - param.cost_ms(lo)) / std::max(param.cost_ms(lo), 1e-9));
+        return v_lo + base * (1.0 + slope);
+    }
+    const double t = static_cast<double>(m - lo) / static_cast<double>(hi - lo);
+    return v_lo + (v_hi - v_lo) * t;
+}
+
+double MeasuredDepthGovernor::time_inflation(uint32_t m) const {
+    const double base = est_ms(1);
+    if (m == 0 || base <= 0.0) return 0.0;
+    const double v = est_ms(m);
+    return v > 0.0 ? v / base : 0.0;
+}
+
+uint32_t MeasuredDepthGovernor::samples(uint32_t m) const {
+    return (m < n_.size()) ? n_[m] : 0u;
+}
+
+uint32_t MeasuredDepthGovernor::next_depth(uint32_t cap) const {
+    if (cap == 0) return 0;
+    bool any = false;
+    for (uint32_t k = 1; k < ms_.size() && k < 64u && !any; ++k) any = measured_ms(k) > 0.0;
+    if (!any) return 0;  // cold: leave the caller's depth alone
+
+    VerifyCostModel cm;
+    cm.measured_ms.assign(static_cast<size_t>(cap) + 2u, 0.0);
+    for (uint32_t m = 1; m <= cap + 1u; ++m) cm.measured_ms[m] = est_ms(m);
+
+    std::vector<double> cond(cap, alpha());
+    const EvictDecision ev = plan_evict(cond, cm, std::min(cfg_.k_min, cap), 0.0);
+    return std::min(std::max(ev.keep, std::min(cfg_.k_min, cap)), cap);
+}
+
+// ---------------------------------------------------------------------------------------------------------
 DrafterKvSync::DrafterKvSync(SyncConfig cfg) : cfg_(cfg) {
     cfg_.stash_slots = std::max(cfg_.stash_slots, cfg_.catchup_window + 1u);
 }

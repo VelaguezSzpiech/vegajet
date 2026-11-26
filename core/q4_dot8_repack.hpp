@@ -153,6 +153,11 @@ struct Dot8RowLayout {
 //   scale region per row: per superblock 8 B {u32 sub-scale nibbles (block j of the superblock at bits
 //   4j..4j+3), f32 d (exact fp16 -> f32)}. Device: lane for block b loads the uint2 at superblock b >> 3.
 Dot8RowLayout dot8_iq3_layout(uint64_t rows, uint32_t cols);
+// Toggle-only Down layout: {u32 sub-scale, f32 superblock d} per 32 weights.
+Dot8RowLayout dot8_iq3_asym_layout(uint64_t rows, uint32_t cols);
+bool dot8_repack_iq3xxs_asym_rows(const uint8_t* src, uint64_t src_stride, uint32_t col_begin,
+                                const Dot8RowLayout& lay, uint64_t row_begin, uint64_t row_end,
+                                uint8_t* w, uint8_t* s, std::string* err);
 
 // Merged Gate+Up pair of IQ2_S-sourced tensors with the same shape (row r of gate and row r of up together).
 //   codes per row: per block ib {gate uint4, up uint4} = 32 B.

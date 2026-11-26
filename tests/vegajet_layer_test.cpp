@@ -9,6 +9,7 @@
 #include "core/vj_check.hpp"
 #include "core/warm_bench.hpp"
 #include "ops/kernels/vj_ornith_super_desc.hpp"
+#include "ops/kernels/vj_ornith_super_args.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -407,6 +408,12 @@ int main(int argc, char** argv) {
     // ---- STAGE 1: GDN (Layer 0) ----
     if (do_gdn && !do_super) {
         const auto* k_conv_m1 = need_k(0, "ornith_gdn_conv_recur_splitv_quant_m1_kernel");
+        // v1.2 D6: VEGAJET_V12_GDN_SPLITV=1 runs the column-thread variant in the same harness (same args,
+        // same golden), so `--stage gdn --m 1` A/Bs the two layouts on the same fixture.
+        const char* ct_env = std::getenv("VEGAJET_V12_GDN_SPLITV");
+        const auto* k_conv_m1_ct = (ct_env != nullptr && ct_env[0] == '1')
+            ? need_k(0, "ornith_gdn_conv_recur_colthread_quant_m1_kernel") : nullptr;
+        const auto* k_conv_m1_sel = (k_conv_m1_ct != nullptr) ? k_conv_m1_ct : k_conv_m1;
         const auto* k_conv    = need_k(0, "ornith_gdn_conv_l2_gate_kernel");
         const auto* k_rec     = need_k(0, "ornith_gdn_recur_quant_kernel");
         const auto* k_pf_conv = need_k(0, "vj_prefill_gdn_conv_l2_gate_kernel");
@@ -441,7 +448,7 @@ int main(int argc, char** argv) {
                         struct CRKA { uint64_t qkv, cw, cr, dt, sa, sr, nw, oq, od, bar, sq; uint32_t nk, nv, cdim, strd, zoff, aoff, boff, cin, cout, sh, ur, sense; float eps; };
                         const CRKA ka{gdn_qkv_va, l0_ssm_cw, conv_ring_va, l0_ssm_dt, l0_ssm_a, ssm_ring_va, l0_ssm_nw,
                                       mid_q8_va, mid_ds_va, gdn_bar_va, gdn_sq_va, 8u, 32u, 6144u, 10304u, 6144u, 10240u, 10272u, 0u, 1u, 0u, 0u, gdn_sense, eps};
-                        VJ_CHECK(rt.enqueue_kernel(0, *k_conv_m1, 128u * 256u, 1, 1, 256, 1, 1, &ka, sizeof(ka), true));
+                        VJ_CHECK(rt.enqueue_kernel(0, *k_conv_m1_sel, 128u * 256u, 1, 1, 256, 1, 1, &ka, sizeof(ka), true));
                     } else if (M <= 16u) {
                         struct CLKA { uint64_t qkv, cw, cr, cout, dt, sa, dec, bs; uint32_t M, nk, nv, cdim, strd, aoff, boff, rh, ur; float eps; };
                         const CLKA cl{gdn_qkv_va, l0_ssm_cw, conv_ring_va, gdn_conv_va, l0_ssm_dt, l0_ssm_a, gdn_dec_va, gdn_bsig_va,
@@ -741,8 +748,8 @@ int main(int argc, char** argv) {
                     },
                     [&]() {
                         ++ssense; ++gdn_sense;
-                        struct KA { uint64_t desc, ov; uint32_t pep, oep, cin, cout, sh, ur, ss, gs; };
-                        const KA ka{gdn_desc_va, 0ULL, 0u, 0u, 0u, 1u, 0u, 0u, ssense, gdn_sense};
+                        using KA = vegajet::ornith_super::GdnArgs;
+                        const KA ka{gdn_desc_va, 0ULL, 0u, 0u, 0u, 1u, 0u, 0u, ssense, gdn_sense, 0ULL};
                         VJ_CHECK(rt.enqueue_kernel(0, *k_gdn_sup, swgs * 256u, 1, 1, 256, 1, 1, &ka, sizeof(ka), true));
                     });
                 std::vector<float> got(D);
@@ -781,8 +788,8 @@ int main(int argc, char** argv) {
                     },
                     [&]() {
                         ++ssense;
-                        struct KA { uint64_t desc; uint32_t pep, oep, p0, ss; };
-                        const KA ka{gqa_desc_va, 0u, 0u, pos0, ssense};
+                        using KA = vegajet::ornith_super::GqaArgs;
+                        const KA ka{gqa_desc_va, 0u, 0u, pos0, ssense, 0ULL};
                         VJ_CHECK(rt.enqueue_kernel(0, *k_gqa_sup, swgs * 256u, 1, 1, 256, 1, 1, &ka, sizeof(ka), true));
                     });
                 std::vector<float> got(D);
@@ -817,8 +824,8 @@ int main(int argc, char** argv) {
                 const uint64_t moe_b = 256ULL * D * 2ULL + 8ULL * (local_ff * 123ULL * 16ULL + D * (dn_d8_w_stride + dn_d8_s_stride)) + 3600000ULL;
                 const double us = time_gpu0([]() {}, [&]() {
                     ++ssense;
-                    struct KA { uint64_t desc; uint32_t aep, oep, ss; };
-                    const KA ka{moe_desc_va, 0u, 0u, ssense};
+                    using KA = vegajet::ornith_super::MoeArgs;
+                    const KA ka{moe_desc_va, 0u, 0u, ssense, 0ULL};
                     VJ_CHECK(rt.enqueue_kernel(0, *k_moe_sup, swgs * 256u, 1, 1, 256, 1, 1, &ka, sizeof(ka), true));
                 });
                 std::vector<float> got(D);

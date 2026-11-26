@@ -209,7 +209,7 @@ Sse parse_sse(const std::string& body) {
 }
 
 std::string chat_body(const std::string& extra) {
-    return "{\"model\":\"m\",\"messages\":[{\"role\":\"system\",\"content\":\"be brief\"},"
+    return "{\"messages\":[{\"role\":\"system\",\"content\":\"be brief\"},"
            "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}]" + extra + "}";
 }
 
@@ -272,7 +272,7 @@ int main() {
                                          "\"repeat_penalty\":1.1,\"seed\":1234,\"max_tokens\":100"));
         VJ_CHECK(r.status == 200);
         const auto j = parse_json(r.body);
-        VJ_CHECK(j.get("object")->str == "chat.completion" && j.get("model")->str == "m");
+        VJ_CHECK(j.get("object")->str == "chat.completion" && j.get("model")->str == "vegajet-test");
         const auto& ch = j.get("choices")->arr[0];
         VJ_CHECK(ch.get("message")->get("role")->str == "assistant");
         VJ_CHECK(ch.get("message")->get("content")->str == kFull);

@@ -112,6 +112,7 @@ struct DeviceInfo {
     uint32_t n_cu = 0;
     uint32_t simd_count = 0;
     uint32_t location_id = 0;
+    uint32_t pci_domain = 0;
     uint32_t p2p_links_count = 0;
     uint32_t cwsr_size = 0;
     uint32_t ctl_stack_size = 0;
@@ -128,6 +129,7 @@ struct KfdBuffer {
     uint32_t flags = 0;
     bool     is_userptr = false;
     bool     is_hugetlb = false;
+    std::vector<uint32_t> mapped_gpu_ids;  // exact successful MAP prefix, not all runtime GPUs
 };
 
 // Hot-tensor VA clustering (opt-in). A tiered arena packs every always-touched tensor (dense projections,
@@ -224,7 +226,9 @@ struct KfdAqlQueue {
     uint64_t  kernarg_va = 0;
     void*     kernarg_host = nullptr;
     size_t    kernarg_capacity = 0;
-    uint32_t  kernarg_slot = 0;
+    uint32_t kernarg_slot = 0;
+    uint64_t completed_write_idx = 0;
+    bool submission_in_flight = false;
     uint64_t  forced_flushes = 0;  // ring-full publishes done by aql_wait_space (see below)
 };
 
@@ -273,8 +277,10 @@ public:
 
     // Opens /dev/kfd with default arena sizing (30.5 GiB ceiling, 64 MiB pinned staging).
     bool open(std::string* err);
-    bool init(double vram_arena_gib, size_t host_pinned_mb, std::string* err = nullptr);
+    bool init(double vram_arena_gib, size_t host_pinned_mb, std::string* err = nullptr, size_t expected_devices = 0);
     void shutdown();
+    // Irreversible fail-closed stop; keep allocations valid for caller cleanup.
+    bool abort_dispatches();
 
     // Loads a single unbundled gfx906 .hsaco onto all open GPUs (hard-asserts private_segment_fixed_size == 0!).
     bool load_code_object(const std::string& path, std::string* err);
@@ -307,11 +313,11 @@ public:
     // GPU VA and size of the peer-mapped payload slice owned by `gpu_idx` (0 when the transport is not PEER_BAR_P2P).
     uint64_t p2p_payload_slice_va(size_t gpu_idx) const { return gpu_idx < p2p_payload_slices_.size() ? p2p_payload_slices_[gpu_idx].va : 0; }
     uint64_t p2p_payload_slice_bytes(size_t gpu_idx) const { return gpu_idx < p2p_payload_slices_.size() ? p2p_payload_slices_[gpu_idx].size : 0; }
-    void     reset_allreduce_mailboxes();
+    bool reset_allreduce_mailboxes(std::string* err = nullptr);
 
     const KfdBuffer& host_pinned_arena() const { return host_pinned_arena_; }
     bool alloc_userptr_pinned(uint64_t size, KfdBuffer& out, bool map_all_gpus = true);
-    void free_buffer(KfdBuffer& buf);
+    bool free_buffer(KfdBuffer& buf);
 
     // AQL kernel dispatch
     bool enqueue_kernel(size_t gpu_idx, const LoadedKernel& kernel,
@@ -338,6 +344,7 @@ public:
     bool download_from_vram(size_t gpu_idx, void* dst, uint64_t src_vram_va, size_t bytes);
 
 private:
+    friend struct RuntimeTestAccess;
     struct LoadedModule {
         std::string name;
         std::string path;
@@ -348,9 +355,10 @@ private:
 #ifndef VEGAJET_CPU_ONLY
     uint64_t reserve_va(uint64_t size, uint64_t align = 0x200000ULL);
     bool alloc_vram(size_t gpu_idx, uint64_t size, uint32_t extra_flags, KfdBuffer& out, bool map_all_gpus = false);
-    bool map_to_gpus(const KfdBuffer& buf, const std::vector<uint32_t>& gpu_ids);
+    bool map_to_gpus(KfdBuffer& buf, const std::vector<uint32_t>& gpu_ids);
     bool create_aql_queue(size_t gpu_idx);
-    void destroy_aql_queue(size_t gpu_idx);
+    bool destroy_aql_queue(size_t gpu_idx);
+    bool stop_queues();
     bool setup_allreduce_mailbox();
     bool load_hsaco_staged(size_t gpu_idx, const std::string& path,
                            KfdBuffer& out_buf,
@@ -368,6 +376,7 @@ private:
     std::vector<KfdArena> vram_arenas_;
     std::vector<KfdAqlQueue> queues_;
     std::vector<KfdBuffer> code_buffers_;
+    std::unordered_map<uint64_t, KfdBuffer> retained_buffers_;  // failed cleanup, retry before closing KFD
     std::vector<LoadedModule> loaded_modules_;
     std::string last_hsaco_dir_;
     uint64_t reload_generation_ = 0;
@@ -383,6 +392,7 @@ private:
     uint64_t va_cursor_ = 0;
     uint64_t va_limit_  = 0;
     bool open_ = false;
+    bool failed_ = false;
 };
 
 } // namespace vegajet::kfd

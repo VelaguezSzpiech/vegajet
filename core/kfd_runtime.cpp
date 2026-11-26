@@ -2,6 +2,8 @@
 #include "core/kfd_runtime.hpp"
 #include "core/gpu_select.hpp"
 #include "core/hsaco_gate.hpp"
+#include "core/hsaco_loader.hpp"
+#include "core/v12_modules.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -135,7 +137,7 @@ std::vector<DeviceInfo> Runtime::scan_gfx906_topology() {
     std::vector<DeviceInfo> out;
     namespace fs = std::filesystem;
     std::error_code ec;
-    const fs::path base("/sys/class/kfd/kfd/topology/nodes");
+    const fs::path base = fs::path(gpusel::sysfs_root()) / "sys/class/kfd/kfd/topology/nodes";
     if (!fs::exists(base, ec)) return out;
 
     std::vector<uint32_t> node_ids;
@@ -160,6 +162,7 @@ std::vector<DeviceInfo> Runtime::scan_gfx906_topology() {
             else if (key == "simd_count") info.simd_count = static_cast<uint32_t>(val);
             else if (key == "drm_render_minor") info.drm_render_minor = static_cast<uint32_t>(val);
             else if (key == "location_id") info.location_id = static_cast<uint32_t>(val);
+            else if (key == "domain") info.pci_domain = static_cast<uint32_t>(val);
             else if (key == "p2p_links_count") info.p2p_links_count = static_cast<uint32_t>(val);
             else if (key == "cwsr_size") info.cwsr_size = static_cast<uint32_t>(val);
             else if (key == "ctl_stack_size") info.ctl_stack_size = static_cast<uint32_t>(val);
@@ -183,7 +186,7 @@ std::vector<DeviceInfo> Runtime::scan_gfx906_topology() {
     }
 
     std::sort(out.begin(), out.end(), [](const DeviceInfo& a, const DeviceInfo& b) {
-        return a.location_id < b.location_id;
+        return a.pci_domain != b.pci_domain ? a.pci_domain < b.pci_domain : a.location_id < b.location_id;
     });
     return out;
 }
@@ -193,6 +196,7 @@ Runtime::~Runtime() {
 }
 
 bool aql_wait_space(KfdAqlQueue& q, uint32_t keep_free, uint64_t timeout_us) {
+    if (q.ring_packets <= keep_free || !q.read_ptr || !q.write_ptr || !q.doorbell) return false;
     const uint64_t limit = static_cast<uint64_t>(q.ring_packets - keep_free);
     auto has_space = [&] { return q.next_write_idx - __atomic_load_n(q.read_ptr, __ATOMIC_ACQUIRE) < limit; };
     if (has_space()) return true;
@@ -217,8 +221,9 @@ bool Runtime::open(std::string* err) {
     if (err) *err = "VegaJet was built with VEGAJET_CPU_ONLY=ON; the KFD runtime is disabled";
     return false;
 }
-bool Runtime::init(double, size_t, std::string* err) { return open(err); }
+bool Runtime::init(double, size_t, std::string* err, size_t) { return open(err); }
 void Runtime::shutdown() { open_ = false; }
+bool Runtime::abort_dispatches() { open_ = false; failed_ = true; return true; }
 bool Runtime::load_code_object(const std::string&, std::string* err) {
     if (err) *err = "code objects cannot be loaded in a CPU-only build";
     return false;
@@ -243,9 +248,9 @@ bool Runtime::execute_plan(const ops::StepPlan&, const OpBinderFn&, bool, Execut
     if (err) *err = "step plans cannot execute in a CPU-only build";
     return false;
 }
-void Runtime::reset_allreduce_mailboxes() {}
+bool Runtime::reset_allreduce_mailboxes(std::string* err) { if (err) *err = "KFD runtime disabled"; return false; }
 bool Runtime::alloc_userptr_pinned(uint64_t, KfdBuffer&, bool) { return false; }
-void Runtime::free_buffer(KfdBuffer&) {}
+bool Runtime::free_buffer(KfdBuffer&) { return true; }
 bool Runtime::enqueue_kernel(size_t, const LoadedKernel&, uint32_t, uint32_t, uint32_t,
                              uint32_t, uint32_t, uint32_t, const void*, size_t, bool, uint32_t) { return false; }
 bool Runtime::submit_batch(size_t) { return false; }
@@ -262,11 +267,18 @@ bool Runtime::download_from_vram(size_t, void*, uint64_t, size_t) { return false
 
 namespace {
 int kfd_ioctl(int fd, unsigned long req, void* arg) {
-    int r;
-    do {
+    int r = ioctl(fd, req, arg);
+    if (r != -1 || (errno != EINTR && errno != EAGAIN)) return r;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+    for (unsigned attempt = 1; attempt < 64; ++attempt) {
+        if (std::chrono::steady_clock::now() >= deadline) break;
+        if (errno == EAGAIN) std::this_thread::sleep_for(std::chrono::microseconds(50));
         r = ioctl(fd, req, arg);
-    } while (r == -1 && (errno == EINTR || errno == EAGAIN));
-    return r;
+        if (r != -1 || (errno != EINTR && errno != EAGAIN)) return r;
+    }
+    std::fprintf(stderr, "[vegajet::kfd] ioctl 0x%lx retry budget exhausted (EINTR/EAGAIN)\n", req);
+    errno = ETIMEDOUT;
+    return -1;
 }
 } // namespace
 
@@ -283,13 +295,36 @@ bool Runtime::open(std::string* err) {
     return init(30.5, 64, err);
 }
 
-bool Runtime::init(double vram_arena_gib, size_t host_pinned_mb, std::string* err) {
+bool Runtime::init(double vram_arena_gib, size_t host_pinned_mb, std::string* err, size_t expected_devices) {
+    if (failed_ || !retained_buffers_.empty() || (!open_ && !queues_.empty())) {
+        if (err) *err = "Runtime is failed or cleanup is incomplete; create a new Runtime after successful shutdown";
+        return false;
+    }
     if (const char* dl = std::getenv("VEGAJET_DISPATCH_LOG"); dl && dl[0] && dlog_fd_ < 0)
         dlog_fd_ = ::open(dl, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
-    if (open_) return true;
+    if (open_) {
+        if (!expected_devices || devices_.size() == expected_devices) return true;
+        if (err) *err = "Runtime already open with a different selected device count";
+        return false;
+    }
 
     devices_ = scan_gfx906_topology();
-    if (!gpusel::filter_from_env(devices_, err)) return false;  // per-process selection (--gpu / VJ_GPU_DEVICES)
+    const size_t discovered = devices_.size();
+    gpusel::Selection selection;
+    if (!gpusel::resolve(nullptr, std::getenv(gpusel::kEnvVar), selection, err) ||
+        !gpusel::filter(devices_, selection, err)) return false;
+    if ((expected_devices && devices_.size() != expected_devices) || devices_.size() > kMaxGpus) {
+        if (err) *err = "Runner requires exactly " + std::to_string(expected_devices ? expected_devices : kMaxGpus) +
+                        " selected GPUs; found " + std::to_string(devices_.size()) +
+                        ". Pin the intended cards with --gpu dddd:bb:dd.f,dddd:bb:dd.f (or VJ_GPU_DEVICES).";
+        return false;
+    }
+    if (!selection.all && selection.bdfs.empty() && discovered > devices_.size())
+        std::fprintf(stderr, "[vegajet::kfd] WARNING: ordinal GPU selection uses %zu of %zu cards; insertion can change identities. Use full PCI BDFs.\n",
+                     devices_.size(), discovered);
+    for (size_t rank = 0; rank < devices_.size(); ++rank)
+        std::printf("[vegajet::kfd] selected GPU %zu: PCI %s (gpu_id=%u)\n", rank,
+                    gpusel::bdf(devices_[rank].pci_domain, devices_[rank].location_id).c_str(), devices_[rank].gpu_id);
     if (devices_.empty()) {
         if (err) *err = "No gfx906 (90006) GPUs found in /sys/class/kfd/kfd/topology/nodes";
         return false;
@@ -476,18 +511,50 @@ bool Runtime::init(double vram_arena_gib, size_t host_pinned_mb, std::string* er
     return true;
 }
 
-void Runtime::reset_allreduce_mailboxes() {
-    if (!p2p_flag_slices_.empty()) {
-        for (auto& b : p2p_flag_slices_) if (b.host_ptr) std::memset(b.host_ptr, 0, b.size);
-    } else if (mailbox_flag_buf_.host_ptr) {
+bool Runtime::reset_allreduce_mailboxes(std::string* err) {
+    auto fail = [&](const std::string& why) {
+        if (err) *err = "AllReduce reset failed: " + why;
+        std::fprintf(stderr, "[vegajet::kfd] AllReduce reset failed: %s; runtime stopped\n", why.c_str());
+        failed_ = true;
+        open_ = false;
+        return false;
+    };
+    if (failed_) return fail("runtime is already failed");
+    if (devices_.size() <= 1) return true;
+    if (queues_.size() != devices_.size()) return fail("missing device queues");
+    if (transport_ == AllReduceTransport::PeerBarP2P) {
+        if (p2p_payload_slices_.size() != devices_.size() || p2p_flag_slices_.size() != devices_.size())
+            return fail("incomplete peer mailbox slices");
+        for (const auto& b : p2p_payload_slices_)
+            if (!b.host_ptr || b.size < kArGpuBytes) return fail("peer payload has no required CPU mapping");
+        for (const auto& b : p2p_flag_slices_)
+            if (!b.host_ptr || b.size < 4096) return fail("peer flags have no required CPU mapping");
+    } else if (!mailbox_payload_buf_.host_ptr || mailbox_payload_buf_.size < sizeof(AllReducePayload) ||
+               !mailbox_flag_buf_.host_ptr || mailbox_flag_buf_.size < sizeof(AllReduceFlags)) {
+        return fail("host mailbox mapping missing or too small");
+    }
+    for (size_t g = 0; g < queues_.size(); ++g) {
+        const auto& q = queues_[g];
+        if (!q.completion_sig) {
+            // Mailboxes are initialized before queues are created. No producer exists in this generation yet.
+            if (!open_ && !q.queue_active && !q.ring_buf.handle && !q.next_write_idx && !q.submission_in_flight) continue;
+            return fail("missing completion signal");
+        }
+        if (q.submission_in_flight || q.next_write_idx != q.completed_write_idx ||
+            __atomic_load_n(&q.completion_sig->value, __ATOMIC_ACQUIRE) != 0) {
+            if (!wait_idle(g)) return fail("GPU " + std::to_string(g) + " did not quiesce");
+        }
+    }
+    // Validate every mapping and quiesce every queue before changing any rank's epoch state.
+    if (transport_ == AllReduceTransport::PeerBarP2P) {
+        for (auto& b : p2p_payload_slices_) std::memset(b.host_ptr, 0, b.size);
+        for (auto& b : p2p_flag_slices_) std::memset(b.host_ptr, 0, b.size);
+    } else {
+        std::memset(mailbox_payload_buf_.host_ptr, 0, sizeof(AllReducePayload));
         std::memset(mailbox_flag_buf_.host_ptr, 0, sizeof(AllReduceFlags));
     }
-    if (!p2p_payload_slices_.empty()) {
-        for (auto& b : p2p_payload_slices_) if (b.host_ptr) std::memset(b.host_ptr, 0, b.size);
-    } else if (mailbox_payload_buf_.host_ptr) {
-        std::memset(mailbox_payload_buf_.host_ptr, 0, sizeof(AllReducePayload));
-    }
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    return true;
 }
 
 bool Runtime::setup_allreduce_mailbox() {
@@ -525,6 +592,12 @@ bool Runtime::setup_allreduce_mailbox() {
                                static_cast<off_t>(args.mmap_offset));
                 if (p != MAP_FAILED) out.host_ptr = p;
             }
+            if (!out.host_ptr) {
+                std::fprintf(stderr, "[vegajet::kfd] required CPU peer mailbox mmap failed GPU %zu: %s\n", gidx,
+                             args.mmap_offset ? std::strerror(errno) : "KFD returned no mmap offset");
+                free_buffer(out);
+                return false;
+            }
             if (!map_to_gpus(out, all_gpu_ids_)) {
                 free_buffer(out);
                 return false;
@@ -545,14 +618,17 @@ bool Runtime::setup_allreduce_mailbox() {
             mailbox_flag_buf_.va          = f_base;
             mailbox_flag_buf_.host_ptr    = p2p_flag_slices_[0].host_ptr;
             transport_ = AllReduceTransport::PeerBarP2P;
-            reset_allreduce_mailboxes();
+            if (!reset_allreduce_mailboxes()) return false;
             std::printf("[vegajet::kfd] AllReduce: PEER_BAR_P2P PUSH-ONLY DUAL-BAR (payload @ 0x%llx [COH-WC], flags @ 0x%llx [UC])\n",
                         static_cast<unsigned long long>(p_base),
                         static_cast<unsigned long long>(f_base));
             return true;
         }
-        for (auto& b : p2p_payload_slices_) free_buffer(b);
-        for (auto& b : p2p_flag_slices_) free_buffer(b);
+        std::fprintf(stderr, "[vegajet::kfd] peer mailbox setup failed; falling back to host-pinned transport\n");
+        bool cleaned = true;
+        for (auto& b : p2p_payload_slices_) if (!free_buffer(b)) cleaned = false;
+        for (auto& b : p2p_flag_slices_) if (!free_buffer(b)) cleaned = false;
+        if (!cleaned) { failed_ = true; return false; }
         p2p_payload_slices_.clear();
         p2p_flag_slices_.clear();
     }
@@ -562,8 +638,7 @@ bool Runtime::setup_allreduce_mailbox() {
     if (!alloc_userptr_pinned(payload_bytes, mailbox_payload_buf_, true)) return false;
     if (!alloc_userptr_pinned(flag_bytes, mailbox_flag_buf_, true)) return false;
     transport_ = AllReduceTransport::HostPinnedUserptr;
-    reset_allreduce_mailboxes();
-    return true;
+    return reset_allreduce_mailboxes();
 }
 
 bool Runtime::alloc_vram(size_t gpu_idx, uint64_t size, uint32_t extra_flags, KfdBuffer& out, bool map_all_gpus) {
@@ -624,25 +699,49 @@ bool Runtime::alloc_userptr_pinned(uint64_t size, KfdBuffer& out, bool map_all_g
     return true;
 }
 
-bool Runtime::map_to_gpus(const KfdBuffer& buf, const std::vector<uint32_t>& gpu_ids) {
-    if (gpu_ids.empty()) return true;
+bool Runtime::map_to_gpus(KfdBuffer& buf, const std::vector<uint32_t>& gpu_ids) {
+    std::vector<uint32_t> targets;
+    for (uint32_t id : gpu_ids) {
+        if (std::find(buf.mapped_gpu_ids.begin(), buf.mapped_gpu_ids.end(), id) == buf.mapped_gpu_ids.end())
+            targets.push_back(id);
+    }
+    if (targets.empty()) return true;
     kfd_ioctl_map_memory_to_gpu_args margs{};
     margs.handle               = buf.handle;
-    margs.device_ids_array_ptr = reinterpret_cast<uint64_t>(gpu_ids.data());
-    margs.n_devices            = static_cast<uint32_t>(gpu_ids.size());
-    return kfd_ioctl(kfd_fd_, AMDKFD_IOC_MAP_MEMORY_TO_GPU, &margs) == 0 && margs.n_success == margs.n_devices;
+    margs.device_ids_array_ptr = reinterpret_cast<uint64_t>(targets.data());
+    margs.n_devices            = static_cast<uint32_t>(targets.size());
+    const int rc = kfd_ioctl(kfd_fd_, AMDKFD_IOC_MAP_MEMORY_TO_GPU, &margs);
+    const size_t done = std::min<size_t>(margs.n_success, targets.size());
+    buf.mapped_gpu_ids.insert(buf.mapped_gpu_ids.end(), targets.begin(), targets.begin() + done);
+    if (rc == 0 && margs.n_success == margs.n_devices) return true;
+    std::fprintf(stderr, "[vegajet::kfd] MAP handle=%llu failed (%u/%u GPUs): %s\n",
+                 static_cast<unsigned long long>(buf.handle), margs.n_success, margs.n_devices, std::strerror(errno));
+    return false;
 }
 
-void Runtime::free_buffer(KfdBuffer& buf) {
-    if (buf.handle != 0 && kfd_fd_ >= 0) {
-        kfd_ioctl_unmap_memory_from_gpu_args uargs{};
-        uargs.handle               = buf.handle;
-        uargs.device_ids_array_ptr = reinterpret_cast<uint64_t>(all_gpu_ids_.data());
-        uargs.n_devices            = static_cast<uint32_t>(all_gpu_ids_.size());
-        (void) kfd_ioctl(kfd_fd_, AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU, &uargs);
+bool Runtime::free_buffer(KfdBuffer& buf) {
+    auto retain = [&](const char* op) {
+        retained_buffers_[buf.handle] = buf;
+        std::fprintf(stderr, "[vegajet::kfd] %s handle=%llu failed; retaining BO and host storage: %s\n",
+                     op, static_cast<unsigned long long>(buf.handle), std::strerror(errno));
+        return false;
+    };
+    if (buf.handle != 0) {
+        if (kfd_fd_ < 0) return retain("cleanup without KFD fd");
+        if (!buf.mapped_gpu_ids.empty()) {
+            kfd_ioctl_unmap_memory_from_gpu_args uargs{};
+            uargs.handle               = buf.handle;
+            uargs.device_ids_array_ptr = reinterpret_cast<uint64_t>(buf.mapped_gpu_ids.data());
+            uargs.n_devices            = static_cast<uint32_t>(buf.mapped_gpu_ids.size());
+            const int rc = kfd_ioctl(kfd_fd_, AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU, &uargs);
+            const size_t done = std::min<size_t>(uargs.n_success, buf.mapped_gpu_ids.size());
+            buf.mapped_gpu_ids.erase(buf.mapped_gpu_ids.begin(), buf.mapped_gpu_ids.begin() + done);
+            if (rc != 0 || uargs.n_success != uargs.n_devices) return retain("UNMAP");
+        }
         kfd_ioctl_free_memory_of_gpu_args fargs{};
         fargs.handle = buf.handle;
-        (void) kfd_ioctl(kfd_fd_, AMDKFD_IOC_FREE_MEMORY_OF_GPU, &fargs);
+        if (kfd_ioctl(kfd_fd_, AMDKFD_IOC_FREE_MEMORY_OF_GPU, &fargs) != 0) return retain("FREE");
+        retained_buffers_.erase(buf.handle);
     }
     if (buf.host_ptr) {
         if (buf.is_hugetlb) munmap(buf.host_ptr, buf.size);
@@ -650,6 +749,7 @@ void Runtime::free_buffer(KfdBuffer& buf) {
         else munmap(buf.host_ptr, buf.size);
     }
     buf = KfdBuffer{};
+    return true;
 }
 
 bool Runtime::create_aql_queue(size_t gpu_idx) {
@@ -742,7 +842,7 @@ bool Runtime::create_aql_queue(size_t gpu_idx) {
     if (!alloc_iso_userptr(2048ULL * 512ULL, 0u, q.kernarg_buf)) return false;
     q.kernarg_host     = q.kernarg_buf.host_ptr;
     q.kernarg_va       = q.kernarg_buf.va;
-    q.kernarg_capacity = 512;
+    q.kernarg_capacity = q.kernarg_buf.size;
     q.kernarg_slot     = 0;
 
     // 5. Create AQL Compute Queue
@@ -781,30 +881,54 @@ bool Runtime::create_aql_queue(size_t gpu_idx) {
     return true;
 }
 
-void Runtime::destroy_aql_queue(size_t gpu_idx) {
+bool Runtime::destroy_aql_queue(size_t gpu_idx) {
     auto& q = queues_[gpu_idx];
+    // Queue ownership is released by KFD, not by unmapping its host doorbell.
+    if (q.queue_active) {
+        kfd_ioctl_destroy_queue_args dargs{};
+        dargs.queue_id = q.queue_id;
+        if (kfd_fd_ < 0 || kfd_ioctl(kfd_fd_, AMDKFD_IOC_DESTROY_QUEUE, &dargs) != 0) {
+            std::fprintf(stderr, "[vegajet::kfd] DESTROY_QUEUE GPU %zu id=%u failed; retaining queue, doorbell and all backing BOs: %s\n",
+                         gpu_idx, q.queue_id, std::strerror(errno));
+            failed_ = true;
+            open_ = false;
+            return false;
+        }
+        q.queue_id = 0;
+        q.queue_active = false;
+    }
     if (q.doorbell_map) {
         munmap(q.doorbell_map, q.doorbell_map_size);
         q.doorbell_map = nullptr;
-        q.doorbell     = nullptr;
+        q.doorbell = nullptr;
     }
-    if (q.queue_active && kfd_fd_ >= 0) {
-        kfd_ioctl_destroy_queue_args dargs{};
-        dargs.queue_id = q.queue_id;
-        (void) kfd_ioctl(kfd_fd_, AMDKFD_IOC_DESTROY_QUEUE, &dargs);
-        q.queue_id     = 0;
-        q.queue_active = false;
-    }
-    free_buffer(q.kernarg_buf);
-    free_buffer(q.rw_ptr_buf);
-    free_buffer(q.cwsr_buf);
-    free_buffer(q.eop_buf);
-    free_buffer(q.ring_buf);
+    bool ok = true;
+    for (auto* b : {&q.kernarg_buf, &q.rw_ptr_buf, &q.cwsr_buf, &q.eop_buf, &q.ring_buf})
+        if (!free_buffer(*b)) ok = false;
+    if (ok) q = KfdAqlQueue{};
+    return ok;
+}
+
+bool Runtime::stop_queues() {
+    bool ok = true;
+    for (size_t i = 0; i < queues_.size(); ++i) if (!destroy_aql_queue(i)) ok = false;
+    if (ok) queues_.clear();
+    return ok;
+}
+
+bool Runtime::abort_dispatches() {
+    failed_ = true;
+    open_ = false;
+    return stop_queues();
 }
 
 void Runtime::shutdown() {
-    for (size_t i = 0; i < queues_.size(); ++i) destroy_aql_queue(i);
-    queues_.clear();
+    open_ = false;
+    if (!stop_queues()) {
+        failed_ = true;
+        std::fprintf(stderr, "[vegajet::kfd] shutdown incomplete: queue teardown failed; retaining runtime allocations and fds\n");
+        return;
+    }
     for (auto& m : loaded_modules_) {
         for (auto& cb : m.code_buffers) free_buffer(cb);
     }
@@ -827,6 +951,18 @@ void Runtime::shutdown() {
         if (a.slab.handle) free_buffer(a.slab);
     }
     vram_arenas_.clear();
+    const auto retry = retained_buffers_;
+    for (const auto& entry : retry) {
+        KfdBuffer b = entry.second;
+        free_buffer(b);
+    }
+    if (!retained_buffers_.empty()) {
+        std::fprintf(stderr, "[vegajet::kfd] shutdown incomplete: %zu BOs retained; KFD fd kept open\n",
+                     retained_buffers_.size());
+        failed_ = true;
+        open_ = false;
+        return;
+    }
     for (auto& g : devices_) {
         if (g.drm_fd >= 0) { ::close(g.drm_fd); g.drm_fd = -1; }
     }
@@ -932,7 +1068,13 @@ bool Runtime::reload_hsaco(const std::string& module_name, std::string* err) {
     if (existing) {
         for (size_t g = 0; g < ng; ++g) {
             for (const auto& old_kn : existing->kernel_names) kernels_[g].erase(old_kn);
-            if (g < existing->code_buffers.size()) free_buffer(existing->code_buffers[g]);
+            if (g < existing->code_buffers.size() && !free_buffer(existing->code_buffers[g])) {
+                for (auto& cb : staged_bufs) free_buffer(cb);
+                if (err) *err = "Hot-reload cleanup failed; runtime stopped";
+                abort_dispatches();
+                open_ = false;
+                return false;
+            }
         }
         existing->code_buffers = std::move(staged_bufs);
         existing->kernel_names = std::move(new_names);
@@ -964,7 +1106,13 @@ bool Runtime::reload_all_hsacos(std::string* err) {
     names.reserve(loaded_modules_.size());
     for (const auto& m : loaded_modules_) names.push_back(m.name);
     for (const auto& nm : names) {
-        if (!reload_hsaco(nm, err)) return false;
+        if (!reload_hsaco(nm, err)) {
+            // Earlier modules may already have replaced executable BOs and cached kernel objects.
+            if (err) *err = "reload-all failed at '" + nm + "'; runtime stopped: " + *err;
+            abort_dispatches();
+            open_ = false;
+            return false;
+        }
     }
     return true;
 }
@@ -1003,6 +1151,7 @@ bool Runtime::load_hsaco_dir(const std::string& hsaco_dir, std::string* err) {
         "vj_spec_gdn.hsaco",
         "vj_dflash2.hsaco",
         "vj_ornith_super.hsaco",
+
     };
     for (const char* f : optional) {
         const fs::path p = fs::path(dir) / f;
@@ -1010,6 +1159,18 @@ bool Runtime::load_hsaco_dir(const std::string& hsaco_dir, std::string* err) {
         if (fs::exists(p, ec)) {
             if (!load_code_object(p.string(), err)) return false;
         }
+    }
+    const char* vol = std::getenv("VEGAJET_V12_BARRIER_VOL");
+    const char* iq2s = std::getenv("VEGAJET_V12_IQ2S_REG");
+    const auto variant = select_super_variant(vol && vol[0] == '1', iq2s && iq2s[0] == '1');
+    if (!variant.valid) {
+        if (err) *err = "BARRIER_VOL and IQ2S_REG are mutually exclusive";
+        return false;
+    }
+    if (variant.object && !load_code_object((fs::path(dir) / variant.object).string(), err)) return false;
+    const char* asym = std::getenv("VEGAJET_V12_ASYM_EXPERTS");
+    if (asym && std::strcmp(asym, "1") == 0) {
+        if (!load_code_object((fs::path(dir) / "vj_moe_asym.hsaco").string(), err)) return false;
     }
     return true;
 }
@@ -1034,30 +1195,21 @@ bool Runtime::load_hsaco_staged(size_t gpu_idx, const std::string& hsaco_path,
         if (err) *err = "Cannot open .hsaco: " + hsaco_path;
         return false;
     }
-    const size_t fsize = static_cast<size_t>(ifs.tellg());
+    const auto end = ifs.tellg();
+    if (end <= 0 || static_cast<uint64_t>(end) > kMaxCodeBytes) {
+        if (err) *err = "HSACO file size outside live-loader limit: " + hsaco_path;
+        return false;
+    }
+    const size_t fsize = static_cast<size_t>(end);
     ifs.seekg(0);
     std::vector<uint8_t> elf(fsize);
-    ifs.read(reinterpret_cast<char*>(elf.data()), static_cast<std::streamsize>(fsize));
-
-    if (fsize < sizeof(Elf64_Ehdr) || std::memcmp(elf.data(), ELFMAG, SELFMAG) != 0) {
-        if (err) *err = hsaco_path + " is not a valid unbundled ELF .hsaco";
+    if (!ifs.read(reinterpret_cast<char*>(elf.data()), static_cast<std::streamsize>(fsize))) {
+        if (err) *err = "Short HSACO read: " + hsaco_path;
         return false;
     }
-    const auto* ehdr  = reinterpret_cast<const Elf64_Ehdr*>(elf.data());
-    const auto* phdrs = reinterpret_cast<const Elf64_Phdr*>(elf.data() + ehdr->e_phoff);
-
-    uint64_t min_vaddr = UINT64_MAX, max_vaddr = 0;
-    for (uint16_t i = 0; i < ehdr->e_phnum; ++i) {
-        if (phdrs[i].p_type != PT_LOAD) continue;
-        if (phdrs[i].p_vaddr < min_vaddr) min_vaddr = phdrs[i].p_vaddr;
-        if (phdrs[i].p_vaddr + phdrs[i].p_memsz > max_vaddr) max_vaddr = phdrs[i].p_vaddr + phdrs[i].p_memsz;
-    }
-    if (min_vaddr >= max_vaddr) {
-        if (err) *err = hsaco_path + " has no PT_LOAD segments";
-        return false;
-    }
-
-    const uint64_t image_size = align_up(max_vaddr - min_vaddr, 4096ULL);
+    CodeLoadPlan plan;
+    if (gpu_idx >= devices_.size() || !plan_hsaco_load(elf.data(), elf.size(), plan, err)) return false;
+    const uint64_t image_size = plan.image_bytes;
     // 2 MiB VA alignment enforces amdgpu.vm_fragment_size=9 fragment isolation for executable code BOs.
     const uint64_t code_va = reserve_va(image_size, 0x200000ULL);
     if (!code_va) { if (err) *err = "GPUVM VA exhausted loading " + hsaco_path; return false; }
@@ -1084,223 +1236,11 @@ bool Runtime::load_hsaco_staged(size_t gpu_idx, const std::string& hsaco_path,
     if (!map_to_gpus(cbuf, {devices_[gpu_idx].gpu_id})) { free_buffer(cbuf); if (err) *err = "map_to_gpus(code) failed"; return false; }
 
     std::memset(cbuf.host_ptr, 0, image_size);
-    for (uint16_t i = 0; i < ehdr->e_phnum; ++i) {
-        if (phdrs[i].p_type != PT_LOAD) continue;
-        std::memcpy(reinterpret_cast<uint8_t*>(cbuf.host_ptr) + (phdrs[i].p_vaddr - min_vaddr),
-                    elf.data() + phdrs[i].p_offset, phdrs[i].p_filesz);
-    }
-
-    // Parse .symtab/.dynsym + AMDGPU MessagePack NT_AMDGPU_METADATA (.amdhsa.kernels)
-    const auto* shdrs = reinterpret_cast<const Elf64_Shdr*>(elf.data() + ehdr->e_shoff);
-    std::unordered_map<std::string, uint32_t> vgprs, sgprs;
-    std::unordered_map<std::string, uint64_t> kd_vaddrs;
-    const auto fn_sizes = gate::elf_function_sizes(elf.data(), elf.size());
-
-    struct MsgPackKernelMeta {
-        uint32_t vgpr_count = 0, sgpr_count = 0, group_seg = 0, priv_seg = 0, wavefront = 64, max_wg = 256;
-        bool valid = false;
-    };
-    std::unordered_map<std::string, MsgPackKernelMeta> mp_meta;
-
-    struct MpReader {
-        const uint8_t* p;
-        size_t len, pos = 0;
-        bool ok() const { return pos < len; }
-        uint8_t u8() { return (pos < len) ? p[pos++] : 0; }
-        uint16_t be16() { uint16_t a = u8(), b = u8(); return static_cast<uint16_t>((a << 8) | b); }
-        uint32_t be32() { uint32_t a = be16(), b = be16(); return (a << 16) | b; }
-        uint64_t be64() { uint64_t a = be32(), b = be32(); return (a << 32) | b; }
-        bool read_str(std::string& out) {
-            if (!ok()) return false;
-            uint8_t b = u8(); size_t n = 0;
-            if ((b & 0xE0u) == 0xA0u) n = b & 0x1Fu;
-            else if (b == 0xD9u) n = u8();
-            else if (b == 0xDAu) n = be16();
-            else if (b == 0xDBu) n = be32();
-            else return false;
-            if (pos + n > len) { pos = len; return false; }
-            out.assign(reinterpret_cast<const char*>(p + pos), n);
-            pos += n;
-            return true;
-        }
-        bool read_uint(uint64_t& out) {
-            if (!ok()) return false;
-            uint8_t b = p[pos];
-            if ((b & 0x80u) == 0u) { pos++; out = b; return true; }
-            if (b == 0xCCu) { pos++; out = u8(); return true; }
-            if (b == 0xCDu) { pos++; out = be16(); return true; }
-            if (b == 0xCEu) { pos++; out = be32(); return true; }
-            if (b == 0xCFu) { pos++; out = be64(); return true; }
-            if (b == 0xD0u) { pos++; out = static_cast<uint64_t>(static_cast<int8_t>(u8())); return true; }
-            if (b == 0xD1u) { pos++; out = static_cast<uint64_t>(static_cast<int16_t>(be16())); return true; }
-            if (b == 0xD2u) { pos++; out = static_cast<uint64_t>(static_cast<int32_t>(be32())); return true; }
-            if (b == 0xD3u) { pos++; out = be64(); return true; }
-            return false;
-        }
-        bool read_map_len(size_t& n) {
-            if (!ok()) return false;
-            uint8_t b = u8();
-            if ((b & 0xF0u) == 0x80u) { n = b & 0x0Fu; return true; }
-            if (b == 0xDEu) { n = be16(); return true; }
-            if (b == 0xDFu) { n = be32(); return true; }
-            return false;
-        }
-        bool read_arr_len(size_t& n) {
-            if (!ok()) return false;
-            uint8_t b = u8();
-            if ((b & 0xF0u) == 0x90u) { n = b & 0x0Fu; return true; }
-            if (b == 0xDCu) { n = be16(); return true; }
-            if (b == 0xDDu) { n = be32(); return true; }
-            return false;
-        }
-        void skip() {
-            if (!ok()) return;
-            uint8_t b = u8();
-            if ((b & 0x80u) == 0u || (b & 0xE0u) == 0xE0u) return;
-            if ((b & 0xE0u) == 0xA0u) { pos = std::min(len, pos + (b & 0x1Fu)); return; }
-            if ((b & 0xF0u) == 0x90u) { for (size_t i = 0, n = b & 0x0Fu; i < n && ok(); ++i) skip(); return; }
-            if ((b & 0xF0u) == 0x80u) { for (size_t i = 0, n = b & 0x0Fu; i < n && ok(); ++i) { skip(); skip(); } return; }
-            switch (b) {
-                case 0xC0u: case 0xC2u: case 0xC3u: return;
-                case 0xC4u: case 0xD9u: pos = std::min(len, pos + u8()); return;
-                case 0xC5u: case 0xDAu: pos = std::min(len, pos + be16()); return;
-                case 0xC6u: case 0xDBu: pos = std::min(len, pos + be32()); return;
-                case 0xCAu: case 0xCEu: case 0xD2u: pos = std::min(len, pos + 4u); return;
-                case 0xCBu: case 0xCFu: case 0xD3u: pos = std::min(len, pos + 8u); return;
-                case 0xCCu: case 0xD0u: pos = std::min(len, pos + 1u); return;
-                case 0xCDu: case 0xD1u: pos = std::min(len, pos + 2u); return;
-                case 0xDCu: { for (size_t i = 0, n = be16(); i < n && ok(); ++i) skip(); return; }
-                case 0xDDu: { for (size_t i = 0, n = be32(); i < n && ok(); ++i) skip(); return; }
-                case 0xDEu: { for (size_t i = 0, n = be16(); i < n && ok(); ++i) { skip(); skip(); } return; }
-                case 0xDFu: { for (size_t i = 0, n = be32(); i < n && ok(); ++i) { skip(); skip(); } return; }
-                default: pos = len; return;
-            }
-        }
-    };
-
-    auto parse_amdhsa_note = [&](const uint8_t* ndata, size_t nlen) {
-        size_t off = 0;
-        while (off + 12u <= nlen) {
-            uint32_t namesz = 0, descsz = 0, ntype = 0;
-            std::memcpy(&namesz, ndata + off + 0u, 4);
-            std::memcpy(&descsz, ndata + off + 4u, 4);
-            std::memcpy(&ntype,  ndata + off + 8u, 4);
-            const size_t name_off = off + 12u;
-            const size_t desc_off = name_off + align_up(namesz, 4ULL);
-            const size_t next_off = desc_off + align_up(descsz, 4ULL);
-            if (next_off > nlen) break;
-            if (ntype == 32u && namesz >= 6u && std::memcmp(ndata + name_off, "AMDGPU", 6) == 0) {
-                MpReader r{ndata + desc_off, descsz, 0};
-                size_t top_n = 0;
-                if (r.read_map_len(top_n)) {
-                    for (size_t ti = 0; ti < top_n && r.ok(); ++ti) {
-                        std::string tkey;
-                        if (!r.read_str(tkey)) break;
-                        if (tkey == "amdhsa.kernels") {
-                            size_t kn = 0;
-                            if (!r.read_arr_len(kn)) break;
-                            for (size_t ki = 0; ki < kn && r.ok(); ++ki) {
-                                size_t fn = 0;
-                                if (!r.read_map_len(fn)) break;
-                                std::string kname, ksym;
-                                MsgPackKernelMeta km{};
-                                km.valid = true;
-                                for (size_t fi = 0; fi < fn && r.ok(); ++fi) {
-                                    std::string fk;
-                                    if (!r.read_str(fk)) break;
-                                    uint64_t uv = 0;
-                                    if (fk == ".name") { (void) r.read_str(kname); }
-                                    else if (fk == ".symbol") { (void) r.read_str(ksym); }
-                                    else if (fk == ".vgpr_count" && r.read_uint(uv)) { km.vgpr_count = static_cast<uint32_t>(uv); }
-                                    else if (fk == ".sgpr_count" && r.read_uint(uv)) { km.sgpr_count = static_cast<uint32_t>(uv); }
-                                    else if (fk == ".group_segment_fixed_size" && r.read_uint(uv)) { km.group_seg = static_cast<uint32_t>(uv); }
-                                    else if (fk == ".private_segment_fixed_size" && r.read_uint(uv)) { km.priv_seg = static_cast<uint32_t>(uv); }
-                                    else if (fk == ".wavefront_size" && r.read_uint(uv)) { km.wavefront = static_cast<uint32_t>(uv); }
-                                    else if (fk == ".max_flat_workgroup_size" && r.read_uint(uv)) { km.max_wg = static_cast<uint32_t>(uv); }
-                                    else { r.skip(); }
-                                }
-                                if (kname.empty() && ksym.size() > 3 && ksym.compare(ksym.size() - 3, 3, ".kd") == 0) {
-                                    kname = ksym.substr(0, ksym.size() - 3);
-                                }
-                                if (!kname.empty()) mp_meta[kname] = km;
-                            }
-                        } else {
-                            r.skip();
-                        }
-                    }
-                }
-            }
-            off = next_off;
-        }
-    };
-
-    for (uint16_t i = 0; i < ehdr->e_shnum; ++i) {
-        if (shdrs[i].sh_type == SHT_NOTE && shdrs[i].sh_offset + shdrs[i].sh_size <= fsize) {
-            parse_amdhsa_note(elf.data() + shdrs[i].sh_offset, shdrs[i].sh_size);
-        }
-        if (shdrs[i].sh_type != SHT_SYMTAB && shdrs[i].sh_type != SHT_DYNSYM) continue;
-        const auto* syms = reinterpret_cast<const Elf64_Sym*>(elf.data() + shdrs[i].sh_offset);
-        const size_t nsyms = shdrs[i].sh_size / sizeof(Elf64_Sym);
-        const char* strtab = reinterpret_cast<const char*>(elf.data() + shdrs[shdrs[i].sh_link].sh_offset);
-        for (size_t s = 0; s < nsyms; ++s) {
-            std::string sname = strtab + syms[s].st_name;
-            if (sname.size() > 3 && sname.compare(sname.size() - 3, 3, ".kd") == 0) {
-                kd_vaddrs[sname.substr(0, sname.size() - 3)] = syms[s].st_value;
-            } else if (sname.size() > 9 && sname.compare(sname.size() - 9, 9, ".num_vgpr") == 0) {
-                vgprs[sname.substr(0, sname.size() - 9)] = static_cast<uint32_t>(syms[s].st_value);
-            } else if (sname.size() > 14 && sname.compare(sname.size() - 14, 14, ".numbered_sgpr") == 0) {
-                sgprs[sname.substr(0, sname.size() - 14)] = static_cast<uint32_t>(syms[s].st_value);
-            }
-        }
-    }
-
-    for (const auto& [kname, vaddr] : kd_vaddrs) {
-        const uint64_t off = vaddr - min_vaddr;
-        const auto* kd = reinterpret_cast<const KernelDescriptor*>(reinterpret_cast<const uint8_t*>(cbuf.host_ptr) + off);
-        LoadedKernel lk;
-        lk.name = kname;
-        lk.kd_gpu_va = cbuf.va + off;
-        lk.group_segment_fixed_size   = kd->group_segment_fixed_size;
-        lk.private_segment_fixed_size = kd->private_segment_fixed_size;
-        lk.kernarg_size               = kd->kernarg_size;
-        lk.vgpr_count                 = vgprs.count(kname) ? vgprs[kname] : 0;
-        lk.sgpr_count                 = sgprs.count(kname) ? sgprs[kname] : 0;
-        if (mp_meta.count(kname) && mp_meta[kname].valid) {
-            const auto& km = mp_meta[kname];
-            if (km.vgpr_count > 0u) lk.vgpr_count = km.vgpr_count;
-            if (km.sgpr_count > 0u) lk.sgpr_count = km.sgpr_count;
-            lk.group_segment_fixed_size   = km.group_seg;
-            lk.private_segment_fixed_size = std::max(lk.private_segment_fixed_size, km.priv_seg);
-            if (km.wavefront > 0u) lk.wavefront_size = km.wavefront;
-            if (km.max_wg > 0u) lk.max_flat_workgroup_size = km.max_wg;
-            lk.from_msgpack_note = true;
-        }
-        // HARD RUNTIME GATE (same table as the build gate): 0 B spill, VGPR class limit, code < 24576 B.
-        {
-            std::string why;
-            const auto fs = fn_sizes.find(kname);
-            const gate::GateResult gr = (fs == fn_sizes.end())
-                ? (why = "kernel '" + kname + "': no function symbol (cannot check code size)", gate::GateResult::Fail)
-                : (lk.vgpr_count == 0u)
-                ? (why = "kernel '" + kname + "': no vgpr_count metadata (cannot check occupancy)", gate::GateResult::Fail)
-                : gate::evaluate(gate::find_entry(kname), kname, lk.vgpr_count, lk.private_segment_fixed_size, fs->second, &why);
-            if (gr == gate::GateResult::Fail) {
-                if (err) *err = "FATAL: code-object gate: " + why + " in " + hsaco_path;
-                free_buffer(cbuf);
-                return false;
-            }
-        }
-        const uint32_t vgpr_alloc = static_cast<uint32_t>(align_up(std::max<uint32_t>(4u, lk.vgpr_count), 4ULL));
-        const uint32_t sgpr_alloc = static_cast<uint32_t>(align_up(std::max<uint32_t>(16u, lk.sgpr_count + 6u), 16ULL));
-        lk.resident_waves_per_simd = std::min<uint32_t>(10u, std::min<uint32_t>(256u / vgpr_alloc, 800u / sgpr_alloc));
-        out_kernels[kname] = lk;
-    }
-
-    if (kd_vaddrs.empty()) {
-        if (err) *err = "No .kd kernel descriptors found in " + hsaco_path;
-        free_buffer(cbuf);
-        return false;
-    }
+    for (const auto& seg : plan.segments)
+        std::memcpy(static_cast<uint8_t*>(cbuf.host_ptr) + seg.image_offset,
+                    elf.data() + seg.file_offset, seg.file_bytes);
+    for (auto& entry : plan.kernels) entry.second.kd_gpu_va += cbuf.va;
+    out_kernels = std::move(plan.kernels);
     out_buf = cbuf;
     return true;
 }
@@ -1427,12 +1367,30 @@ bool Runtime::enqueue_kernel(size_t gpu_idx, const LoadedKernel& kernel,
         dprintf(dlog_fd_, "E rank=%zu seq=%llu kernel=%s grid=%ux%ux%u block=%ux%ux%u kernarg=%zu barrier=%d\n", gpu_idx,
                 static_cast<unsigned long long>(++dlog_seq_), kernel.name.c_str(), grid_x, grid_y, grid_z, block_x, block_y, block_z,
                 kernarg_bytes, barrier ? 1 : 0);
+    if (!open_ || gpu_idx >= queues_.size()) return false;
     auto& q = queues_[gpu_idx];
+    if (q.submission_in_flight) {
+        std::fprintf(stderr, "[vegajet::kfd] enqueue GPU %zu rejected: wait for outstanding batch first\n", gpu_idx);
+        return false;
+    }
+    if (kernarg_bytes > 256 || (kernarg_bytes && !kernargs)) {
+        std::fprintf(stderr, "[vegajet::kfd] invalid kernargs GPU %zu (bytes=%zu)\n", gpu_idx, kernarg_bytes);
+        return false;
+    }
     const size_t hidden_off = align_up(kernarg_bytes, 8ULL);
     const size_t total_ka   = std::max<size_t>(hidden_off + 256, kernel.kernarg_size);
-    if (total_ka > 512) return false;
-
-    const uint32_t kslot = (q.kernarg_slot++) & 2047u;
+    if (total_ka > 512 || !q.kernarg_host || q.kernarg_slot >= q.kernarg_capacity / 512) {
+        std::fprintf(stderr, "[vegajet::kfd] kernarg capacity exhausted GPU %zu; submit and wait before reuse\n", gpu_idx);
+        return false;
+    }
+    // Reserve AQL space before touching either live kernargs or the allocation cursor.
+    if (!aql_wait_space(q, 2u, 5000000ULL)) {
+        std::fprintf(stderr, "[vegajet::kfd] AQL space timeout GPU %zu; runtime stopped\n", gpu_idx);
+        failed_ = true;
+        open_ = false;
+        return false;
+    }
+    const uint32_t kslot = q.kernarg_slot++;
     uint8_t* ka_dst_host = reinterpret_cast<uint8_t*>(q.kernarg_host) + static_cast<size_t>(kslot) * 512ULL;
     const uint64_t ka_dst_va = q.kernarg_va + static_cast<uint64_t>(kslot) * 512ULL;
 
@@ -1458,8 +1416,6 @@ bool Runtime::enqueue_kernel(size_t gpu_idx, const LoadedKernel& kernel,
     imp.remainder_z   = (block_z > 0) ? static_cast<uint16_t>(grid_z % block_z) : 0u;
     imp.grid_dims     = 3u;
     std::memcpy(ka_dst_host + hidden_off, &imp, sizeof(imp));
-
-    if (!aql_wait_space(q, 2u, 5000000ULL)) return false;
 
     const uint64_t idx  = q.next_write_idx++;
     const uint32_t slot = static_cast<uint32_t>(idx % q.ring_packets);
@@ -1487,9 +1443,20 @@ bool Runtime::enqueue_kernel(size_t gpu_idx, const LoadedKernel& kernel,
 }
 
 bool Runtime::submit_batch(size_t gpu_idx) {
+    if (!open_ || gpu_idx >= queues_.size()) return false;
     auto& q = queues_[gpu_idx];
+    if (q.submission_in_flight) {
+        std::fprintf(stderr, "[vegajet::kfd] submit GPU %zu rejected: completion signal still owned by outstanding batch\n", gpu_idx);
+        return false;
+    }
+    if (q.next_write_idx == q.completed_write_idx) return true;
     if (dlog_fd_ >= 0) dprintf(dlog_fd_, "S rank=%zu upto_seq=%llu\n", gpu_idx, static_cast<unsigned long long>(dlog_seq_));
-    if (!aql_wait_space(q, 1u, 5000000ULL)) return false;
+    if (!aql_wait_space(q, 1u, 5000000ULL)) {
+        std::fprintf(stderr, "[vegajet::kfd] AQL fence space timeout GPU %zu; runtime stopped\n", gpu_idx);
+        failed_ = true;
+        open_ = false;
+        return false;
+    }
     __atomic_store_n(&q.completion_sig->value, 1LL, __ATOMIC_RELEASE);
 
     const uint64_t idx  = q.next_write_idx++;
@@ -1504,12 +1471,14 @@ bool Runtime::submit_batch(size_t gpu_idx) {
     const uint16_t hdr = make_aql_header(kPacketTypeBarrierAnd, true, kFenceScopeSystem, kFenceScopeSystem);
     __atomic_store_n(&raw16[0], hdr, __ATOMIC_RELEASE);
 
+    q.submission_in_flight = true;
     __atomic_store_n(q.write_ptr, q.next_write_idx, __ATOMIC_RELEASE);
     __atomic_store_n(q.doorbell, idx, __ATOMIC_RELEASE);
     return true;
 }
 
 void Runtime::ring_doorbell(size_t gpu_idx) {
+    if (!open_ || gpu_idx >= queues_.size()) return;
     auto& q = queues_[gpu_idx];
     if (q.next_write_idx == 0) return;
     __atomic_store_n(q.write_ptr, q.next_write_idx, __ATOMIC_RELEASE);
@@ -1527,10 +1496,21 @@ bool Runtime::dispatch_async(size_t gpu_idx, const LoadedKernel& kernel,
 }
 
 bool Runtime::wait_idle(size_t gpu_idx, uint64_t timeout_us) {
+    if (!open_ || gpu_idx >= queues_.size()) return false;
     auto& q = queues_[gpu_idx];
+    // Pending/rung packets without a completion barrier must be fenced before zero means idle.
+    if (!q.submission_in_flight && q.next_write_idx != q.completed_write_idx && !submit_batch(gpu_idx)) return false;
     auto t0 = std::chrono::steady_clock::now();
     uint32_t spins = 0;
-    while (__atomic_load_n(&q.completion_sig->value, __ATOMIC_ACQUIRE) > 0) {
+    int64_t value;
+    while ((value = __atomic_load_n(&q.completion_sig->value, __ATOMIC_ACQUIRE)) != 0) {
+        if (value < 0) {
+            std::fprintf(stderr, "[vegajet::kfd] completion underflow GPU %zu (sig=%lld); runtime stopped\n",
+                         gpu_idx, static_cast<long long>(value));
+            failed_ = true;
+            open_ = false;
+            return false;
+        }
         if ((++spins & 1023u) == 0u) {
             const auto el = std::chrono::duration_cast<std::chrono::microseconds>(
                                 std::chrono::steady_clock::now() - t0).count();
@@ -1539,6 +1519,8 @@ bool Runtime::wait_idle(size_t gpu_idx, uint64_t timeout_us) {
                              gpu_idx, static_cast<long long>(q.completion_sig->value),
                              static_cast<unsigned long long>(*q.read_ptr),
                              static_cast<unsigned long long>(*q.write_ptr));
+                failed_ = true;
+                open_ = false;
                 return false;
             }
         }
@@ -1548,6 +1530,9 @@ bool Runtime::wait_idle(size_t gpu_idx, uint64_t timeout_us) {
         std::this_thread::yield();
 #endif
     }
+    q.submission_in_flight = false;
+    q.completed_write_idx = q.next_write_idx;
+    q.kernarg_slot = 0;  // only a completed system fence retires kernarg ownership
     if (dlog_fd_ >= 0) dprintf(dlog_fd_, "C rank=%zu upto_seq=%llu\n", gpu_idx, static_cast<unsigned long long>(dlog_seq_));
     return true;
 }

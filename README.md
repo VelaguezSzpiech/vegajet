@@ -46,7 +46,7 @@ tar -xzf vegajet-0.1.0-alpha.1-linux-x86_64.tar.gz && ./vegajet-0.1.0-alpha.1-li
 "$HOME/.local/bin/vegajet" serve "/path/to/your/Ornith-model" --tp 2 --port 8080
 ```
 
-Replace the quoted model path with your compatible local Ornith GGUF; the bundle does not include weights. For an OpenAI-compatible client, use `http://127.0.0.1:8080/v1` and the local API key `vegajet-local`. For an Anthropic-compatible client, use `http://127.0.0.1:8080`. Set the model in either client to the ID printed at startup (`Ornith-122B-AD-D4` in the qualified run).
+Replace the quoted model path with your compatible local Ornith GGUF; the bundle does not include weights. For an OpenAI-compatible client, use `http://127.0.0.1:8080/v1`. No API key is required by default (the server binds to 127.0.0.1); pass `--api-key` or set `VEGAJET_API_KEY` to require one, and the startup banner then says so. For an Anthropic-compatible client, use `http://127.0.0.1:8080`. Set the model in either client to the ID printed at startup (`Ornith-122B-AD-D4` in the qualified run).
 
 For CPU-only evaluation without gfx906 hardware, replace the second command with
 `"$HOME/.local/bin/vegajet" serve --mock --port 8080` (or run `"$HOME/.local/bin/stream-test"`).
@@ -64,8 +64,10 @@ harnesses (OpenAI SDK, Anthropic SDK, `curl`, `vegajet chat`, `vegajet top`):
 
 ```text
 [vegajet] OpenAI server listening on http://127.0.0.1:8080 (model=<model-id>, engine=..., slots=1, gpus=all)
-[vegajet]   OpenAI API:    BASE_URL=http://127.0.0.1:8080/v1  MODEL=<model-id>  API_KEY=vegajet-local
+[vegajet]   OpenAI API:    BASE_URL=http://127.0.0.1:8080/v1  MODEL=<model-id>
 [vegajet]   Anthropic API: ANTHROPIC_BASE_URL=http://127.0.0.1:8080  MODEL=<model-id>
+[vegajet]   Auth:          none (no key required; local bind only)
+[vegajet]   CORS:          disabled
 [vegajet]   Endpoints:     GET /health  GET /v1/models  POST /v1/chat/completions  POST /v1/messages  GET /metrics
 ```
 

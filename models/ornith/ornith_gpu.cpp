@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+#include "models/ornith/expert_tensor_checks.hpp"
 #include "core/bpe_tokenizer.hpp"
 #include "core/engine_factory.hpp"
 #include "core/engine_interface.hpp"
@@ -12,6 +13,8 @@
 #include "core/spec_policy.hpp"
 #include "core/spec_cascade.hpp"
 #include "core/suffix_trie.hpp"
+#include "core/v12_dispatch.hpp"
+#include "core/v12_modules.hpp"
 #include "core/evict_controller.hpp"
 #include "core/host_preflight.hpp"
 #include "core/moe_lru_cache.hpp"
@@ -20,6 +23,7 @@
 #include "models/ornith/ornith_gpu.hpp"
 
 #include "core/spec_engine.hpp"
+#include "core/spec_tree.hpp"
 
 #include <condition_variable>
 #include <deque>
@@ -32,6 +36,7 @@
 #include <atomic>
 #include <algorithm>
 #include "core/vj_check.hpp"
+#include "core/vj_device_guard.hpp"
 #include "ops/kernels/vj_ornith_super_desc.hpp"
 #include <chrono>
 #include <cmath>
@@ -43,11 +48,20 @@
 
 namespace vegajet::ornith {
 
+// Host planning is ready; never silently run the chain as a tree verifier.
+static constexpr const char* kTreeVerifyUnavailable =
+    "VEGAJET_V12_TREE_VERIFY=1 unavailable: S3 host planning only; "
+    "GPU tree attention, GDN branching and KV commit are not integrated";
+
 #ifdef VEGAJET_CPU_ONLY
 
 OrnithBenchMetrics run_ornith_gpu(const std::string&, const std::string&, const OrnithGpuOptions&) {
     OrnithBenchMetrics m;
     m.ok = false;
+    if (spec::tree_verify_requested(std::getenv("VEGAJET_V12_TREE_VERIFY"))) {
+        m.error = kTreeVerifyUnavailable;
+        return m;
+    }
     m.error = "Ornith GPU execution requires VEGAJET_CPU_ONLY=OFF";
     return m;
 }
@@ -63,6 +77,30 @@ namespace {
 constexpr uint32_t kMaxSpecBatch   = 16;  // speculative verify M <= 16 (bounded by kGdnRingSlots - 1)
 constexpr uint32_t kGdnRingSlots   = 17;  // == VJ_GDN_RING_SLOTS in the kernels: verify batches of up to 16 tokens
 constexpr uint32_t kVocabBlocks    = 240;
+
+// v1.2 decode-kernel levers. Read once per process; every one of them defaults OFF, so the
+// default path is byte-identical to v1.1.
+bool v12_vocab_ilp() {
+    static const bool on = [] { const char* e = std::getenv("VEGAJET_V12_VOCAB_ILP"); return e != nullptr && e[0] == '1'; }();
+    return on;
+}
+bool v12_dense_persist() {
+    static const bool on = [] { const char* e = std::getenv("VEGAJET_V12_DENSE_PERSIST"); return e != nullptr && e[0] == '1'; }();
+    return on;
+}
+uint32_t v12_dense_wgs() {
+    static const uint32_t wgs = [] {
+        const char* e = std::getenv("VEGAJET_V12_DENSE_WGS");
+        const long v = (e != nullptr) ? std::atol(e) : 224L;
+        return static_cast<uint32_t>((v >= 96L && v <= 240L) ? v : 224L);
+    }();
+    return wgs;
+}
+// v1.2 D6: column-thread M=1 GDN ConvRec (no LDS partials between pred/o reductions). Default off.
+bool v12_gdn_splitv() {
+    static const bool on = [] { const char* e = std::getenv("VEGAJET_V12_GDN_SPLITV"); return e != nullptr && e[0] == '1'; }();
+    return on;
+}
 
 struct Q8WeightDev {
     uint64_t qs_va = 0;
@@ -177,6 +215,7 @@ struct GpuStateDev {
     uint64_t moe_bar_va    = 0;
     uint64_t gdn_bar_va    = 0;
     uint64_t moe_bq_va     = 0;
+    uint64_t dense_q_va    = 0;   // v1.2 D13: dense GEMV tile counter / WG arrival pair
     uint64_t gdn_sq_va     = 0;
 
     uint64_t gdn_qkv_gab_va = 0;
@@ -216,6 +255,7 @@ struct GpuStateDev {
     std::vector<uint64_t> gdn_ssm_ring_va;
     uint64_t spec_gdn_s_slot_va[2] = {0, 0}; // --spec-gdn: 2 contiguous [36][32][128][128] FP32 slots
     uint64_t spec_gdn_o_va         = 0;      // [12][32][128] FP32
+    uint64_t spec_nq_bar_va        = 0;      // v1.2 S5: 64 u32 grid barrier for the fused verify+nq launch
     uint64_t spec_gdn_rec_kv_va    = 0;      // [36][12][40*128] FP32
     uint64_t spec_gdn_rec_dec_va   = 0;      // [36][12][32] FP32
     uint64_t spec_gdn_rec_beta_va  = 0;      // [36][12][32] FP32
@@ -252,6 +292,7 @@ struct KernelTable {
     const kfd::LoadedKernel* moe_mid_f32_to_q8 = nullptr;
     const kfd::LoadedKernel* moe_down_d8_sh = nullptr;
     const kfd::LoadedKernel* gemv_q4_w32 = nullptr;
+    const kfd::LoadedKernel* gemv_q4_w32p = nullptr; // v1.2 D13: persistent work-stealing grid variant
     const kfd::LoadedKernel* gemv_q4_w64 = nullptr;
     const kfd::LoadedKernel* gemv_q4_splitk_p1 = nullptr;
     const kfd::LoadedKernel* splitk_red_pp = nullptr;
@@ -260,10 +301,12 @@ struct KernelTable {
     const kfd::LoadedKernel* gemm_q4_m8  = nullptr;
     const kfd::LoadedKernel* gemm_q4_m12 = nullptr;
     const kfd::LoadedKernel* gemm_q4_m16 = nullptr;
+    const kfd::LoadedKernel* gemv_q4_mn  = nullptr;   // v1.2 S4: narrow M=2..16 verify GEMV
     const kfd::LoadedKernel* gdn_conv_l2 = nullptr;
     const kfd::LoadedKernel* gdn_recur = nullptr;
     const kfd::LoadedKernel* gdn_recur_sv = nullptr;
     const kfd::LoadedKernel* gdn_conv_recur_sv = nullptr;
+    const kfd::LoadedKernel* gdn_conv_recur_ct = nullptr; // v1.2 D6 column-thread variant (VEGAJET_V12_GDN_SPLITV)
     const kfd::LoadedKernel* gdn_wy = nullptr;
     const kfd::LoadedKernel* attn_prep = nullptr;
     const kfd::LoadedKernel* attn_flash = nullptr;
@@ -280,6 +323,7 @@ struct KernelTable {
     const kfd::LoadedKernel* moe_down_d8_pp = nullptr;
     const kfd::LoadedKernel* spec_gdn_ver = nullptr;
     const kfd::LoadedKernel* spec_gdn_nq = nullptr;
+    const kfd::LoadedKernel* spec_gdn_ver_nq = nullptr;  // v1.2 S5: verify + norm/quant in one launch
     const kfd::LoadedKernel* spec_flash_part = nullptr;
     const kfd::LoadedKernel* spec_flash_merge = nullptr;
     const kfd::LoadedKernel* flash_skv_p1 = nullptr;
@@ -313,6 +357,7 @@ struct KernelTable {
     const kfd::LoadedKernel* moe_gu_iq2s_grp = nullptr;
     const kfd::LoadedKernel* moe_down_iq3_grp = nullptr;
     const kfd::LoadedKernel* vocab_m1 = nullptr;
+    const kfd::LoadedKernel* vocab_ilp = nullptr;  // v1.2 D3: 2-way ILP accumulator variant
     const kfd::LoadedKernel* vocab_argmax = nullptr;
     const kfd::LoadedKernel* vocab_argmax_b6 = nullptr;
     const kfd::LoadedKernel* vocab_argmax_b12 = nullptr;
@@ -320,6 +365,9 @@ struct KernelTable {
     const kfd::LoadedKernel* p2p_ar_moe_m1_front = nullptr;
     const kfd::LoadedKernel* p2p_ar_moe_m1_front_s240 = nullptr;
     const kfd::LoadedKernel* moe_m1_back_s224 = nullptr;
+    const kfd::LoadedKernel* moe_m1_back_asym = nullptr;
+    const kfd::LoadedKernel* moe_down_asym = nullptr;
+    const kfd::LoadedKernel* moe_down_asym_q4 = nullptr;
     const kfd::LoadedKernel* moe_m1_back_s240 = nullptr;
     const kfd::LoadedKernel* mtp_eh_cat = nullptr;
     const kfd::LoadedKernel* moe_gu_q4a8 = nullptr;
@@ -765,6 +813,12 @@ bool write_vram_bin(kfd::Runtime& rt, size_t gpu_idx, uint64_t va, uint64_t byte
     return true;
 }
 
+// v1.2 serving levers (read once per run): serve-side speculative decode.
+static bool v12_serve_spec() {
+    const char* v = std::getenv("VEGAJET_V12_SERVE_SPEC");
+    return v != nullptr && v[0] == '1';
+}
+
 } // namespace
 
 OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
@@ -773,6 +827,10 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
     OrnithGpuOptions opt = opt_in;
     const OrnithGpuOptions base_opt = opt_in;
     OrnithBenchMetrics res{};
+    if (spec::tree_verify_requested(std::getenv("VEGAJET_V12_TREE_VERIFY"))) {
+        res.error = kTreeVerifyUnavailable;
+        return res;
+    }
     auto t_load0 = std::chrono::steady_clock::now();
     {   // Alpha portability: 2 x 32 GB gfx906 only. Say so before planning, tokenizing or reserving any arena.
         const auto budget = preflight::check_arena(preflight::gfx906_vram_bytes("/"), preflight::kOrnithArenaGiB,
@@ -805,17 +863,41 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
     const LoadReport lrep = planner.load(f, lopt);
     if (!lrep.ok) { res.error = lrep.error; return res; }
     const auto& hp = planner.hparams();
+    const char* asym_env = std::getenv("VEGAJET_V12_ASYM_EXPERTS");
+    const bool asym_experts = asym_env && std::strcmp(asym_env, "1") == 0;
+    const bool v12_batch_catchup = (std::getenv("VEGAJET_V12_BATCH_CATCHUP") != nullptr &&
+                                    std::getenv("VEGAJET_V12_BATCH_CATCHUP")[0] == '1');
+    if (!dispatch::mtp_batch_layout_supported(asym_experts, v12_batch_catchup)) {
+        res.error = "VEGAJET_V12_ASYM_EXPERTS=1 cannot be combined with VEGAJET_V12_BATCH_CATCHUP=1: "
+                    "batched MTP requires symmetric 512-column experts; disable either toggle";
+        return res;
+    }
+
+    // Validate metadata before mapping expert payloads or initializing GPU arenas.
+    const char* raw_env = std::getenv("VEGAJET_RAW_ONLY");
+    const bool load_mtp_experts = !(raw_env && raw_env[0] == '1') &&
+                                  f.tensor("blk.48.nextn.eh_proj.weight") != nullptr;
+    for (uint32_t il = 0; il < (load_mtp_experts ? 49u : 48u); ++il) {
+        const std::string prefix = "blk." + std::to_string(il) + ".";
+        for (const char* suffix : {"ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"}) {
+            const std::string name = prefix + suffix;
+            if (!validate_expert_tensor(f.tensor(name), name, hp.n_embd, hp.n_ff_exp, hp.n_expert,
+                                        std::strcmp(suffix, "ffn_down_exps.weight") == 0, il < 48u, &res.error))
+                return res;
+        }
+    }
 
     kfd::Runtime rt;
-    if (!rt.init(30.5, 64, &res.error) && !rt.init(30.0, 64, &res.error)) return res;
-    if (rt.num_gpus() < 2) { res.error = "Ornith-122B GPU runner requires 2x MI50 GPUs"; return res; }
+    if (!rt.init(30.5, 64, &res.error, 2) && !rt.init(30.0, 64, &res.error, 2)) return res;
+    if (rt.num_gpus() != 2) { res.error = "Ornith-122B GPU runner requires exactly 2 selected MI50 GPUs"; return res; }
     // Resolve per-GPU calibrated HBM2 ceiling from hw_profile.json (matched by PCI BDF when available).
     double gpu_bw_ceiling_gbs[kfd::kMaxGpus] = {};
     double calibrated_hbm2_ceiling_gbs = 0.0;
     for (size_t g = 0; g < rt.num_gpus() && g < kfd::kMaxGpus; ++g) {
         const uint32_t loc = rt.devices()[g].location_id;
         char bdf_buf[32];
-        std::snprintf(bdf_buf, sizeof(bdf_buf), "0000:%02x:%02x.%u", (loc >> 8) & 0xFFu, (loc >> 3) & 0x1Fu, loc & 7u);
+        std::snprintf(bdf_buf, sizeof(bdf_buf), "%04x:%02x:%02x.%u", rt.devices()[g].pci_domain,
+                      (loc >> 8) & 0xFFu, (loc >> 3) & 0x1Fu, loc & 7u);
         double bw = (g < lopt.gpus.size()) ? lopt.gpus[g].bw_hbm_gbs : 800.0;
         if (have_hw_prof) {
             for (const auto& hg : hw_prof.gpus) {
@@ -825,6 +907,15 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         gpu_bw_ceiling_gbs[g] = bw;
         calibrated_hbm2_ceiling_gbs += bw;
     }
+    // Resolve the requested variant before loading any experimental artifact.
+    const char* vol = std::getenv("VEGAJET_V12_BARRIER_VOL");
+    const char* iq2s = std::getenv("VEGAJET_V12_IQ2S_REG");
+    const auto variant = select_super_variant(vol && vol[0] == '1', iq2s && iq2s[0] == '1');
+    if (!variant.valid) {
+        res.error = "VEGAJET_V12_BARRIER_VOL and VEGAJET_V12_IQ2S_REG are mutually exclusive";
+        return res;
+    }
+    const std::string super_sfx = variant.suffix;
     const std::string hdir = kfd::resolve_hsaco_dir(opt.hsaco_dir);
     if (!rt.load_hsaco_dir(hdir, &res.error)) return res;
 
@@ -846,6 +937,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             K[g].p2p_ar_prepush = need_k("ornith_p2p_ar_res_rms_quant_prepush_kernel");
             K[g].p2p_ar_i8      = need_k("ornith_p2p_ar_i8_res_rms_quant_kernel");
             K[g].gemv_q4_w32  = need_k("ornith_gemv_q4a8_m1_w32_kernel");
+            K[g].gemv_q4_w32p = v12_dense_persist() ? rt.get_kernel(g, "ornith_gemv_q4a8_m1_w32_persist_kernel") : nullptr;
             K[g].gemv_q4_w64  = need_k("vj_gemv_q4a8_w64_kernel");
             K[g].gemv_q4_splitk_p1 = need_k("vj_gemv_q4a8_splitk_p1_kernel");
             K[g].splitk_red_pp = need_k("vj_splitk_reduce_prepush_f32_kernel");
@@ -854,10 +946,14 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             K[g].gemm_q4_m8   = need_k("ornith_gemm_q4a8_m8_kernel");
             K[g].gemm_q4_m12  = need_k("ornith_gemm_q4a8_m12_kernel");
             K[g].gemm_q4_m16  = need_k("ornith_gemm_q4a8_m16_l2_kernel");
+            K[g].gemv_q4_mn   = rt.get_kernel(g, "ornith_gemv_q4a8_mn_kernel");  // v1.2 S4 (optional)
             K[g].gdn_conv_l2  = need_k("ornith_gdn_conv_l2_gate_kernel");
             K[g].gdn_recur    = need_k("ornith_gdn_recur_quant_kernel");
             K[g].gdn_recur_sv = need_k("ornith_gdn_recur_splitv_quant_kernel");
             K[g].gdn_conv_recur_sv = need_k("ornith_gdn_conv_recur_splitv_quant_m1_kernel");
+            if (v12_gdn_splitv()) {
+                K[g].gdn_conv_recur_ct = need_k("ornith_gdn_conv_recur_colthread_quant_m1_kernel");
+            }
             K[g].gdn_wy       = need_k("ornith_gdn_wy_prefill_quant_kernel");
             K[g].attn_prep    = need_k("ornith_attn_qkv_prep_kernel");
             K[g].attn_flash   = need_k("ornith_attn_flash_quant_kernel");
@@ -874,6 +970,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             K[g].moe_down_d8_pp   = need_k("vj_moe_down_dot8_prepush_kernel");
             K[g].spec_gdn_ver = opt.spec_gdn ? need_k("vj_spec_gdn_verify_kernel") : rt.get_kernel(g, "vj_spec_gdn_verify_kernel");
             K[g].spec_gdn_nq  = opt.spec_gdn ? need_k("vj_spec_gdn_norm_quant_kernel") : rt.get_kernel(g, "vj_spec_gdn_norm_quant_kernel");
+            K[g].spec_gdn_ver_nq = rt.get_kernel(g, "vj_spec_gdn_verify_fused_nq_kernel");  // v1.2 S5 (optional)
             K[g].flash_skv_p1 = need_k("vj_flash_splitkv_any_partial_kernel");
             K[g].flash_skv_p2 = need_k("vj_flash_splitkv_any_merge_quant_kernel");
             K[g].spec_flash_part  = opt.spec_flash ? need_k("vj_spec_flash_partial_kernel") : rt.get_kernel(g, "vj_spec_flash_partial_kernel");
@@ -928,12 +1025,21 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             K[g].vocab_argmax     = need_k("ornith_vocab_argmax_q8_kernel");
             K[g].vocab_m1 = (hp.n_embd == 3072u)
                 ? rt.get_kernel(g, "ornith_vocab_argmax_q8_mubuf_kernel") : nullptr;
+            K[g].vocab_ilp = v12_vocab_ilp() ? rt.get_kernel(g, "ornith_vocab_argmax_q8_ilp_kernel") : nullptr;
             K[g].vocab_argmax_b6  = need_k("ornith_vocab_argmax_q8_batch6_kernel");
             K[g].vocab_argmax_b12 = need_k("ornith_vocab_argmax_q8_batch12_l2_kernel");
-            K[g].m1_gdn_super     = rt.get_kernel(g, "ornith_m1_gdn_super_kernel");
-            K[g].m1_gqa_super     = rt.get_kernel(g, "ornith_m1_gqa_super_kernel");
-            K[g].m1_moe_super     = rt.get_kernel(g, "ornith_m1_moe_super_kernel");
-            K[g].m1_moe_super_q3  = rt.get_kernel(g, "ornith_m1_moe_super_q3_kernel");
+            K[g].m1_gdn_super     = rt.get_kernel(g, "ornith_m1_gdn_super_kernel" + super_sfx);
+            K[g].m1_gqa_super     = rt.get_kernel(g, "ornith_m1_gqa_super_kernel" + super_sfx);
+            K[g].m1_moe_super     = rt.get_kernel(g, "ornith_m1_moe_super_kernel" + super_sfx);
+            K[g].m1_moe_super_q3  = rt.get_kernel(g, "ornith_m1_moe_super_q3_kernel" + super_sfx);
+            if (!super_sfx.empty() && (!K[g].m1_gdn_super || !K[g].m1_gqa_super ||
+                                       !K[g].m1_moe_super || !K[g].m1_moe_super_q3)) {
+                // Fail closed: a requested variant that is not on disk would otherwise fall through
+                // to the baseline kernels of a stale build and silently measure nothing.
+                if (kerr && kerr->empty()) *kerr = "super-kernel variant " + super_sfx +
+                    " requested but vj_ornith_super" + super_sfx + ".hsaco is missing from " + hdir;
+                return false;
+            }
             K[g].moe_gu_repack    = rt.get_kernel(g, "vj_repack_iq2s_to_dot8_gu_kernel");
             K[g].moe_gu_lru       = rt.get_kernel(g, "vj_moe_gu_dot8_lru_kernel");
             K[g].vocab_argmax_b16 = need_k("ornith_vocab_argmax_q8_batch16_l2_kernel");
@@ -949,6 +1055,11 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             K[g].mtp_eh_cat   = need_k("ornith_mtp_eh_norm_cat_q8_kernel");
             K[g].moe_gu_q4a8  = need_k("ornith_moe_gu_q4a8_kernel");
             K[g].moe_down_q4a8= need_k("ornith_moe_down_q4a8_kernel");
+            if (asym_experts) {
+                K[g].moe_m1_back_asym = need_k("vj_moe_m1_back_asym_s224_kernel");
+                K[g].moe_down_asym = need_k("vj_moe_down_asym_kernel");
+                K[g].moe_down_asym_q4 = need_k("vj_moe_down_asym_q4a8_kernel");
+            }
             K[g].memcpy_u32   = need_k("kfd_memcpy_u32");
             K[g].memset_u32   = need_k("kfd_memset_u32");
             if (!opt.draft_gguf.empty() && planner.draft_hparams().is_dflash2()) {
@@ -990,7 +1101,20 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                                    static_cast<uint32_t>(voc_ranges[1].size()) };
     const uint32_t voc_off[2]  = { static_cast<uint32_t>(voc_ranges[0].begin),
                                    static_cast<uint32_t>(voc_ranges[1].begin) };
-    const uint32_t local_ff = hp.n_ff_exp / 2u; // 512 (kept symmetric where fused M=1 s224/Down kernels require equal local_ff)
+    const auto ff_ranges = shard::split_expert_intermediate(hp.n_ff_exp, bw_vec, asym_experts);
+    if (ff_ranges.size() != 2u || (asym_experts && hp.n_ff_exp != 1024u)) {
+        res.error = "asymmetric experts require two nonempty 32-row shards of n_ff_exp=1024"; return res;
+    }
+    if (asym_experts && (opt.dot8_ab || !opt.dump_golden_layers_dir.empty())) {
+        res.error = "asymmetric experts do not support legacy 512-only --dot8-ab / --dump-golden-layers; use --dump-logits";
+        return res;
+    }
+    const uint32_t ff_size[2] = {static_cast<uint32_t>(ff_ranges[0].size()), static_cast<uint32_t>(ff_ranges[1].size())};
+    const uint32_t ff_begin[2] = {0u, static_cast<uint32_t>(ff_ranges[1].begin)};
+    // Capacity planning uses the larger shard; launches use the rank's width.
+    const uint32_t local_ff = std::max(ff_size[0], ff_size[1]);
+    if (asym_experts) std::printf("[ornith::asym] expert FF=%u/%u (BW %.1f/%.1f GB/s, row unit=32)\n",
+                                  ff_size[0], ff_size[1], bw_vec[0], bw_vec[1]);
 
     const auto gdn_plan = shard::plan_gdn(hp.ssm_groups, hp.ssm_v_heads, bw_vec);
     const auto gqa_plan = shard::plan_attention(hp.n_head, hp.n_head_kv, bw_vec, false);
@@ -1137,7 +1261,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         target_gu_dot8_layers = static_cast<uint32_t>(std::max(0, std::atoi(gd_env)));
     }
     const bool no_auto_dot8 = (std::getenv("VEGAJET_NO_AUTO_DOT8") != nullptr && std::getenv("VEGAJET_NO_AUTO_DOT8")[0] == '1');
-    if (target_gu_dot8_layers == 0u && !no_auto_dot8 && local_ff == 512u && D == 3072u) {
+    if (target_gu_dot8_layers == 0u && !no_auto_dot8 && (asym_experts || local_ff == 512u) && D == 3072u) {
         const Dot8RowLayout gu_lay = dot8_gu_iq2s_layout(256ULL * local_ff, D);
         const uint64_t est_base_vram = raw_only_vram ? (24600ULL << 20) : (26400ULL << 20);
         const uint64_t headroom      = raw_only_vram ? (640ULL << 20)   : (1600ULL << 20);
@@ -1172,6 +1296,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         const bool is_gdn = hp.is_recurrent(il);
 
         for (size_t g = 0; g < 2; ++g) {
+            const uint32_t local_ff = ff_size[g];
             auto& lw = layers[g][il];
             lw.is_gdn = is_gdn;
             if (!upload_f32_rows(rt, g, f, p + "attn_norm.weight", nullptr, lw.attn_norm_va, &res.error)) return res;
@@ -1205,11 +1330,11 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             if (!upload_f32_as_f16(rt, g, f, p + "ffn_gate_inp.weight", lw.w_router_f16_va, &res.error)) return res;
             if (!upload_f32_rows(rt, g, f, p + "ffn_gate_inp_shexp.weight", nullptr, lw.w_sh_gate_va, &res.error)) return res;
             if (!upload_fused_q4a8_tcc(rt, g, f, {
-                    {p + "ffn_gate_shexp.weight", iota_range(static_cast<uint32_t>(g) * local_ff, local_ff)},
-                    {p + "ffn_up_shexp.weight",   iota_range(static_cast<uint32_t>(g) * local_ff, local_ff)}
+                    {p + "ffn_gate_shexp.weight", iota_range(ff_begin[g], local_ff)},
+                    {p + "ffn_up_shexp.weight",   iota_range(ff_begin[g], local_ff)}
                 }, 0, D, nullptr, lw.w_sh_gu, &res.error)) return res;
             if (!upload_fused_q4a8_tcc(rt, g, f, {{p + "ffn_down_shexp.weight", all_D_rows}},
-                                       static_cast<uint32_t>(g) * local_ff, local_ff, nullptr, lw.w_sh_down, &res.error)) return res;
+                                       ff_begin[g], local_ff, nullptr, lw.w_sh_down, &res.error)) return res;
         }
 
         // Pack Gate+Up IQ2_S into coalesced uint4 merged split-plane layout
@@ -1251,7 +1376,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
 
             const bool use_gu_q3 = (std::getenv("VEGAJET_GU_Q3") != nullptr && std::atoi(std::getenv("VEGAJET_GU_Q3")) > 0);
             bool promoted_in_place = false;
-            if (use_gu_q3 && local_ff == 512u && D == 3072u) {
+            if (use_gu_q3 && (asym_experts || local_ff == 512u) && D == 3072u) {
                 const Dot8RowLayout lay = q3_gu_iq2s_layout(n_rows_rank, D);
                 const uint64_t reserve_tail = raw_only_vram
                     ? (static_cast<uint64_t>(47u - il) * (540ULL << 20) + (512ULL << 20))
@@ -1259,13 +1384,15 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                        + (opt.spec_gdn ? 2048ULL : 2800ULL) * (1ULL << 20));
                 if (rt.vram_arena(0).used() + lay.vram_bytes() + reserve_tail <= arena_cap_bytes &&
                     rt.vram_arena(1).used() + lay.vram_bytes() + reserve_tail <= arena_cap_bytes) {
-                    const Dot8RowLayout lay_e = q3_gu_iq2s_layout(local_ff, D);
                     for (size_t g = 0; g < 2; ++g) {
+                        const uint32_t local_ff = ff_size[g];
+                        const auto lay = q3_gu_iq2s_layout(256ULL * local_ff, D);
+                        const auto lay_e = q3_gu_iq2s_layout(local_ff, D);
                         std::vector<uint8_t> wpl(lay.w_plane_bytes()), spl(lay.s_plane_bytes());
                         bool rok = true;
                         #pragma omp parallel for schedule(static) reduction(&&:rok)
                         for (size_t e = 0; e < 256u; ++e) {
-                            const size_t src_r0 = e * (2u * local_ff) + g * local_ff;
+                            const size_t src_r0 = shard::expert_row_index(e, hp.n_ff_exp, ff_begin[g], 0u);
                             std::string e_err;
                             rok = rok && q3_repack_gu_iq2s_rows(
                                 rg + src_r0 * raw_rb, ru + src_r0 * raw_rb, raw_rb, 0u, lay_e, 0u, local_ff,
@@ -1286,7 +1413,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                     promoted_in_place = true;
                 }
             }
-            if (!promoted_in_place && il < target_gu_dot8_layers && local_ff == 512u && D == 3072u) {
+            if (!promoted_in_place && il < target_gu_dot8_layers && (asym_experts || local_ff == 512u) && D == 3072u) {
                 const Dot8RowLayout lay = dot8_gu_iq2s_layout(n_rows_rank, D);
                 const uint64_t reserve_tail = raw_only_vram
                     ? (static_cast<uint64_t>(47u - il) * (505ULL << 20) + (768ULL << 20))
@@ -1296,13 +1423,15 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                 const uint64_t iq2s_extra = raw_only_vram ? 0ULL : (n_rows_rank * row_u4 * 16ULL);
                 if (rt.vram_arena(0).used() + lay.vram_bytes() + iq2s_extra + reserve_tail <= arena_cap_bytes &&
                     rt.vram_arena(1).used() + lay.vram_bytes() + iq2s_extra + reserve_tail <= arena_cap_bytes) {
-                    const Dot8RowLayout lay_e = dot8_gu_iq2s_layout(local_ff, D);
                     for (size_t g = 0; g < 2; ++g) {
+                        const uint32_t local_ff = ff_size[g];
+                        const auto lay = dot8_gu_iq2s_layout(256ULL * local_ff, D);
+                        const auto lay_e = dot8_gu_iq2s_layout(local_ff, D);
                         std::vector<uint8_t> wpl(lay.w_plane_bytes()), spl(lay.s_plane_bytes());
                         bool rok = true;
                         #pragma omp parallel for schedule(static) reduction(&&:rok)
                         for (size_t e = 0; e < 256u; ++e) {
-                            const size_t src_r0 = e * (2u * local_ff) + g * local_ff;
+                            const size_t src_r0 = shard::expert_row_index(e, hp.n_ff_exp, ff_begin[g], 0u);
                             std::string e_err;
                             rok = rok && dot8_repack_gu_iq2s_rows(
                                 rg + src_r0 * raw_rb, ru + src_r0 * raw_rb, raw_rb, 0u, lay_e, 0u, local_ff,
@@ -1328,7 +1457,23 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                     promoted_in_place = raw_only_vram;
                 }
             }
-            if (!promoted_in_place) {
+            if (!promoted_in_place && asym_experts) {
+                for (size_t g = 0; g < 2; ++g) {
+                    const uint32_t lff = ff_size[g];
+                    std::vector<uint32_t> packed(256ULL * lff * row_u4 * 4u);
+                    #pragma omp parallel for schedule(static)
+                    for (size_t e = 0; e < 256u; ++e) for (size_t r = 0; r < lff; ++r) {
+                        const size_t src_r = shard::expert_row_index(e, hp.n_ff_exp, ff_begin[g], r);
+                        pack_row(rg + src_r * raw_rb, ru + src_r * raw_rb,
+                                 packed.data() + (e * lff + r) * row_u4 * 4u);
+                    }
+                    const size_t bytes = packed.size() * 4u;
+                    auto& va = layers[g][il].w_gu_iq2s_va;
+                    va = rt.vram_arena(g).alloc(bytes, 4096, kfd::Tier::COLD);
+                    if (!va) { res.error = "VRAM OOM for routed Gate+Up"; return res; }
+                    VJ_CHECK(rt.upload_to_vram(g, va, packed.data(), bytes));
+                }
+            } else if (!promoted_in_place) {
                 std::vector<uint32_t> m0(n_rows_rank * row_u4 * 4u), m1(n_rows_rank * row_u4 * 4u);
                 #pragma omp parallel for schedule(static)
                 for (size_t e = 0; e < 256u; ++e) {
@@ -1360,15 +1505,19 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             // Routed Down is stored as the exact 16-level DOT8 repack (4.25 bpw read, register v_perm decode): it is
             // bit-identical to the compact IQ3_XXS layout on hardware and 1.16-1.65x faster at M = 1 / 5 / 128.
             {
-                const Dot8RowLayout lay = dot8_iq3_layout(n_rows, 512u);
                 for (size_t g = 0; g < 2; ++g) {
+                    const auto lay = asym_experts ? dot8_iq3_asym_layout(n_rows, ff_size[g])
+                                                  : dot8_iq3_layout(n_rows, 512u);
                     std::vector<uint8_t> wpl(lay.w_plane_bytes()), spl(lay.s_plane_bytes());
                     bool rok = true;
                     #pragma omp parallel for schedule(static) reduction(&&:rok)
                     for (size_t r0 = 0; r0 < n_rows; r0 += 4096u) {
                         std::string e;
-                        rok = rok && dot8_repack_iq3xxs_rows(rd, full_rb, static_cast<uint32_t>(2u * g), lay, r0,
-                                                             std::min<uint64_t>(n_rows, r0 + 4096u), wpl.data(), spl.data(), &e);
+                        rok = rok && (asym_experts
+                            ? dot8_repack_iq3xxs_asym_rows(rd, full_rb, ff_begin[g], lay, r0,
+                                  std::min<uint64_t>(n_rows, r0 + 4096u), wpl.data(), spl.data(), &e)
+                            : dot8_repack_iq3xxs_rows(rd, full_rb, static_cast<uint32_t>(2u * g), lay, r0,
+                                  std::min<uint64_t>(n_rows, r0 + 4096u), wpl.data(), spl.data(), &e));
                     }
                     if (!rok) { res.error = "DOT8 repack of ffn_down_exps failed"; return res; }
                     auto& lw = layers[g][il];
@@ -1436,13 +1585,15 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         const std::string p = "blk.48.";
         std::vector<uint32_t> gu_rows[2];
         for (size_t g = 0; g < 2; ++g) {
+            const uint32_t local_ff = ff_size[g];
             gu_rows[g].reserve(256u * local_ff);
             for (uint32_t e = 0; e < 256u; ++e)
                 for (uint32_t r = 0; r < local_ff; ++r)
-                    gu_rows[g].push_back(e * (2u * local_ff) + static_cast<uint32_t>(g) * local_ff + r);
+                    gu_rows[g].push_back(shard::expert_row_index(e, hp.n_ff_exp, ff_begin[g], r));
         }
         const auto all_exp_dn_rows = iota_range(0, 256u * D);
         for (size_t g = 0; g < 2; ++g) {
+            const uint32_t local_ff = ff_size[g];
             auto& ml = mtp[g];
             if (!upload_f32_rows(rt, g, f, p + "nextn.enorm.weight", nullptr, ml.enorm_va, &res.error)) return res;
             if (!upload_f32_rows(rt, g, f, p + "nextn.hnorm.weight", nullptr, ml.hnorm_va, &res.error)) return res;
@@ -1463,18 +1614,18 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             if (!upload_f32_as_f16(rt, g, f, p + "ffn_gate_inp.weight", ml.w_router_f16_va, &res.error)) return res;
             if (!upload_f32_rows(rt, g, f, p + "ffn_gate_inp_shexp.weight", nullptr, ml.w_sh_gate_va, &res.error)) return res;
             if (!upload_fused_q4a8_tcc(rt, g, f, {
-                    {p + "ffn_gate_shexp.weight", iota_range(static_cast<uint32_t>(g) * local_ff, local_ff)},
-                    {p + "ffn_up_shexp.weight",   iota_range(static_cast<uint32_t>(g) * local_ff, local_ff)}
+                    {p + "ffn_gate_shexp.weight", iota_range(ff_begin[g], local_ff)},
+                    {p + "ffn_up_shexp.weight",   iota_range(ff_begin[g], local_ff)}
                 }, 0, D, nullptr, ml.w_sh_gu, &res.error)) return res;
             if (!upload_fused_q4a8_tcc(rt, g, f, {{p + "ffn_down_shexp.weight", all_D_rows}},
-                                       static_cast<uint32_t>(g) * local_ff, local_ff, nullptr, ml.w_sh_down, &res.error)) return res;
+                                       ff_begin[g], local_ff, nullptr, ml.w_sh_down, &res.error)) return res;
             kfd::ArenaTierScope mtp_cold(rt.vram_arena(g), kfd::Tier::COLD);  // MTP routed experts: 8/256 read per draft
             if (!upload_fused_q4a8_tcc(rt, g, f, {{p + "ffn_gate_exps.weight", gu_rows[g]}},
                                        0, D, nullptr, ml.w_exp_gate, &res.error)) return res;
             if (!upload_fused_q4a8_tcc(rt, g, f, {{p + "ffn_up_exps.weight", gu_rows[g]}},
                                        0, D, nullptr, ml.w_exp_up, &res.error)) return res;
             if (!upload_fused_q4a8_tcc(rt, g, f, {{p + "ffn_down_exps.weight", all_exp_dn_rows}},
-                                       static_cast<uint32_t>(g) * local_ff, local_ff, nullptr, ml.w_exp_down, &res.error)) return res;
+                                       ff_begin[g], local_ff, nullptr, ml.w_exp_down, &res.error)) return res;
             ml.loaded = true;
         }
         for (const char* suf : {"nextn.enorm.weight", "nextn.hnorm.weight", "nextn.shared_head_norm.weight",
@@ -1671,6 +1822,15 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
     const uint64_t df_io_val_va1 = df_io_val_va0 + kDfTopkStride;          // +512 KiB
     const uint64_t df_io_id_va0  = df_io_val_va1 + kDfTopkStride;          // +768 KiB
     const uint64_t df_io_id_va1  = df_io_id_va0  + kDfTopkStride;          // +1024 KiB (ends at 2.25 MiB < 4 MiB)
+    // v1.2 C1: one 16 B device-fault slot per rank at 3.5 MiB (above the DFlash2 slices and lru_top at
+    // 3 MiB+48 KiB, below the 4 MiB end). Host-visible, zeroed by the allocator, rank stamped once.
+    constexpr uint64_t kFaultIoBase = 3670016ULL;
+    auto* io_fault_host = reinterpret_cast<uint32_t*>(io_host_u8 + kFaultIoBase);
+    const uint64_t io_fault_va[2] = {io_buf.va + kFaultIoBase,
+                                     io_buf.va + kFaultIoBase + guard::kFaultSlotBytes};
+    for (size_t g = 0; g < 2; ++g) {
+        io_fault_host[g * guard::kFaultWords + guard::kFaultWRank] = static_cast<uint32_t>(g);
+    }
     auto* df_io_gate_host = reinterpret_cast<float*>(io_host_u8 + kDfIoBase + 98304ULL);
     auto* df_io_val_host0 = reinterpret_cast<float*>(io_host_u8 + kDfIoBase + 262144ULL);
     auto* df_io_val_host1 = reinterpret_cast<float*>(io_host_u8 + kDfIoBase + 262144ULL + kDfTopkStride);
@@ -1700,6 +1860,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
     auto grp_item_cap = [](uint32_t M) { const uint32_t R = M * 8u, U = std::min(R, 256u); return std::min(R, (R + 63u * U + 63u) / 64u); };
     GpuStateDev S[2];
     for (size_t g = 0; g < 2; ++g) {
+        const uint32_t local_ff = ff_size[g];
         bool alloc_oom = false;
         auto alloc = [&](uint64_t b, uint64_t a = 256) {
             const uint64_t v = rt.vram_arena(g).alloc(b, a);
@@ -1717,6 +1878,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         S[g].moe_bar_va     = alloc(256u);
         S[g].gdn_bar_va     = alloc(8192u, 256);
         S[g].moe_bq_va      = alloc(256u);
+        S[g].dense_q_va     = alloc(256u);
         S[g].super_bar_va      = alloc(2048u, 256);
         S[g].gdn_super_desc_va = alloc(36ULL * sizeof(ornith_super::GdnSuperDesc), 256);
         S[g].gqa_super_desc_va = alloc(12ULL * sizeof(ornith_super::GqaSuperDesc), 256);
@@ -1793,6 +1955,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             S[g].spec_gdn_s_slot_va[0] = alloc(all_s_bytes, 4096);
             S[g].spec_gdn_s_slot_va[1] = alloc(all_s_bytes, 4096);
             S[g].spec_gdn_o_va         = alloc(16ULL * 32ULL * 128ULL * 4ULL, 4096);
+            S[g].spec_nq_bar_va        = alloc(256u, 256);
             S[g].spec_gdn_rec_kv_va    = alloc(36ULL * 16ULL * 40ULL * 128ULL * 4ULL, 4096);
             S[g].spec_gdn_rec_dec_va   = alloc(36ULL * 16ULL * 32ULL * 4ULL, 4096);
             S[g].spec_gdn_rec_beta_va  = alloc(36ULL * 16ULL * 32ULL * 4ULL, 4096);
@@ -1830,13 +1993,13 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
 
     // Wave 5 Dynamic LRU VJ_Q4_DOT8 MoE Gate+Up Cache (up to 44 slots/L in spare VRAM for M >= 4 verify!).
     uint32_t lru_slots = 0u;
-    Dot8RowLayout lru_lay{};
+    Dot8RowLayout lru_lay[2]{};
     uint64_t lru_w_va[2][48] = {}, lru_s_va[2][48] = {}, lru_e2s_va[2][48] = {};
     std::vector<std::array<int32_t, 256>> lru_e2s_host(48);
     std::unique_ptr<moecache::MoeLruCache> lru_cache;
     const uint64_t lru_top_va = io_buf.va + 3ULL * 1024ULL * 1024ULL;
     auto* lru_top_host = reinterpret_cast<int32_t*>(io_host_u8 + 3ULL * 1024ULL * 1024ULL);
-    if (local_ff == 512u && D == 3072u && K[0].moe_gu_repack && K[0].moe_gu_lru && layers[0][0].w_gu_d8_w_va == 0u) {
+    if ((asym_experts || local_ff == 512u) && D == 3072u && K[0].moe_gu_repack && K[0].moe_gu_lru && layers[0][0].w_gu_d8_w_va == 0u) {
         const char* lru_env = std::getenv("VEGAJET_MOE_LRU");
         uint32_t want_slots = lru_env ? static_cast<uint32_t>(std::max(0, std::atoi(lru_env))) : 0u;
         if (want_slots == 0u && !lru_env && (!opt.sweep_spec.empty() || opt.interactive)) {
@@ -1857,15 +2020,15 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             if (min_free > reserve_b + 8ULL * per_slot_all_layers) {
                 const uint32_t max_fit = static_cast<uint32_t>((min_free - reserve_b) / per_slot_all_layers);
                 lru_slots = std::min<uint32_t>(want_slots, max_fit);
-                lru_lay = dot8_gu_iq2s_layout(static_cast<uint64_t>(lru_slots) * local_ff, D);
+                for (size_t g = 0; g < 2; ++g) lru_lay[g] = dot8_gu_iq2s_layout(static_cast<uint64_t>(lru_slots) * ff_size[g], D);
                 std::vector<int32_t> neg_tab(256, -1);
                 for (uint32_t il = 0; il < 48u; ++il) lru_e2s_host[il].fill(-1);
                 bool ok_lru = true;
                 for (size_t g = 0; g < 2 && ok_lru; ++g) {
                     for (uint32_t il = 0; il < 48u && ok_lru; ++il) {
-                        lru_w_va[g][il]   = rt.vram_arena(g).alloc(lru_lay.w_plane_bytes(), 4096, kfd::Tier::COLD);
-                        lru_s_va[g][il]   = lru_lay.scale_embedded ? (lru_w_va[g][il] + lru_lay.s_offset_bytes)
-                                                                   : rt.vram_arena(g).alloc(lru_lay.s_plane_bytes(), 256, kfd::Tier::COLD);
+                        lru_w_va[g][il]   = rt.vram_arena(g).alloc(lru_lay[g].w_plane_bytes(), 4096, kfd::Tier::COLD);
+                        lru_s_va[g][il]   = lru_lay[g].scale_embedded ? (lru_w_va[g][il] + lru_lay[g].s_offset_bytes)
+                                                                   : rt.vram_arena(g).alloc(lru_lay[g].s_plane_bytes(), 256, kfd::Tier::COLD);
                         lru_e2s_va[g][il] = rt.vram_arena(g).alloc(256u * 4u, 256);
                         if (!lru_w_va[g][il] || !lru_s_va[g][il] || !lru_e2s_va[g][il] ||
                             !rt.upload_to_vram(g, lru_e2s_va[g][il], neg_tab.data(), 256u * 4u)) {
@@ -1879,7 +2042,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                     ccfg.max_admits_per_step = 48u; ccfg.max_admits_per_layer_step = 1u; ccfg.admit_after_misses = 2u;
                     lru_cache = std::make_unique<moecache::MoeLruCache>(ccfg);
                     std::printf("  allocated Dynamic LRU MoE Gate+Up cache: %u slots/L (%.2f GiB/GPU)\n",
-                                lru_slots, (48.0 * lru_lay.vram_bytes()) / 1073741824.0);
+                                lru_slots, (48.0 * std::max(lru_lay[0].vram_bytes(), lru_lay[1].vram_bytes())) / 1073741824.0);
                 } else {
                     lru_slots = 0u;
                 }
@@ -1902,7 +2065,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                 res.load_sec, res.vram_gib_gpu0, res.vram_gib_gpu1,
                 (30.50 - res.vram_gib_gpu0) + (30.50 - res.vram_gib_gpu1));
 
-    uint32_t ar_epoch = 1u, ring_head = 0u, conv_head = 0u, spec_gdn_active = 0u, last_dispatches = 0, moe_sense = 0u, gdn_sense = 0u, moe_back_sense = 0u, super_sense = 0u;
+    uint32_t ar_epoch = 1u, ring_head = 0u, conv_head = 0u, spec_gdn_active = 0u, last_dispatches = 0, moe_sense = 0u, gdn_sense = 0u, moe_back_sense = 0u, super_sense = 0u, spec_nq_sense = 0u;
     // Stage profiler: when prof_stage != 0 the matching idempotent stage is enqueued prof_reps times per layer, so
     // (t(reps) - t(1)) / (reps - 1) is that stage's in-situ cost per token. Outputs are unchanged.
     uint32_t prof_stage = 0u, prof_reps = 1u;
@@ -1920,10 +2083,12 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             zero_buf(S[g].ar_bar_va, 256u);
             zero_buf(S[g].moe_bar_va, 256u);
             zero_buf(S[g].gdn_bar_va, 8192u);
+            if (S[g].spec_nq_bar_va) zero_buf(S[g].spec_nq_bar_va, 256u);
             zero_buf(S[g].super_bar_va, 2048u);
             if (S[g].pf_gdn_bar_va)  zero_buf(S[g].pf_gdn_bar_va, 256u);
             if (S[g].pf_gu_queue_va) zero_buf(S[g].pf_gu_queue_va, 256u);
             zero_buf(S[g].moe_bq_va, 256u);
+            zero_buf(S[g].dense_q_va, 256u);
             if (has_mtp) zero_buf(S[g].mtp_h_zero_va, D * 4u);
             for (uint32_t i = 0; i < 36u; ++i) {
                 zero_buf(S[g].gdn_conv_ring_va[i], kGdnRingSlots * 3ULL * 6144ULL * 4ULL);
@@ -1946,6 +2111,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
 
     // Populate and upload per-layer M=1 super-kernel descriptors once per GPU (~24 KiB/GPU).
     for (size_t g = 0; g < 2; ++g) {
+        const uint32_t local_ff = ff_size[g];
         const size_t peer = 1u - g;
         std::vector<ornith_super::GdnSuperDesc> gdn_d(36);
         std::vector<ornith_super::GqaSuperDesc> gqa_d(12);
@@ -2120,10 +2286,75 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         st_last = now;
     };
 
+    // v1.2 C1: fail-closed barrier / peer-mailbox faults. The super-kernels stop as soon as a spin budget runs
+    // out and leave a record in io_fault_host. Every step re-arms both slots and, once the queues have drained,
+    // any record becomes a sticky host error so no token can ever be produced from a wedged grid.
+    bool device_faulted = false;
+    uint64_t dense_persist_launches = 0;
+    guard::RunState run_state;
+    auto fail_run = [&](const std::string& message) -> void {
+        run_state.latch(message);
+        res.error = run_state.error();
+        rt.abort_dispatches();
+        throw guard::RunFailure(run_state.error());
+    };
+    auto require_token = [&](int32_t id, const char* where) {
+        run_state.check();
+        if (!guard::token_id_in_range(id, static_cast<uint32_t>(hp.vocab)))
+            fail_run(std::string(where) + ": token id " + std::to_string(id) + " is outside the vocabulary");
+    };
+    auto require_kv_span = [&](uint32_t pos, uint32_t rows) {
+        if (!dispatch::kv_span_fits(pos, rows, opt.max_ctx))
+            fail_run("KV position or batch exceeds configured context capacity");
+    };
+    auto require_split_scratch = [&](uint32_t rows, uint32_t heads, uint32_t chunks) {
+        if (!dispatch::split_scratch_fits(rows, heads, chunks, kMaxSpecBatch * 60u, 16u))
+            fail_run("split attention scratch capacity exceeded");
+    };
+    auto device_fault_check = [&](const char* where) -> bool {
+        for (size_t g = 0; g < 2; ++g) {
+            const uint32_t* slot = io_fault_host + g * guard::kFaultWords;
+            if (!guard::fault_seen(slot)) continue;
+            device_faulted = true;
+            if (res.error.empty()) {
+                res.error = std::string("device fault during ") + where + ": " + guard::fault_describe(slot);
+                std::fprintf(stderr, "[ornith::gpu] DEVICE FAULT: %s\n", res.error.c_str());
+            }
+            return true;
+        }
+        return false;
+    };
+
+    double max_pwr = 0.0, max_tmem = 0.0;
+    HwmonSampler telem;
+    size_t parity_code_match = golden::kCodeRef32.size();
+    bool bench_spec_mismatch = false;
+    std::string bench_spec_mismatch_msg;
+    try {
     auto step_batch = [&](const std::vector<int32_t>& toks, uint32_t pos0,
                           bool use_wy, bool use_ring, bool compute_logits,
                           bool capture_dflash_taps = false) -> std::vector<int32_t> {
         const uint32_t M = static_cast<uint32_t>(toks.size());
+        // v1.2 C1: a funneled fault stops the run instead of re-dispatching onto a poisoned barrier arena.
+        // Unwind the driver before callbacks, recurrent commits or drafter catch-up.
+        run_state.check();
+        if (device_faulted) fail_run(res.error);
+        require_kv_span(pos0, M);
+        if (M > max_batch || M > 1024u) fail_run("token batch exceeds staging capacity");
+        // v1.2 C3: never turn an out-of-range token id into an embedding address offset.
+        const uint32_t n_vocab = static_cast<uint32_t>(hp.vocab);
+        for (const int32_t t : toks) {
+            if (guard::token_id_in_range(t, n_vocab)) continue;
+            if (res.error.empty()) {
+                res.error = "token id " + std::to_string(t) + " is outside the vocabulary [0, " +
+                            std::to_string(n_vocab) + ") before the embedding lookup";
+                std::fprintf(stderr, "[ornith::gpu] BAD TOKEN ID: %s\n", res.error.c_str());
+            }
+            fail_run(res.error);
+        }
+        // A fault raised by a dispatch queued outside step_batch (stage-profiler path) is caught here.
+        if (device_fault_check("previous dispatch")) fail_run(res.error);
+        for (size_t g = 0; g < 2; ++g) guard::fault_clear(io_fault_host + g * guard::kFaultWords);
         if (st_on) st_last = std::chrono::steady_clock::now();
         std::memcpy(io_toks_host, toks.data(), M * sizeof(int32_t));
         __atomic_thread_fence(__ATOMIC_RELEASE);
@@ -2175,6 +2406,9 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         const bool ab_f2_front = (std::getenv("VEGAJET_AB_F2_FRONT") != nullptr && std::getenv("VEGAJET_AB_F2_FRONT")[0] == '1');
         const bool ab_b2_back  = (std::getenv("VEGAJET_AB_B2_BACK") != nullptr && std::getenv("VEGAJET_AB_B2_BACK")[0] == '1');
         const bool ab_enable_super = !(std::getenv("VEGAJET_ENABLE_SUPER") != nullptr && std::getenv("VEGAJET_ENABLE_SUPER")[0] == '0');
+        // v1.2 levers, both default off (unset or any value other than "1" keeps the old path).
+        const bool v12_narrow_verify = (std::getenv("VEGAJET_V12_NARROW_VERIFY") != nullptr && std::getenv("VEGAJET_V12_NARROW_VERIFY")[0] == '1');
+        const bool v12_fused_nq      = (std::getenv("VEGAJET_V12_VERIFY_FUSED_NQ") != nullptr && std::getenv("VEGAJET_V12_VERIFY_FUSED_NQ")[0] == '1');
 
         auto enq_gemm_q4 = [&](size_t g, const Q4A8WeightDev& w, uint64_t xq, uint64_t xds, uint64_t y, bool barrier = true, uint64_t peer_tx = 0ULL) {
             if (M == 1u) {
@@ -2193,8 +2427,23 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                     } else {
                         struct M1W32KA { uint64_t wq, wdm, xq, xds, y; uint32_t rows, cols, stride, dm_st; uint64_t ptx; };
                         M1W32KA ka{w.qs_va, w.dm_va, xq, xds, y, w.rows, w.cols, w.row_stride_bytes, 0u, peer_tx};
-                        const uint32_t gx = ((w.rows + 7u) / 8u) * 256u;
-                        VJ_CHECK(rt.enqueue_kernel(g, *K[g].gemv_q4_w32, gx, 1, 1, 256, 1, 1, &ka, sizeof(ka), barrier));
+                        const uint32_t n_tiles = (w.rows + 7u) / 8u;
+                        const uint32_t pwgs    = v12_dense_wgs();
+                        // The tile counter is shared by consecutive dispatches, so the variant is only
+                        // taken when the launch is a full AQL barrier (barrier=0 lets packets overlap).
+                        if (K[g].gemv_q4_w32p != nullptr && n_tiles >= pwgs && barrier) {
+                            // v1.2 D13: resident grid pulls 8-row tiles from an atomic counter instead of
+                            // launching one WG per tile (rows=3072 -> 384 WGs on 250-300 slots).
+                            struct M1W32PKA { uint64_t wq, wdm, xq, xds, y; uint32_t rows, cols, stride, dm_st;
+                                              uint64_t ptx, q; uint32_t n_tiles; };
+                            M1W32PKA kap{w.qs_va, w.dm_va, xq, xds, y, w.rows, w.cols, w.row_stride_bytes, 0u,
+                                         peer_tx, S[g].dense_q_va, n_tiles};
+                            VJ_CHECK(rt.enqueue_kernel(g, *K[g].gemv_q4_w32p, pwgs * 256u, 1, 1, 256, 1, 1, &kap, sizeof(kap), barrier));
+                            ++dense_persist_launches;
+                        } else {
+                            const uint32_t gx = ((w.rows + 7u) / 8u) * 256u;
+                            VJ_CHECK(rt.enqueue_kernel(g, *K[g].gemv_q4_w32, gx, 1, 1, 256, 1, 1, &ka, sizeof(ka), barrier));
+                        }
                     }
                 }
             } else {
@@ -2208,6 +2457,12 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                     }
                 } else if (K[g].pf_gemm && !use_ring && M >= 16u && w.cols % 64u == 0u) {
                     VJ_CHECK(rt.enqueue_kernel(g, *K[g].pf_gemm, ((w.rows + 63u) / 64u) * 256u, (M + 63u) / 64u, 1, 256, 1, 1, &ka, sizeof(ka), barrier));
+                } else if (v12_narrow_verify && M >= 2u && M <= 16u && (w.cols % 32u) == 0u && w.cols != 512u &&
+                           K[g].gemv_q4_mn != nullptr) {
+                    struct GemmPpKA { uint64_t wq, wdm, xq, xds, y; uint32_t rows, cols, M, stride; uint64_t ptx; };
+                    GemmPpKA pka{w.qs_va, w.dm_va, xq, xds, y, w.rows, w.cols, M, w.row_stride_bytes, peer_tx};
+                    const uint32_t gx = ((w.rows + 7u) / 8u) * 256u;
+                    VJ_CHECK(rt.enqueue_kernel(g, *K[g].gemv_q4_mn, gx, 1, 1, 256, 1, 1, &pka, sizeof(pka), barrier));
                 } else if (M <= 8u && K[g].gemm_q4_m8) {
                     struct GemmPpKA { uint64_t wq, wdm, xq, xds, y; uint32_t rows, cols, M, stride; uint64_t ptx; };
                     GemmPpKA pka{w.qs_va, w.dm_va, xq, xds, y, w.rows, w.cols, M, w.row_stride_bytes, peer_tx};
@@ -2273,10 +2528,18 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                 }
                 if (ar_ts_on && M == 1u && ar_ts_idx < kArTsMax) ++ar_ts_idx;
                 disp += 1u;
+                // A single readiness word cannot hold two unconsumed slice epochs.
+                // Keep the single-slice fast path unchanged; drain BOTH ranks before reuse.
+                if (dispatch::collective_slice_needs_drain(m0, mc, M)) {
+                    if (!rt.submit_batch(0) || !rt.submit_batch(1) ||
+                        !rt.wait_idle(0) || !rt.wait_idle(1))
+                        fail_run("all-reduce slice completion failed or timed out before mailbox reuse");
+                    if (device_fault_check("all-reduce slice")) fail_run(res.error);
+                }
             }
         };
 
-        const bool use_m1_super = (ab_enable_super && !golden_cap_on && M == 1u && !ab_w64 && !ab_f2_front && !ab_b2_back &&
+        const bool use_m1_super = (!asym_experts && ab_enable_super && !golden_cap_on && M == 1u && !ab_w64 && !ab_f2_front && !ab_b2_back &&
                                    opt.fuse_moe_router && opt.fuse_moe_back && opt.gdn_splitv &&
                                    !opt.ab_no_prepush && !opt.ar_wire_int8 && !opt.spec_flash &&
                                    !ar_ts_on && !st_on && !tap_on && !capture_dflash_taps &&
@@ -2284,6 +2547,8 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                                    local_ff == 512u && D == 3072u &&
                                    K[0].m1_gdn_super && K[0].m1_gqa_super && K[0].m1_moe_super);
 
+        if (use_m1_super && v12_dense_persist())
+            fail_run("D13 is standalone-only: use VEGAJET_ENABLE_SUPER=0 for BOTH baseline and D13 runs");
         uint32_t gdn_idx = 0, attn_idx = 0;
         if (use_m1_super) {
             const char* swg_env = std::getenv("VEGAJET_SUPER_WGS");
@@ -2305,43 +2570,49 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                     const uint32_t gi = gdn_idx++;
                     ++super_sense;
                     ++gdn_sense;
-                    struct GdnSupKA {
+                    struct GdnSupKA {  // field order == ornith_m1_gdn_super_kernel parameter order
                         uint64_t desc, sring_ov;
                         uint32_t prev_ep, out_ep, cin, cout, shead, uring, ssense, gsense;
+                        uint64_t fault;
                     };
+                    static_assert(sizeof(GdnSupKA) == 56u, "kernarg ABI drift");
                     for (size_t g = 0; g < 2; ++g) {
                         const uint64_t s_ov = opt.spec_gdn
                             ? (S[g].spec_gdn_s_slot_va[spec_gdn_active] + static_cast<uint64_t>(gi) * s_layer_bytes) : 0ULL;
                         const GdnSupKA ka{
                             S[g].gdn_super_desc_va + static_cast<uint64_t>(gi) * sizeof(ornith_super::GdnSuperDesc),
-                            s_ov, prev_ep, attn_ep, c_in_slot, c_out_slot, s_rhead, s_uring, super_sense, gdn_sense
+                            s_ov, prev_ep, attn_ep, c_in_slot, c_out_slot, s_rhead, s_uring, super_sense, gdn_sense, io_fault_va[g]
                         };
                         VJ_CHECK(rt.enqueue_kernel(g, *K[g].m1_gdn_super, super_wgs * 256u, 1, 1, 256, 1, 1, &ka, sizeof(ka), true));
                     }
                 } else {
                     const uint32_t ai = attn_idx++;
                     ++super_sense;
-                    struct GqaSupKA {
+                    struct GqaSupKA {  // field order == ornith_m1_gqa_super_kernel parameter order
                         uint64_t desc;
                         uint32_t prev_ep, out_ep, pos0, ssense;
+                        uint64_t fault;
                     };
+                    static_assert(sizeof(GqaSupKA) == 32u, "kernarg ABI drift");
                     for (size_t g = 0; g < 2; ++g) {
                         const GqaSupKA ka{
                             S[g].gqa_super_desc_va + static_cast<uint64_t>(ai) * sizeof(ornith_super::GqaSuperDesc),
-                            prev_ep, attn_ep, pos0, super_sense
+                            prev_ep, attn_ep, pos0, super_sense, io_fault_va[g]
                         };
                         VJ_CHECK(rt.enqueue_kernel(g, *K[g].m1_gqa_super, super_wgs * 256u, 1, 1, 256, 1, 1, &ka, sizeof(ka), true));
                     }
                 }
                 ++super_sense;
-                struct MoeSupKA {
+                struct MoeSupKA {  // field order == ornith_m1_moe_super[_q3]_kernel parameter order
                     uint64_t desc;
                     uint32_t ar_ep, out_ep, ssense;
+                    uint64_t fault;
                 };
+                static_assert(sizeof(MoeSupKA) == 32u, "kernarg ABI drift");
                 for (size_t g = 0; g < 2; ++g) {
                     const MoeSupKA ka{
                         S[g].moe_super_desc_va + static_cast<uint64_t>(il) * sizeof(ornith_super::MoeSuperDesc),
-                        attn_ep, moe_ep, super_sense
+                        attn_ep, moe_ep, super_sense, io_fault_va[g]
                     };
                     const bool use_q3_k = allow_q3_fast && (super_wgs == 240u) && K[g].m1_moe_super_q3 &&
                                           (layers[g][il].w_gu_d8_w_va != 0ULL) &&
@@ -2446,7 +2717,10 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                             8u, 32u, 6144u, 10304u, 6144u, 10240u, 10272u,
                             c_in_slot, c_out_slot, s_rhead, (!opt.spec_gdn && use_ring) ? 1u : 0u, gdn_sense, eps
                         };
-                        VJ_CHECK(rt.enqueue_kernel(g, *K[g].gdn_conv_recur_sv, 128u * 256u, 1, 1, 256, 1, 1, &crka, sizeof(crka), true));
+                        // v1.2 D6: VEGAJET_V12_GDN_SPLITV=1 swaps in the column-thread variant (same args, same math).
+                        const kfd::LoadedKernel* const cr_k =
+                            (K[g].gdn_conv_recur_ct != nullptr) ? K[g].gdn_conv_recur_ct : K[g].gdn_conv_recur_sv;
+                        VJ_CHECK(rt.enqueue_kernel(g, *cr_k, 128u * 256u, 1, 1, 256, 1, 1, &crka, sizeof(crka), true));
                         st_mark(kStGdnRecur, static_cast<int>(g));
                     } else {
                     struct ConvL2KA {
@@ -2479,11 +2753,37 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                             S[g].spec_gdn_o_va, S[g].spec_gdn_rec_kv_va, S[g].spec_gdn_rec_dec_va, S[g].spec_gdn_rec_beta_va,
                             M, 8u, 32u, 6144u, 40u * 128u, gi, 0u, 0u, 0u, 16u * 40u * 128u, 16u * 32u
                         };
+                        if (g == 0 && v12_fused_nq) ++spec_nq_sense;
+                        const auto* fused = K[g].spec_gdn_ver_nq;
+                        const bool fused_resident = v12_fused_nq && fused && fused->wavefront_size == 64u &&
+                            fused->max_flat_workgroup_size >= 256u && fused->private_segment_fixed_size == 0u &&
+                            dispatch::fused_verify_resident(fused->from_msgpack_note, rt.devices()[g].n_cu,
+                                fused->vgpr_count, fused->sgpr_count, fused->group_segment_fixed_size,
+                                fused->resident_waves_per_simd);
+                        if (v12_fused_nq && fused_resident && S[g].spec_nq_bar_va != 0) {
+                            // v1.2 S5: verify + norm/quant in one launch (grid barrier inside).
+                            struct SpecGdnNqKA {
+                                uint64_t sin, sout, qsrc, ksrc, vsrc, dec, beta, oout, rkv, rdec, rbeta;
+                                uint64_t gab, nw, oq, od, bar;
+                                uint32_t M, nk, nv, s_strd, r_strd, lbase, s_lstrd, src_lstrd, gb_lstrd, r_lstrd, rgb_lstrd;
+                                uint32_t strd_in, zoff, sense; float eps;
+                                uint64_t fault;
+                            };
+                            static_assert(offsetof(SpecGdnNqKA, fault) == 192u && sizeof(SpecGdnNqKA) == 200u);
+                            const SpecGdnNqKA fnka{
+                                sgka.sin, sgka.sout, sgka.qsrc, sgka.ksrc, sgka.vsrc, sgka.dec, sgka.beta, sgka.oout,
+                                sgka.rkv, sgka.rdec, sgka.rbeta,
+                                S[g].gdn_qkv_gab_va, lw.ssm_norm_va, S[g].mid_q8_va, S[g].mid_ds_va, S[g].spec_nq_bar_va,
+                                M, 8u, 32u, 6144u, 40u * 128u, gi, 0u, 0u, 0u, 16u * 40u * 128u, 16u * 32u,
+                                10304u, 6144u, spec_nq_sense, eps, io_fault_va[g]};
+                            VJ_CHECK(rt.enqueue_kernel(g, *K[g].spec_gdn_ver_nq, 128u * 256u, 1, 1, 256, 1, 1, &fnka, sizeof(fnka), true));
+                        } else {
                         VJ_CHECK(rt.enqueue_kernel(g, *K[g].spec_gdn_ver, 128u * 256u, 1, 1, 256, 1, 1, &sgka, sizeof(sgka), true));
                         struct SpecGdnNormKA { uint64_t ob, gab, nw, oq, od; uint32_t M, nv, strd, zoff; float eps; };
                         const SpecGdnNormKA snka{S[g].spec_gdn_o_va, S[g].gdn_qkv_gab_va, lw.ssm_norm_va,
                                                  S[g].mid_q8_va, S[g].mid_ds_va, M, 32u, 10304u, 6144u, eps};
                         VJ_CHECK(rt.enqueue_kernel(g, *K[g].spec_gdn_nq, ((M * 32u + 3u) / 4u) * 256u, 1, 1, 256, 1, 1, &snka, sizeof(snka), true));
+                        }
                     } else if (std::getenv("VEGAJET_PREFILL_CODEX_GDN") != nullptr &&
                                std::strcmp(std::getenv("VEGAJET_PREFILL_CODEX_GDN"), "1") == 0 &&
                                K[g].pf_gdn_wy_codex && K[g].pf_gdn_nq_codex && use_wy && M >= 16u && !use_ring) {
@@ -2596,7 +2896,8 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                     } else if (opt.spec_flash && K[g].spec_flash_part && (use_ring ? M <= 16u : M < 16u)) {
                         const uint32_t span = pos0 + M;
                         const uint32_t chunk_len = (span <= 1920u) ? 32u : ((span <= 3840u) ? 64u : ((span <= 7680u) ? 128u : 256u));
-                        const uint32_t n_chunks  = std::max<uint32_t>(1u, (span + chunk_len - 1u) / chunk_len);
+                        const uint32_t n_chunks = 1u + (span - 1u) / chunk_len;
+                        require_split_scratch(M, n_q_local, n_chunks);
                         struct SfPartKA { uint64_t qo, kc, vc, po, pml; uint32_t M, pos0, nq, nkv, nc, cl; };
                         struct SfMrgKA  { uint64_t po, pml, go, oq, od; uint32_t M, nq, nc; };
                         const SfPartKA pka2{S[g].q_buf_va, S[g].attn_k_cache_va[ai], S[g].attn_v_cache_va[ai],
@@ -2654,7 +2955,8 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                 gcap_dump("gqa_partial_out", S[0].partial_va, static_cast<uint64_t>(M) * D * 4ULL);
             }
             const bool fuse_front = !golden_cap_on && opt.fuse_moe_router && M == 1u && layers[0][il].w_sh_gu.cols == D &&
-                                    33u + (layers[0][il].w_sh_gu.rows + 7u) / 8u <= 240u;
+                                    33u + (layers[0][il].w_sh_gu.rows + 7u) / 8u <= 240u &&
+                                    (!asym_experts || 33u + (layers[1][il].w_sh_gu.rows + 7u) / 8u <= 240u);
             const bool use_f2_front = (ab_f2_front && fuse_front && K[0].moe_m1_rtr_shgu != nullptr && K[0].moe_m1_top8_swiglu != nullptr);
             const bool fuse_ar_front = (!use_f2_front && fuse_front && M == 1u && ep_pushed_attn && !ar_ts_on && !opt.ar_wire_int8 &&
                                         !st_on && K[0].p2p_ar_moe_m1_front != nullptr);
@@ -2670,17 +2972,19 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             }
 
             // Decided once per layer for both ranks: a rank that skipped the sense bump would fall through the barrier.
-            const bool fuse_back = opt.fuse_moe_back && M == 1u && local_ff == 512u && opt.moe_back_wgs >= 1u && opt.moe_back_wgs <= 240u &&
-                                   layers[0][il].w_sh_down.cols == 512u && layers[1][il].w_sh_down.cols == 512u &&
+            const bool fuse_back = opt.fuse_moe_back && M == 1u && (asym_experts || local_ff == 512u) && (!asym_experts || opt.moe_back_wgs == 224u) && opt.moe_back_wgs >= 1u && opt.moe_back_wgs <= 240u &&
+                                   layers[0][il].w_sh_down.cols == ff_size[0] && layers[1][il].w_sh_down.cols == ff_size[1] &&
                                    layers[0][il].w_gu_d8_w_va == 0u;
             const bool is_prefill_moe = (!use_ring && M >= 16u) || M > 16u;
             const uint32_t dgrp = is_prefill_moe ? opt.down_grp_prefill : ((M >= 2u) ? opt.down_grp_verify : 0u);
-            const bool use_pf_down_tiled = (S[0].dgrp_buf_va != 0u && S[0].pf_gu_queue_va != 0u && !fuse_back && dgrp == 3u && K[0].pf_down_tiled && D % 128u == 0u && local_ff == 512u);
-            const bool use_dgrp = (S[0].dgrp_buf_va != 0u && !fuse_back && !use_pf_down_tiled && dgrp != 0u && dgrp != 3u && D % 64u == 0u);
+            // Grouped/tiled Down and the monolithic superkernel retain their legacy 512-column layouts.
+            const bool use_pf_down_tiled = (!asym_experts && S[0].dgrp_buf_va != 0u && S[0].pf_gu_queue_va != 0u && !fuse_back && dgrp == 3u && K[0].pf_down_tiled && D % 128u == 0u && local_ff == 512u);
+            const bool use_dgrp = (!asym_experts && S[0].dgrp_buf_va != 0u && !fuse_back && !use_pf_down_tiled && dgrp != 0u && dgrp != 3u && D % 64u == 0u);
             if (fuse_front && !use_f2_front) moe_sense += reps_of(7u);
-            if (fuse_back && !ab_b2_back) moe_back_sense += reps_of(8u);
+            if (fuse_back && (!ab_b2_back || asym_experts)) moe_back_sense += reps_of(8u);
             const uint32_t ar_front_ep = fuse_ar_front ? ar_epoch++ : 0u;
             for (size_t g = 0; g < 2; ++g) {
+                const uint32_t local_ff = ff_size[g];
                 const auto& lw = layers[g][il];
                 if (use_f2_front) {
                     struct RsKA { uint64_t wr, wsh, xn, shq, shdm, xq, xds, logits, shgsc, shgu; uint32_t D, sh_rows, sh_stride; };
@@ -2781,7 +3085,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                 if (fuse_back) {
                     const bool do_ep_moe = (!opt.ab_no_prepush && M == 1u && !ar_ts_on && !opt.ar_wire_int8);
                     const uint64_t ptx_moe = do_ep_moe ? (pay_base + (1u - g) * kfd::kArGpuBytes + (ar_epoch & 1u) * kfd::kArSlotBytes) : 0ULL;
-                    if (ab_b2_back && local_ff == 512u && D == 3072u && K[g].moe_gu_16r && K[g].moe_mid_f32_to_q8 && K[g].moe_down_d8_sh) {
+                    if (!asym_experts && ab_b2_back && local_ff == 512u && D == 3072u && K[g].moe_gu_16r && K[g].moe_mid_f32_to_q8 && K[g].moe_down_d8_sh) {
                         struct Gu8KA  { uint64_t wgu, xq, xds, tids, mf32; uint32_t lff; };
                         struct QKA    { uint64_t mf32, mq, md; uint32_t nblk; };
                         struct DnShKA { uint64_t wd, wds, mq, md, tids, tw, shwq, shwdm, shq, shds, out; uint32_t D, sh_st, dn_wst, dn_sst; uint64_t ptx; };
@@ -2810,10 +3114,10 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                                              local_ff, D, lw.w_sh_down.rows, lw.w_sh_down.row_stride_bytes,
                                              moe_back_sense - reps_of(8u) + 1u + r,
                                              lw.dn_d8_w_stride, lw.dn_d8_s_stride, 0u, ptx_moe};
-                            VJ_CHECK(rt.enqueue_kernel(g, *(use_s224 ? K[g].moe_m1_back_s224 : K[g].moe_m1_back), opt.moe_back_wgs * 256u, 1, 1, 256, 1, 1, &bka, sizeof(bka), true));
+                            VJ_CHECK(rt.enqueue_kernel(g, *(asym_experts ? K[g].moe_m1_back_asym : (use_s224 ? K[g].moe_m1_back_s224 : K[g].moe_m1_back)), opt.moe_back_wgs * 256u, 1, 1, 256, 1, 1, &bka, sizeof(bka), true));
                         }
                     }
-                } else if ((is_prefill_moe || (opt.gu_grp_verify && M >= 8u)) && lw.w_gu_iq2s_va != 0u) {
+                } else if (!asym_experts && (is_prefill_moe || (opt.gu_grp_verify && M >= 8u)) && lw.w_gu_iq2s_va != 0u) {
                     // Deduplicated single MoE expert sort: when grouped Down is active, vj_moe_route_group_kernel
                     // produces the exact same (exp_off, exp_cnt, routes) tables needed by Gate+Up AND the work items
                     // needed by grouped Down, eliminating 96 serial 1-WG sort launches per prefill chunk.
@@ -2914,7 +3218,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                         struct GuLruKA { uint64_t wgu, cw, cs, e2s, xq, xd, tids, mq, md; uint32_t M, lff, wst, sst; };
                         const GuLruKA lka{lw.w_gu_iq2s_va, lru_w_va[g][il], lru_s_va[g][il], lru_e2s_va[g][il],
                                           S[g].x_q8_va, S[g].x_ds_va, S[g].top_ids_va, S[g].moe_q8_va, S[g].moe_d_va,
-                                          M, local_ff, lru_lay.w_row_stride_bytes, lru_lay.s_row_stride_bytes};
+                                          M, local_ff, lru_lay[g].w_row_stride_bytes, lru_lay[g].s_row_stride_bytes};
                         VJ_CHECK(rt.enqueue_kernel(g, *K[g].moe_gu_lru, 8u * (local_ff / 32u) * 256u, M, 1, 256, 1, 1, &lka, sizeof(lka), true));
                         if (g == 0u && M >= 4u) {
                             struct CpU32KA { uint64_t dst, src, n; };
@@ -2953,6 +3257,20 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                             VJ_CHECK(rt.enqueue_kernel(g, *K[g].dgrp_f32, (D / 32u) * 256u, icap, 1, 256, 1, 1, &gf, sizeof(gf), true));
                             VJ_CHECK(rt.enqueue_kernel(g, *K[g].dgrp_comb_f32, ((D + 15u) / 16u) * 256u, M, 1, 256, 1, 1, &cb, sizeof(cb), true));
                         }
+                    } else if (asym_experts) {
+                        struct AsymDnKA {
+                            uint64_t wq, ws, mq, md, tids, tw, shd, out;
+                            uint32_t M, D, wst, sst, lff, pad;
+                            uint64_t ptx;
+                        };
+                        static_assert(sizeof(AsymDnKA) == 96u, "asymmetric Down kernarg ABI");
+                        const bool prepush = !opt.ab_no_prepush && M <= 16u && !ar_ts_on && !opt.ar_wire_int8;
+                        const uint64_t ptx = prepush ? pay_base + (1u - g) * kfd::kArGpuBytes + (ar_epoch & 1u) * kfd::kArSlotBytes : 0u;
+                        const AsymDnKA dka{lw.w_dn_d8_w_va, lw.w_dn_d8_s_va, S[g].moe_q8_va, S[g].moe_d_va,
+                            S[g].top_ids_va, S[g].top_w_va, S[g].sh_down_va, S[g].partial_va,
+                            M, D, lw.dn_d8_w_stride, lw.dn_d8_s_stride, local_ff, 0u, ptx};
+                        VJ_CHECK(rt.enqueue_kernel(g, *K[g].moe_down_asym, ((D + 15u) / 16u) * 256u, M, 1,
+                                                  256, 1, 1, &dka, sizeof(dka), true));
                     } else if (!opt.ab_no_prepush && M <= 16u && !ar_ts_on && !opt.ar_wire_int8 && K[g].moe_down_d8_pp != nullptr) {
                         const uint64_t ptx_dn = pay_base + (1u - g) * kfd::kArGpuBytes + (ar_epoch & 1u) * kfd::kArSlotBytes;
                         struct DnPpKA { uint64_t wq, ws, mq, md, tids, tw, shd, out; uint32_t M, D, wst, sst; uint64_t ptx; };
@@ -2980,8 +3298,9 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                 gcap_dump("moe_top_w", S[0].top_w_va, static_cast<uint64_t>(M) * 8ULL * 4ULL);
                 gcap_dump("moe_partial_out", S[0].partial_va, static_cast<uint64_t>(M) * D * 4ULL);
             }
-            const bool ep_pushed_moe_dn = (!opt.ab_no_prepush && !fuse_back && !(is_prefill_moe || (opt.gu_grp_verify && M >= 8u)) && !use_dgrp &&
-                                           M <= 16u && !ar_ts_on && !opt.ar_wire_int8 && K[0].moe_down_d8_pp != nullptr);
+            // Both Down paths publish the same [M,D] FP16 payload, independent of the local intermediate width.
+            const bool ep_pushed_moe_dn = (!opt.ab_no_prepush && !fuse_back && (asym_experts || !(is_prefill_moe || (opt.gu_grp_verify && M >= 8u))) && !use_dgrp &&
+                                           M <= 16u && !ar_ts_on && !opt.ar_wire_int8 && (asym_experts || K[0].moe_down_d8_pp != nullptr));
             const bool ep_pushed_moe = (!opt.ab_no_prepush && fuse_back && M == 1u && !ar_ts_on && !opt.ar_wire_int8) || ep_pushed_moe_dn;
             enq_p2p_ar_rms(il * 2u + 1u, next_w0, next_w1, (il + 1u < 48u || compute_logits) ? 1u : 0u, ep_pushed_moe);
             st_mark(kStAr, -1);
@@ -3019,7 +3338,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                 } else if (use_b6) {
                     VJ_CHECK(rt.enqueue_kernel(g, *K[g].vocab_argmax_b6, kVocabBlocks * 256u, (voc_m + 5u) / 6u, 1, 256, 1, 1, &vka, sizeof(vka), true));
                 } else {
-                    VJ_CHECK(rt.enqueue_kernel(g, *((voc_m == 1u && K[g].vocab_m1 && std::getenv("VEGAJET_VOCAB_MUBUF") && std::strcmp(std::getenv("VEGAJET_VOCAB_MUBUF"), "1") == 0) ? K[g].vocab_m1 : K[g].vocab_argmax), kVocabBlocks * 256u, voc_m, 1, 256, 1, 1, &vka, sizeof(vka), true));
+                    VJ_CHECK(rt.enqueue_kernel(g, *((voc_m == 1u && K[g].vocab_m1 && std::getenv("VEGAJET_VOCAB_MUBUF") && std::strcmp(std::getenv("VEGAJET_VOCAB_MUBUF"), "1") == 0) ? K[g].vocab_m1 : ((voc_m == 1u && K[g].vocab_ilp != nullptr) ? K[g].vocab_ilp : K[g].vocab_argmax)), kVocabBlocks * 256u, voc_m, 1, 256, 1, 1, &vka, sizeof(vka), true));
                 }
             }
             disp += 1u;
@@ -3029,7 +3348,33 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
 
         VJ_CHECK(rt.submit_batch(0) && rt.submit_batch(1));
         VJ_CHECK(rt.wait_idle(0)    && rt.wait_idle(1));
+        // v1.2 C1: both queues drained -> a recorded barrier/mailbox fault invalidates this step's logits.
+        if (device_fault_check("decode step")) fail_run(res.error);
 
+        std::vector<int32_t> preds(M, -1);
+        if (compute_logits) {
+            __atomic_thread_fence(__ATOMIC_ACQUIRE);
+            for (uint32_t m = 0; m < voc_m; ++m) {
+                float best_v = -1e30f;
+                int32_t best_i = -1;
+                for (uint32_t b = 0; b < kVocabBlocks; ++b) {
+                    const uint32_t idx = m * kVocabBlocks + b;
+                    if (io_arg_val_host0[idx] > best_v) { best_v = io_arg_val_host0[idx]; best_i = io_arg_id_host0[idx]; }
+                    if (io_arg_val_host1[idx] > best_v) { best_v = io_arg_val_host1[idx]; best_i = io_arg_id_host1[idx]; }
+                }
+                // v1.2 C3: a block reduction that never replaced its -1 sentinel (all-NaN / empty
+                // logits) or an id outside the vocabulary must not reach the embedding gather.
+                if (!guard::token_id_in_range(best_i, n_vocab)) {
+                    if (res.error.empty()) {
+                        res.error = "argmax token id " + std::to_string(best_i) + " is outside the vocabulary [0, " +
+                                    std::to_string(n_vocab) + "); refusing to feed it to the embedding lookup";
+                        std::fprintf(stderr, "[ornith::gpu] BAD ARGMAX: %s\n", res.error.c_str());
+                    }
+                    fail_run(res.error);
+                }
+                preds[last_tok_only_vocab ? (M - 1u) : m] = best_i;
+            }
+        }
         // Update Dynamic LRU MoE Gate+Up cache on M >= 4 verify passes (~10.8 us/expert on-GPU repack!).
         const bool lru_active_now = (lru_cache && std::getenv("VEGAJET_MOE_LRU") != nullptr && std::atoi(std::getenv("VEGAJET_MOE_LRU")) > 0);
         if (lru_active_now && M >= 4u && M <= 16u && !use_m1_super && !use_pf_dot8) {
@@ -3046,8 +3391,9 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                     if (a.evicted >= 0 && a.evicted < 256) lru_e2s_host[a.layer][a.evicted] = -1;
                     lru_e2s_host[a.layer][a.expert] = static_cast<int32_t>(a.slot);
                     for (size_t g = 0; g < 2; ++g) {
+                        const uint32_t local_ff = ff_size[g];
                         const RepKA rka{layers[g][a.layer].w_gu_iq2s_va, lru_w_va[g][a.layer], lru_s_va[g][a.layer],
-                                        a.expert, a.slot, local_ff, lru_lay.w_row_stride_bytes, lru_lay.s_row_stride_bytes};
+                                        a.expert, a.slot, local_ff, lru_lay[g].w_row_stride_bytes, lru_lay[g].s_row_stride_bytes};
                         VJ_CHECK(rt.enqueue_kernel(g, *K[g].moe_gu_repack, local_ff * 128u, 1, 1, 128, 1, 1, &rka, sizeof(rka), true));
                     }
                     lru_cache->commit(a);
@@ -3062,25 +3408,12 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             }
         }
 
-        std::vector<int32_t> preds(M, -1);
-        if (compute_logits) {
-            __atomic_thread_fence(__ATOMIC_ACQUIRE);
-            for (uint32_t m = 0; m < voc_m; ++m) {
-                float best_v = -1e30f;
-                int32_t best_i = -1;
-                for (uint32_t b = 0; b < kVocabBlocks; ++b) {
-                    const uint32_t idx = m * kVocabBlocks + b;
-                    if (io_arg_val_host0[idx] > best_v) { best_v = io_arg_val_host0[idx]; best_i = io_arg_id_host0[idx]; }
-                    if (io_arg_val_host1[idx] > best_v) { best_v = io_arg_val_host1[idx]; best_i = io_arg_id_host1[idx]; }
-                }
-                preds[last_tok_only_vocab ? (M - 1u) : m] = best_i;
-            }
-        }
         return preds;
     };
 
     // Quick stage micro-profiler (measures exact M=1 ms per component across 48 layers!)
     auto run_m1_profile = [&]() {
+        const uint32_t local_ff = ff_size[0];
         auto time_fn = [&](int iters, auto&& fn) -> double {
             fn();
             auto t0 = std::chrono::steady_clock::now();
@@ -3132,6 +3465,15 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         }); });
         double t_moe_gu  = time_fn(8, [&]() { run_g0([&]() {
             for (int i = 0; i < 48; ++i) {
+                if (asym_experts && layers[0][i].w_gu_d8_w_va != 0u) {
+                    const auto& lw = layers[0][i];
+                    struct GuD8KA { uint64_t wq, ws, xq, xd, tids, mq, md; uint32_t M, lff, wst, sst; };
+                    const GuD8KA ka{lw.w_gu_d8_w_va, lw.w_gu_d8_s_va, S[0].x_q8_va, S[0].x_ds_va,
+                        S[0].top_ids_va, S[0].moe_q8_va, S[0].moe_d_va, 1u, local_ff, lw.gu_d8_w_stride, lw.gu_d8_s_stride};
+                    const auto* gu = (lw.gu_d8_w_stride == 2304u && K[0].moe_gu_q3) ? K[0].moe_gu_q3 : K[0].moe_gu_d8;
+                    VJ_CHECK(rt.enqueue_kernel(0, *gu, 8u * (local_ff / 32u) * 256u, 1, 1, 256, 1, 1, &ka, sizeof(ka), true));
+                    continue;
+                }
                 struct GuKA { uint64_t wgu, xq, xd, tids, mq, md; uint32_t M, lff; };
                 GuKA gka{layers[0][i].w_gu_iq2s_va, S[0].x_q8_va, S[0].x_ds_va, S[0].top_ids_va, S[0].moe_q8_va, S[0].moe_d_va, 1u, local_ff};
                 VJ_CHECK(rt.enqueue_kernel(0, *K[0].moe_gu_iq2s, 8u * (local_ff / 32u) * 256u, 1, 1, 256, 1, 1, &gka, sizeof(gka), true));
@@ -3139,6 +3481,15 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         }); });
         double t_moe_dn  = time_fn(8, [&]() { run_g0([&]() {
             for (int i = 0; i < 48; ++i) {
+                if (asym_experts) {
+                    struct AsymDnKA { uint64_t wq, ws, mq, md, tids, tw, shd, out; uint32_t M, D, wst, sst, lff, pad; uint64_t ptx; };
+                    const auto& lw = layers[0][i];
+                    const AsymDnKA dka{lw.w_dn_d8_w_va, lw.w_dn_d8_s_va, S[0].moe_q8_va, S[0].moe_d_va,
+                        S[0].top_ids_va, S[0].top_w_va, S[0].sh_down_va, S[0].partial_va,
+                        1u, D, lw.dn_d8_w_stride, lw.dn_d8_s_stride, local_ff, 0u, 0u};
+                    VJ_CHECK(rt.enqueue_kernel(0, *K[0].moe_down_asym, ((D + 15u) / 16u) * 256u, 1, 1, 256, 1, 1, &dka, sizeof(dka), true));
+                    continue;
+                }
                 struct DnKA { uint64_t wq, ws, mq, md, tids, tw, shd, out; uint32_t M, D, wst, sst; };
                 DnKA dka{layers[0][i].w_dn_d8_w_va, layers[0][i].w_dn_d8_s_va, S[0].moe_q8_va, S[0].moe_d_va, S[0].top_ids_va, S[0].top_w_va, S[0].sh_down_va,
                          S[0].partial_va, 1u, D, layers[0][i].dn_d8_w_stride, layers[0][i].dn_d8_s_stride};
@@ -3149,7 +3500,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             struct VocKA { uint64_t wq, wd, xq, xd, bv, bi; uint32_t lr, cols, ro, stride, M; };
             VocKA vka{out_w[0].qs_va, out_w[0].ds_va, S[0].x_q8_va, S[0].x_ds_va,
                       S[0].argmax_val_va, S[0].argmax_id_va, voc_rows[0], D, 0u, out_w[0].row_stride_bytes, 1u};
-            VJ_CHECK(rt.enqueue_kernel(0, *((K[0].vocab_m1 && std::getenv("VEGAJET_VOCAB_MUBUF") && std::strcmp(std::getenv("VEGAJET_VOCAB_MUBUF"), "1") == 0) ? K[0].vocab_m1 : K[0].vocab_argmax), kVocabBlocks * 256u, 1, 1, 256, 1, 1, &vka, sizeof(vka), true));
+            VJ_CHECK(rt.enqueue_kernel(0, *((K[0].vocab_m1 && std::getenv("VEGAJET_VOCAB_MUBUF") && std::strcmp(std::getenv("VEGAJET_VOCAB_MUBUF"), "1") == 0) ? K[0].vocab_m1 : (K[0].vocab_ilp != nullptr ? K[0].vocab_ilp : K[0].vocab_argmax)), kVocabBlocks * 256u, 1, 1, 256, 1, 1, &vka, sizeof(vka), true));
         }); });
         double t_ar = time_fn(8, [&]() {
             for (int i = 0; i < 96; ++i) {
@@ -3223,7 +3574,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                 return double(w.rows) * (double(w.cols) * 0.5 + double(w.cols / 32u) * 4.0);
             };
             const double gu_d8_row_b = double(dot8_gu_iq2s_layout(1u, D).read_bytes_per_row());
-            const double dn_d8_row_b = double(dot8_iq3_layout(1u, local_ff).read_bytes_per_row());
+            const double dn_d8_row_b = double((asym_experts ? dot8_iq3_asym_layout(1u, local_ff) : dot8_iq3_layout(1u, local_ff)).read_bytes_per_row());
             double b_gdn_qkv = 0, b_gdn_out = 0, b_gqa_qkv = 0, b_gqa_o = 0, b_front = 0, b_back = 0;
             uint32_t n_gdn = 0, n_gqa = 0;
             for (uint32_t il = 0; il < 48u; ++il) {
@@ -3320,8 +3671,15 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         VJ_CHECK(rt.wait_idle(0) && rt.wait_idle(1));
     };
 
+    // Speculative decode driver (the bench's `tg128 Suffix` path): draft a suffix-tree chain, verify the whole batch,
+    // keep only the tokens that match the greedy argmax, so the emitted sequence is the raw greedy one by
+    // construction. Optional `on_tok` sees every committed token (same order, same ids as the returned vector) and can
+    // stop the run; `pos_cap` bounds the KV position (serving passes opt.max_ctx).
+    using SuffixTokenCb = std::function<bool(int32_t tid, uint32_t n_comp, double prefill_ms, double decode_ms)>;
     auto run_greedy_suffix = [&](const std::vector<int32_t>& prompt_ids, int n_gen, double* out_tps,
-                                 uint64_t* out_hits = nullptr, uint64_t* out_acc = nullptr, uint64_t* out_dr = nullptr) -> std::vector<int32_t> {
+                                 uint64_t* out_hits = nullptr, uint64_t* out_acc = nullptr, uint64_t* out_dr = nullptr,
+                                 const SuffixTokenCb* on_tok = nullptr,
+                                 uint32_t pos_cap = 0xFFFFFFFFu) -> std::vector<int32_t> {
         reset_state();
         spec::SuffixTree sfx;
         sfx.extend(prompt_ids);
@@ -3331,6 +3689,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
 
         uint32_t pos = 0;
         int32_t last_pred = -1;
+        const auto tp0 = std::chrono::steady_clock::now();
         for (size_t off = 0; off < prompt_ids.size(); off += opt.prefill_chunk) {
             const size_t cnt = std::min<size_t>(opt.prefill_chunk, prompt_ids.size() - off);
             std::vector<int32_t> chunk(prompt_ids.begin() + off, prompt_ids.begin() + off + cnt);
@@ -3345,13 +3704,18 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         gen.push_back(last_pred);
         sfx.push(last_pred);
         uint64_t hits = 0, acc_tot = 0, dr_tot = 0;
+        const double prefill_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp0).count();
+        if (on_tok && !(*on_tok)(last_pred, 1u, prefill_ms, 0.0)) return gen;
 
         auto td0 = std::chrono::steady_clock::now();
-        while (static_cast<int>(gen.size()) < n_gen) {
+        while (static_cast<int>(gen.size()) < n_gen && pos < pos_cap) {
             const uint32_t rem = static_cast<uint32_t>(n_gen - static_cast<int>(gen.size()));
+            const uint32_t room = pos_cap - pos;
             std::vector<int32_t> qctx = ctx;
             qctx.push_back(gen.back());
-            const uint32_t k_max = std::min<uint32_t>({opt.suffix_max_draft, kGdnRingSlots - 2u, (rem > 1u) ? (rem - 1u) : 0u});
+            const uint32_t k_max = std::min<uint32_t>({opt.suffix_max_draft, kGdnRingSlots - 2u, (rem > 1u) ? (rem - 1u) : 0u,
+                                                       (room > 1u) ? (room - 1u) : 0u});
             std::vector<int32_t> draft_toks;
             if (k_max > 0u) {
                 double chain_score = 1.0;
@@ -3364,11 +3728,18 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                     qctx.push_back(nodes[0].token);
                 }
             }
+            const auto notify = [&](int32_t tid) {
+                if (!on_tok) return true;
+                const double dec_ms =
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - td0).count();
+                return (*on_tok)(tid, static_cast<uint32_t>(gen.size()), prefill_ms, dec_ms);
+            };
             if (draft_toks.empty()) {
                 auto preds = step_batch({gen.back()}, pos++, false, false, true);
                 ctx.push_back(gen.back());
                 gen.push_back(preds[0]);
                 sfx.push(preds[0]);
+                if (!notify(preds[0])) return gen;
             } else {
                 ++hits;
                 const uint32_t dk = static_cast<uint32_t>(draft_toks.size());
@@ -3388,10 +3759,12 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                     gen.push_back(draft_toks[j]);
                     ctx.push_back(draft_toks[j]);
                     sfx.push(draft_toks[j]);
+                    if (!notify(draft_toks[j])) return gen;
                 }
                 if (static_cast<int>(gen.size()) < n_gen) {
                     gen.push_back(preds[acc]);
                     sfx.push(preds[acc]);
+                    if (!notify(preds[acc])) return gen;
                 }
                 const uint32_t n_commit = acc + 1u;
                 ring_head = (ring_head + n_commit) % kGdnRingSlots;
@@ -3410,6 +3783,9 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
     // Built-in blk.48 nextn MTP single-token step (1 layer + optional LM head -> ~0.7 ms/draft!)
     auto step_mtp = [&](int32_t tok_id, uint32_t pos, uint64_t h_in0, uint64_t h_in1,
                         bool compute_logits, bool do_submit, uint32_t tok_slot) -> int32_t {
+        require_token(tok_id, "MTP embedding");
+        require_kv_span(pos, 1u);
+        if (tok_slot >= 1024u) fail_run("MTP token staging capacity exceeded");
         io_toks_host[tok_slot] = tok_id;
         __atomic_thread_fence(__ATOMIC_RELEASE);
         const float eps = static_cast<float>(hp.rms_eps);
@@ -3472,7 +3848,8 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             if (opt.spec_flash && K[g].spec_flash_part) {
                 const uint32_t span = pos + 1u;
                 const uint32_t chunk_len = (span <= 1920u) ? 32u : ((span <= 3840u) ? 64u : ((span <= 7680u) ? 128u : 256u));
-                const uint32_t n_chunks  = std::max<uint32_t>(1u, (span + chunk_len - 1u) / chunk_len);
+                const uint32_t n_chunks = 1u + (span - 1u) / chunk_len;
+                require_split_scratch(1u, 16u, n_chunks);
                 struct SfPartKA { uint64_t qo, kc, vc, po, pml; uint32_t M, pos0, nq, nkv, nc, cl; };
                 struct SfMrgKA  { uint64_t po, pml, go, oq, od; uint32_t M, nq, nc; };
                 const SfPartKA pka2{S[g].q_buf_va, S[g].mtp_k_cache_va, S[g].mtp_v_cache_va,
@@ -3492,6 +3869,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         enq_ar_mtp(60u, mtp[0].post_attn_norm_va, mtp[1].post_attn_norm_va, 1u);
 
         for (size_t g = 0; g < 2; ++g) {
+            const uint32_t local_ff = ff_size[g];
             const auto& ml = mtp[g];
             struct RLogKA { uint64_t wr, wsh, xn, lout, shg; uint32_t M, D; };
             RLogKA rlka{ml.w_router_f16_va, ml.w_sh_gate_va, S[g].x_norm_va, S[g].router_log_va, S[g].sh_gate_sc_va, 1u, D};
@@ -3512,11 +3890,19 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             VJ_CHECK(rt.enqueue_kernel(g, *K[g].moe_gu_q4a8, 8u * (local_ff / 32u) * 256u, 1, 1, 256, 1, 1, &gka, sizeof(gka), true));
             enq_q4_m1(g, ml.w_sh_down, S[g].sh_q8_va, S[g].sh_ds_va, S[g].sh_down_va, false);
 
-            struct DnQ4KA { uint64_t wdq, wddm, mq, mds, tids, tw, shd, out; uint32_t M, D, stride; };
-            DnQ4KA dka{ml.w_exp_down.qs_va, ml.w_exp_down.dm_va, S[g].moe_q8_va, S[g].mtp_moe_ds_va,
-                       S[g].top_ids_va, S[g].top_w_va, S[g].sh_down_va, S[g].partial_va,
-                       1u, D, ml.w_exp_down.row_stride_bytes};
-            VJ_CHECK(rt.enqueue_kernel(g, *K[g].moe_down_q4a8, ((D + 15u) / 16u) * 256u, 1, 1, 256, 1, 1, &dka, sizeof(dka), true));
+            if (asym_experts) {
+                struct DnQ4KA { uint64_t wdq, wddm, mq, mds, tids, tw, shd, out; uint32_t M, D, stride, lff; };
+                const DnQ4KA dka{ml.w_exp_down.qs_va, ml.w_exp_down.dm_va, S[g].moe_q8_va, S[g].mtp_moe_ds_va,
+                    S[g].top_ids_va, S[g].top_w_va, S[g].sh_down_va, S[g].partial_va,
+                    1u, D, ml.w_exp_down.row_stride_bytes, local_ff};
+                VJ_CHECK(rt.enqueue_kernel(g, *K[g].moe_down_asym_q4, ((D + 15u) / 16u) * 256u, 1, 1, 256, 1, 1, &dka, sizeof(dka), true));
+            } else {
+                struct DnQ4KA { uint64_t wdq, wddm, mq, mds, tids, tw, shd, out; uint32_t M, D, stride; };
+                DnQ4KA dka{ml.w_exp_down.qs_va, ml.w_exp_down.dm_va, S[g].moe_q8_va, S[g].mtp_moe_ds_va,
+                           S[g].top_ids_va, S[g].top_w_va, S[g].sh_down_va, S[g].partial_va,
+                           1u, D, ml.w_exp_down.row_stride_bytes};
+                VJ_CHECK(rt.enqueue_kernel(g, *K[g].moe_down_q4a8, ((D + 15u) / 16u) * 256u, 1, 1, 256, 1, 1, &dka, sizeof(dka), true));
+            }
         }
         enq_ar_mtp(61u, mtp[0].shared_head_norm_va, mtp[1].shared_head_norm_va, compute_logits ? 1u : 0u);
 
@@ -3529,13 +3915,14 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                 VocKA vka{vw.qs_va, vw.ds_va, S[g].x_q8_va, S[g].x_ds_va,
                           S[g].argmax_val_va, S[g].argmax_id_va,
                           lr, D, ro, vw.row_stride_bytes, 1u};
-                VJ_CHECK(rt.enqueue_kernel(g, *((K[g].vocab_m1 && std::getenv("VEGAJET_VOCAB_MUBUF") && std::strcmp(std::getenv("VEGAJET_VOCAB_MUBUF"), "1") == 0) ? K[g].vocab_m1 : K[g].vocab_argmax), kVocabBlocks * 256u, 1, 1, 256, 1, 1, &vka, sizeof(vka), true));
+                VJ_CHECK(rt.enqueue_kernel(g, *((K[g].vocab_m1 && std::getenv("VEGAJET_VOCAB_MUBUF") && std::strcmp(std::getenv("VEGAJET_VOCAB_MUBUF"), "1") == 0) ? K[g].vocab_m1 : (K[g].vocab_ilp != nullptr ? K[g].vocab_ilp : K[g].vocab_argmax)), kVocabBlocks * 256u, 1, 1, 256, 1, 1, &vka, sizeof(vka), true));
             }
         }
         if (!do_submit) return -1;
 
         VJ_CHECK(rt.submit_batch(0) && rt.submit_batch(1));
         VJ_CHECK(rt.wait_idle(0)    && rt.wait_idle(1));
+        if (device_fault_check("MTP step")) fail_run(res.error);
         if (!compute_logits) return -1;
 
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
@@ -3549,8 +3936,10 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             const uint32_t idx = static_cast<uint32_t>(best_i);
             const size_t g = (idx >= fr_rows_per_gpu) ? 1u : 0u;
             const uint32_t local_r = idx - static_cast<uint32_t>(g) * fr_rows_per_gpu;
-            if (local_r < fr_tok_map[g].size()) best_i = fr_tok_map[g][local_r];
+            if (local_r >= fr_tok_map[g].size()) fail_run("MTP frequency-rank argmax is outside the token map");
+            best_i = fr_tok_map[g][local_r];
         }
+        require_token(best_i, "MTP argmax");
         return best_i;
     };
 
@@ -3560,6 +3949,180 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         const uint32_t gx = ((D + 255u) / 256u) * 256u;
         VJ_CHECK(rt.enqueue_kernel(0, *K[0].memcpy_u32, gx, 1, 1, 256, 1, 1, &ka0, sizeof(ka0), true));
         VJ_CHECK(rt.enqueue_kernel(1, *K[1].memcpy_u32, gx, 1, 1, 256, 1, 1, &ka1, sizeof(ka1), true));
+    };
+
+    // v1.2 levers, both default off: C7+S1 measured depth governor, S2 batched drafter catch-up.
+    const bool v12_spec_gov = (std::getenv("VEGAJET_V12_SPEC_GOV") != nullptr && std::getenv("VEGAJET_V12_SPEC_GOV")[0] == '1');
+    // Batch flag was validated against the expert layout before runtime initialization.
+
+    // v1.2 S2: ingest n <= kMaxSpecBatch blk.48 MTP tokens in ONE M-row forward instead of n M=1 forwards.
+    // Same kernels, buffers and order as step_mtp; only the grid gains the row dimension (attn_prep/spec_flash
+    // are already row-parallel) and the residual inputs are staged into the mtp_h_cur rows eh_proj overwrites.
+    // Positions must be consecutive (pos0 + j). Falls back to the per-token path when the M-row GEMVs are absent.
+    const bool v12_batch_ok = (K[0].gemm_q4_m8 != nullptr) && (K[1].gemm_q4_m8 != nullptr);
+    auto step_mtp_batch = [&](const std::vector<int32_t>& toks, uint32_t pos0,
+                              const std::vector<uint64_t>& hs0, const std::vector<uint64_t>& hs1) -> bool {
+        run_state.check();
+        for (int32_t id : toks) require_token(id, "MTP batch embedding");
+        const uint32_t n = static_cast<uint32_t>(toks.size());
+        if (n == 0u) return true;
+        require_kv_span(pos0, n);
+        if (hs0.size() != n || hs1.size() != n) fail_run("MTP hidden-row count mismatch");
+        if (n == 1u || n > kMaxSpecBatch || !v12_batch_ok) {
+            for (uint32_t j = 0; j < n; ++j)
+                (void) step_mtp(toks[j], pos0 + j, hs0[j], hs1[j], false, true, 0u);
+            return true;
+        }
+
+        const uint32_t M = n;
+        const float eps = static_cast<float>(hp.rms_eps);
+        const float rope_base = static_cast<float>(hp.rope_base);
+        const uint64_t row_bytes = static_cast<uint64_t>(D) * 4ULL;
+        for (uint32_t j = 0; j < M; ++j) io_toks_host[j] = toks[j];
+        __atomic_thread_fence(__ATOMIC_RELEASE);
+
+        // Stage the per-row residual inputs; eh_cat reads them before eh_proj overwrites the same rows.
+        for (uint32_t j = 0; j < M; ++j)
+            gpu_copy_h_both(S[0].mtp_h_cur_va + static_cast<uint64_t>(j) * row_bytes, hs0[j],
+                            S[1].mtp_h_cur_va + static_cast<uint64_t>(j) * row_bytes, hs1[j]);
+
+        // M-row VJ_Q4_A8 GEMV: same kernel choice as enq_gemm_q4's M>1 branch.
+        auto enq_q4_mN = [&](size_t g, const Q4A8WeightDev& w, uint64_t xq, uint64_t xds, uint64_t y, bool barrier) {
+            const uint32_t gx8 = ((w.rows + 7u) / 8u) * 256u;
+            if (M <= 8u && K[g].gemm_q4_m8) {
+                struct GemmPpKA { uint64_t wq, wdm, xq, xds, y; uint32_t rows, cols, M, stride; uint64_t ptx; };
+                GemmPpKA pka{w.qs_va, w.dm_va, xq, xds, y, w.rows, w.cols, M, w.row_stride_bytes, 0ULL};
+                VJ_CHECK(rt.enqueue_kernel(g, *K[g].gemm_q4_m8, gx8, 1, 1, 256, 1, 1, &pka, sizeof(pka), barrier));
+            } else if (M <= 12u && K[g].gemm_q4_m12) {
+                struct GemmPpKA { uint64_t wq, wdm, xq, xds, y; uint32_t rows, cols, M, stride; uint64_t ptx; };
+                GemmPpKA pka{w.qs_va, w.dm_va, xq, xds, y, w.rows, w.cols, M, w.row_stride_bytes, 0ULL};
+                VJ_CHECK(rt.enqueue_kernel(g, *K[g].gemm_q4_m12, gx8, 1, 1, 256, 1, 1, &pka, sizeof(pka), barrier));
+            } else if (M <= 16u && K[g].gemm_q4_m16) {
+                struct GemmPpKA { uint64_t wq, wdm, xq, xds, y; uint32_t rows, cols, M, stride; uint64_t ptx; };
+                GemmPpKA pka{w.qs_va, w.dm_va, xq, xds, y, w.rows, w.cols, M, w.row_stride_bytes, 0ULL};
+                VJ_CHECK(rt.enqueue_kernel(g, *K[g].gemm_q4_m16, gx8, 1, 1, 256, 1, 1, &pka, sizeof(pka), barrier));
+            } else {
+                struct GemmKA { uint64_t wq, wdm, xq, xds, y; uint32_t rows, cols, M, stride; };
+                GemmKA ka{w.qs_va, w.dm_va, xq, xds, y, w.rows, w.cols, M, w.row_stride_bytes};
+                VJ_CHECK(rt.enqueue_kernel(g, *K[g].gemm_q4_tcc, gx8, (M + 15u) / 16u, 1, 256, 1, 1, &ka, sizeof(ka), barrier));
+            }
+        };
+
+        for (size_t g = 0; g < 2; ++g) {
+            const auto& ml = mtp[g];
+            struct EhCatKA { uint64_t eqs, eds, toks, hin, wen, whn, cq, cds; uint32_t M, D; float eps; };
+            EhCatKA ecka{emb_w[g].qs_va, emb_w[g].ds_va, io_toks_va, S[g].mtp_h_cur_va, ml.enorm_va, ml.hnorm_va,
+                         S[g].mtp_cat_q8_va, S[g].mtp_cat_ds_va, M, D, eps};
+            VJ_CHECK(rt.enqueue_kernel(g, *K[g].mtp_eh_cat, dispatch::eh_grid_x(M), 1, 1, 256, 1, 1, &ecka, sizeof(ecka), true));
+            enq_q4_mN(g, ml.w_eh_proj, S[g].mtp_cat_q8_va, S[g].mtp_cat_ds_va, S[g].mtp_h_cur_va, true);
+
+            struct RmsKA { uint64_t h, xa, w, xn, xq, xd; uint32_t M, D; float eps; };
+            RmsKA rka{S[g].mtp_h_cur_va, 0ULL, ml.attn_norm_va, S[g].x_norm_va, S[g].x_q8_va, S[g].x_ds_va, M, D, eps};
+            VJ_CHECK(rt.enqueue_kernel(g, *K[g].rms_quant, M * 256u, 1, 1, 256, 1, 1, &rka, sizeof(rka), true));
+
+            enq_q4_mN(g, ml.w_attn_qkv, S[g].x_q8_va, S[g].x_ds_va, S[g].attn_qkv_va, true);
+            struct PrepKA { uint64_t qkv, qw, kw, qo, go, kc, vc; uint32_t M, pos0, nq, nkv, rdims; float rbase, eps; };
+            PrepKA pka{S[g].attn_qkv_va, ml.q_norm_va, ml.k_norm_va,
+                       S[g].q_buf_va, S[g].gate_buf_va, S[g].mtp_k_cache_va, S[g].mtp_v_cache_va,
+                       M, pos0, 16u, 1u, hp.rope_dims, rope_base, eps};
+            VJ_CHECK(rt.enqueue_kernel(g, *K[g].attn_prep, 17u * 256u, M, 1, 256, 1, 1, &pka, sizeof(pka), true));
+
+            if (opt.spec_flash && K[g].spec_flash_part) {
+                const uint32_t span = pos0 + M;
+                const uint32_t chunk_len = (span <= 1920u) ? 32u : ((span <= 3840u) ? 64u : ((span <= 7680u) ? 128u : 256u));
+                const uint32_t n_chunks = 1u + (span - 1u) / chunk_len;
+                require_split_scratch(M, 16u, n_chunks);
+                struct SfPartKA { uint64_t qo, kc, vc, po, pml; uint32_t M, pos0, nq, nkv, nc, cl; };
+                struct SfMrgKA  { uint64_t po, pml, go, oq, od; uint32_t M, nq, nc; };
+                const SfPartKA pka2{S[g].q_buf_va, S[g].mtp_k_cache_va, S[g].mtp_v_cache_va,
+                                    S[g].spec_fl_part_o_va, S[g].spec_fl_part_ml_va, M, pos0, 16u, 1u, n_chunks, chunk_len};
+                const SfMrgKA  mka2{S[g].spec_fl_part_o_va, S[g].spec_fl_part_ml_va, S[g].gate_buf_va,
+                                    S[g].mid_q8_va, S[g].mid_ds_va, M, 16u, n_chunks};
+                VJ_CHECK(rt.enqueue_kernel(g, *K[g].spec_flash_part,  n_chunks * 512u, M, 1, 512, 1, 1, &pka2, sizeof(pka2), true));
+                VJ_CHECK(rt.enqueue_kernel(g, *K[g].spec_flash_merge, 16u * 256u, M, 1, 256, 1, 1, &mka2, sizeof(mka2), true));
+            } else {
+                struct FlKA { uint64_t qo, go, kc, vc, oq, od; uint32_t M, pos0, nq, nkv; };
+                FlKA fka{S[g].q_buf_va, S[g].gate_buf_va, S[g].mtp_k_cache_va, S[g].mtp_v_cache_va,
+                         S[g].mid_q8_va, S[g].mid_ds_va, M, pos0, 16u, 1u};
+                VJ_CHECK(rt.enqueue_kernel(g, *K[g].attn_flash, 16u * 256u, M, 1, 256, 1, 1, &fka, sizeof(fka), true));
+            }
+            enq_q4_mN(g, ml.w_o, S[g].mid_q8_va, S[g].mid_ds_va, S[g].partial_va, true);
+        }
+
+        // Post-attention AR + RMS over M rows (one slice, M <= 16), same slot as the M=1 path.
+        const auto attn_collective = dispatch::next_collective(ar_epoch);
+        for (size_t g = 0; g < 2; ++g) {
+            const size_t peer = 1u - g;
+            const uint32_t ep = attn_collective.epoch;
+            const uint32_t pp = attn_collective.parity;
+            struct ArKA {
+                uint64_t xp, ptx, lrx, pfl, lfl, bar, h, w, xn, xq, xd;
+                uint32_t M, D, ep, dn;
+                float eps;
+            };
+            ArKA aka{S[g].partial_va,
+                     pay_base + peer * kfd::kArGpuBytes + pp * kfd::kArSlotBytes,
+                     pay_base + g    * kfd::kArGpuBytes + pp * kfd::kArSlotBytes,
+                     flg_base + peer * 4096ULL + (60u & 63u) * 64ULL,
+                     flg_base + g    * 4096ULL + (60u & 63u) * 64ULL,
+                     S[g].ar_bar_va, S[g].mtp_h_cur_va, (g == 0) ? mtp[0].post_attn_norm_va : mtp[1].post_attn_norm_va,
+                     S[g].x_norm_va, S[g].x_q8_va, S[g].x_ds_va, M, D, ep, 1u, eps};
+            VJ_CHECK(rt.enqueue_kernel(g, *K[g].p2p_ar_rms, M * 256u, 1, 1, 256, 1, 1, &aka, sizeof(aka), true));
+        }
+
+        for (size_t g = 0; g < 2; ++g) {
+            const auto& ml = mtp[g];
+            struct RLogKA { uint64_t wr, wsh, xn, lout, shg; uint32_t M, D; };
+            RLogKA rlka{ml.w_router_f16_va, ml.w_sh_gate_va, S[g].x_norm_va, S[g].router_log_va, S[g].sh_gate_sc_va, M, D};
+            VJ_CHECK(rt.enqueue_kernel(g, *K[g].moe_rtr_log, 33u * 256u, (M + 7u) / 8u, 1, 256, 1, 1, &rlka, sizeof(rlka), true));
+            enq_q4_mN(g, ml.w_sh_gu, S[g].x_q8_va, S[g].x_ds_va, S[g].sh_gu_va, false);
+
+            struct RTopKA { uint64_t lin, tids, tw; uint32_t M; };
+            RTopKA rtka{S[g].router_log_va, S[g].top_ids_va, S[g].top_w_va, M};
+            VJ_CHECK(rt.enqueue_kernel(g, *K[g].moe_rtr_top8, M * 256u, 1, 1, 256, 1, 1, &rtka, sizeof(rtka), true));
+            struct SwiKA { uint64_t gu, sc, oq, od; uint32_t M, lff; };
+            SwiKA ska{S[g].sh_gu_va, S[g].sh_gate_sc_va, S[g].sh_q8_va, S[g].sh_ds_va, M, local_ff};
+            VJ_CHECK(rt.enqueue_kernel(g, *K[g].swiglu_q8, M * 256u, 1, 1, 256, 1, 1, &ska, sizeof(ska), false));
+
+            struct GuQ4KA { uint64_t wgq, wgdm, wuq, wudm, xq, xds, tids, mq, mds; uint32_t M, lff, stride; };
+            GuQ4KA gka{ml.w_exp_gate.qs_va, ml.w_exp_gate.dm_va, ml.w_exp_up.qs_va, ml.w_exp_up.dm_va,
+                       S[g].x_q8_va, S[g].x_ds_va, S[g].top_ids_va, S[g].moe_q8_va, S[g].mtp_moe_ds_va,
+                       M, local_ff, ml.w_exp_gate.row_stride_bytes};
+            VJ_CHECK(rt.enqueue_kernel(g, *K[g].moe_gu_q4a8, 8u * (local_ff / 32u) * 256u, M, 1, 256, 1, 1, &gka, sizeof(gka), true));
+            enq_q4_mN(g, ml.w_sh_down, S[g].sh_q8_va, S[g].sh_ds_va, S[g].sh_down_va, false);
+
+            struct DnQ4KA { uint64_t wdq, wddm, mq, mds, tids, tw, shd, out; uint32_t M, D, stride; };
+            DnQ4KA dka{ml.w_exp_down.qs_va, ml.w_exp_down.dm_va, S[g].moe_q8_va, S[g].mtp_moe_ds_va,
+                       S[g].top_ids_va, S[g].top_w_va, S[g].sh_down_va, S[g].partial_va,
+                       M, D, ml.w_exp_down.row_stride_bytes};
+            VJ_CHECK(rt.enqueue_kernel(g, *K[g].moe_down_q4a8, ((D + 15u) / 16u) * 256u, M, 1, 256, 1, 1, &dka, sizeof(dka), true));
+        }
+
+        // Post-MoE AR + shared-head norm over M rows; no LM head here (catch-up only ingests).
+        const auto moe_collective = dispatch::next_collective(ar_epoch);
+        for (size_t g = 0; g < 2; ++g) {
+            const size_t peer = 1u - g;
+            const uint32_t ep = moe_collective.epoch;
+            const uint32_t pp = moe_collective.parity;
+            struct ArKA {
+                uint64_t xp, ptx, lrx, pfl, lfl, bar, h, w, xn, xq, xd;
+                uint32_t M, D, ep, dn;
+                float eps;
+            };
+            ArKA aka{S[g].partial_va,
+                     pay_base + peer * kfd::kArGpuBytes + pp * kfd::kArSlotBytes,
+                     pay_base + g    * kfd::kArGpuBytes + pp * kfd::kArSlotBytes,
+                     flg_base + peer * 4096ULL + (61u & 63u) * 64ULL,
+                     flg_base + g    * 4096ULL + (61u & 63u) * 64ULL,
+                     S[g].ar_bar_va, S[g].mtp_h_cur_va, (g == 0) ? mtp[0].shared_head_norm_va : mtp[1].shared_head_norm_va,
+                     S[g].x_norm_va, S[g].x_q8_va, S[g].x_ds_va, M, D, ep, 0u, eps};
+            VJ_CHECK(rt.enqueue_kernel(g, *K[g].p2p_ar_rms, M * 256u, 1, 1, 256, 1, 1, &aka, sizeof(aka), true));
+        }
+
+        // All token/hidden staging is shared: complete consumption before any caller can reuse it.
+        VJ_CHECK(rt.submit_batch(0) && rt.submit_batch(1));
+        VJ_CHECK(rt.wait_idle(0)    && rt.wait_idle(1));
+        return true;
     };
 
     auto run_greedy_mtp = [&](const std::vector<int32_t>& prompt_ids, int n_gen, uint32_t K_draft,
@@ -3600,10 +4163,28 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             // (each step_mtp enqueues 16 dispatches: 64 * 16 = 1024 << 2048).
             for (size_t j0 = 0; j0 < cnt; j0 += 64u) {
                 const size_t j_end = std::min<size_t>(cnt, j0 + 64u);
-                for (size_t j = j0; j < j_end; ++j) {
-                    uint64_t h0 = (j == 0) ? ((pos == 0) ? S[0].mtp_h_zero_va : S[0].mtp_h_pend_va) : (S[0].h_va + (j - 1u) * h_stride);
-                    uint64_t h1 = (j == 0) ? ((pos == 0) ? S[1].mtp_h_zero_va : S[1].mtp_h_pend_va) : (S[1].h_va + (j - 1u) * h_stride);
-                    (void) step_mtp(chunk[j], pos + static_cast<uint32_t>(j), h0, h1, false, false, static_cast<uint32_t>(j - j0));
+                if (v12_batch_catchup) {
+                    // One M-row forward per <= kMaxSpecBatch consecutive prompt tokens.
+                    for (size_t b0 = j0; b0 < j_end; b0 += kMaxSpecBatch) {
+                        const size_t b_end = std::min<size_t>(j_end, b0 + kMaxSpecBatch);
+                        std::vector<int32_t> bt;
+                        std::vector<uint64_t> bh0, bh1;
+                        bt.reserve(b_end - b0); bh0.reserve(b_end - b0); bh1.reserve(b_end - b0);
+                        for (size_t j = b0; j < b_end; ++j) {
+                            bt.push_back(chunk[j]);
+                            bh0.push_back((j == 0) ? ((pos == 0) ? S[0].mtp_h_zero_va : S[0].mtp_h_pend_va)
+                                                   : (S[0].h_va + (j - 1u) * h_stride));
+                            bh1.push_back((j == 0) ? ((pos == 0) ? S[1].mtp_h_zero_va : S[1].mtp_h_pend_va)
+                                                   : (S[1].h_va + (j - 1u) * h_stride));
+                        }
+                        (void) step_mtp_batch(bt, pos + static_cast<uint32_t>(b0), bh0, bh1);
+                    }
+                } else {
+                    for (size_t j = j0; j < j_end; ++j) {
+                        uint64_t h0 = (j == 0) ? ((pos == 0) ? S[0].mtp_h_zero_va : S[0].mtp_h_pend_va) : (S[0].h_va + (j - 1u) * h_stride);
+                        uint64_t h1 = (j == 0) ? ((pos == 0) ? S[1].mtp_h_zero_va : S[1].mtp_h_pend_va) : (S[1].h_va + (j - 1u) * h_stride);
+                        (void) step_mtp(chunk[j], pos + static_cast<uint32_t>(j), h0, h1, false, false, static_cast<uint32_t>(j - j0));
+                    }
                 }
                 if (j_end == cnt) {
                     gpu_copy_h_both(S[0].mtp_h_pend_va, S[0].h_va + (cnt - 1u) * h_stride,
@@ -3635,9 +4216,32 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         double t_draft = 0.0, t_catch = 0.0, t_ver[17] = {};
         uint32_t n_ver[17] = {}, n_cyc = 0, n_neural = 0;
         auto now_ms = []() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
+        // v1.2 C7+S1: depth from the measured per-M verify time and the live accepted length.
+        spec_policy::MeasuredDepthGovernor mtp_gov;
+        uint32_t gov_depth_sum = 0u, gov_depth_n = 0u;
+        auto mtp_ingest = [&](const std::vector<std::pair<int32_t, uint32_t>>& tok_pos,
+                              const std::vector<uint64_t>& hs0, const std::vector<uint64_t>& hs1) {
+            // Split into maximal runs of consecutive positions: one M-row forward per run (<= kMaxSpecBatch rows).
+            size_t i = 0;
+            while (i < tok_pos.size()) {
+                size_t j = i + 1u;
+                while (j < tok_pos.size() && tok_pos[j].second == tok_pos[j - 1u].second + 1u &&
+                       (j - i) < kMaxSpecBatch) ++j;
+                std::vector<int32_t> bt;
+                std::vector<uint64_t> b0, b1;
+                bt.reserve(j - i); b0.reserve(j - i); b1.reserve(j - i);
+                for (size_t k = i; k < j; ++k) { bt.push_back(tok_pos[k].first); b0.push_back(hs0[k]); b1.push_back(hs1[k]); }
+                (void) step_mtp_batch(bt, tok_pos[i].second, b0, b1);
+                i = j;
+            }
+        };
         while (static_cast<int>(gen.size()) < n_gen) {
             const uint32_t rem = static_cast<uint32_t>(n_gen - static_cast<int>(gen.size()));
-            const uint32_t k_cur = std::min<uint32_t>({K_draft, kGdnRingSlots - 2u, (rem > 1u) ? (rem - 1u) : 0u});
+            uint32_t k_cur = std::min<uint32_t>({K_draft, kGdnRingSlots - 2u, (rem > 1u) ? (rem - 1u) : 0u});
+            if (v12_spec_gov) {
+                const uint32_t gd = mtp_gov.next_depth(k_cur);
+                if (gd > 0u) { k_cur = std::min(k_cur, gd); gov_depth_sum += k_cur; ++gov_depth_n; }
+            }
             // Suffix chains are free to draft and almost always accepted, so they may fill a whole verify batch.
             const uint32_t k_sfx = std::min<uint32_t>({opt.suffix_max_draft, kGdnRingSlots - 2u, (rem > 1u) ? (rem - 1u) : 0u});
             if (k_cur == 0u && (!use_hybrid_suffix || k_sfx == 0u)) {
@@ -3714,6 +4318,10 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             uint32_t acc = 0;
             while (acc < dk && preds[acc] == drafts[acc]) ++acc;
             dr_tot += dk; acc_tot += acc;
+            if (v12_spec_gov) {
+                mtp_gov.observe_verify(std::min<uint32_t>(dk + 1u, 16u), tC - tB);
+                mtp_gov.observe_accept(dk, acc);
+            }
             commit_spec_gdn(acc, dk);
 
             ctx.push_back(gen.back());
@@ -3740,10 +4348,21 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                         gpu_copy_h_both(S[0].mtp_h_stash_va + static_cast<uint64_t>(sc.dst_slot) * h_stride, resolve_h_src(0, sc.src),
                                         S[1].mtp_h_stash_va + static_cast<uint64_t>(sc.dst_slot) * h_stride, resolve_h_src(1, sc.src));
                     }
-                    for (size_t c = 0; c < post.catchup.size(); ++c) {
-                        const auto& st = post.catchup[c];
-                        (void) step_mtp(st.token, st.pos, resolve_h_src(0, st.h), resolve_h_src(1, st.h),
-                                        false, false, static_cast<uint32_t>(c));
+                    if (v12_batch_catchup) {
+                        std::vector<std::pair<int32_t, uint32_t>> tp;
+                        std::vector<uint64_t> c0, c1;
+                        for (const auto& st : post.catchup) {
+                            tp.emplace_back(st.token, st.pos);
+                            c0.push_back(resolve_h_src(0, st.h));
+                            c1.push_back(resolve_h_src(1, st.h));
+                        }
+                        mtp_ingest(tp, c0, c1);
+                    } else {
+                        for (size_t c = 0; c < post.catchup.size(); ++c) {
+                            const auto& st = post.catchup[c];
+                            (void) step_mtp(st.token, st.pos, resolve_h_src(0, st.h), resolve_h_src(1, st.h),
+                                            false, false, static_cast<uint32_t>(c));
+                        }
                     }
                     gpu_copy_h_both(S[0].mtp_h_pend_va, S[0].h_va + acc * h_stride,
                                     S[1].mtp_h_pend_va, S[1].h_va + acc * h_stride);
@@ -3753,10 +4372,22 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                     if (used_suffix) {
                         (void) step_mtp(vtoks[0], pos, S[0].mtp_h_pend_va, S[1].mtp_h_pend_va, false, false, 0u);
                     }
-                    for (uint32_t j = 1u; j <= acc; ++j) {
-                        (void) step_mtp(vtoks[j], pos + j,
-                                        S[0].h_va + (j - 1u) * h_stride, S[1].h_va + (j - 1u) * h_stride,
-                                        false, false, j);
+                    if (v12_batch_catchup && acc > 0u) {
+                        // Rows vtoks[1..acc] at pos+1..pos+acc; the vtoks[0] row (suffix ingest) stays a single step.
+                        std::vector<std::pair<int32_t, uint32_t>> tp;
+                        std::vector<uint64_t> c0, c1;
+                        for (uint32_t j = 1u; j <= acc; ++j) {
+                            tp.emplace_back(vtoks[j], pos + j);
+                            c0.push_back(S[0].h_va + (j - 1u) * h_stride);
+                            c1.push_back(S[1].h_va + (j - 1u) * h_stride);
+                        }
+                        mtp_ingest(tp, c0, c1);
+                    } else {
+                        for (uint32_t j = 1u; j <= acc; ++j) {
+                            (void) step_mtp(vtoks[j], pos + j,
+                                            S[0].h_va + (j - 1u) * h_stride, S[1].h_va + (j - 1u) * h_stride,
+                                            false, false, j);
+                        }
                     }
                     gpu_copy_h_both(S[0].mtp_h_pend_va, S[0].h_va + acc * h_stride,
                                     S[1].mtp_h_pend_va, S[1].h_va + acc * h_stride);
@@ -3780,6 +4411,10 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                             static_cast<unsigned long long>(zs.neural),
                             static_cast<unsigned long long>(zs.suffix_tokens));
             }
+            if (v12_spec_gov && gov_depth_n > 0u)
+                std::printf(" | v12_gov depth %.2f alpha %.3f t_ver(M=4) %.2f ms",
+                            static_cast<double>(gov_depth_sum) / static_cast<double>(gov_depth_n),
+                            mtp_gov.alpha(), mtp_gov.measured_ms(4u));
             std::printf("\n");
         }
         double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - td0).count();
@@ -3790,12 +4425,9 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         return gen;
     };
 
-    double max_pwr = 0.0, max_tmem = 0.0;
-    HwmonSampler telem;
-    size_t parity_code_match = golden::kCodeRef32.size();
-
     // ---- Pillar 3: --dump-golden-layers <dir> (1 GDN L0 + 1 GQA L3 fixture for vegajet_layer_test) ----
     if (!opt.dump_golden_layers_dir.empty()) {
+        const uint32_t local_ff = ff_size[0];
         namespace fs = std::filesystem;
         std::error_code ec;
         fs::create_directories(fs::path(opt.dump_golden_layers_dir) / "weights", ec);
@@ -3891,6 +4523,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
            << "gqa_rot_dim=64\n"
            << "m_list=1,5,16,128,512\n";
         mf.close();
+        if (device_fault_check("golden dump")) fail_run(res.error);
         rt.free_buffer(tap_buf);
         rt.free_buffer(io_buf);
         telem.stop();
@@ -4074,28 +4707,31 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                             const uint32_t pep = pend_ep, aep = ar_epoch++, mep = ar_epoch++;
                             if (layers[0][il].is_gdn) {
                                 const uint32_t cgi = gi++; ++super_sense; ++gdn_sense;
-                                struct GdnSupKA { uint64_t desc, ov; uint32_t pep, oep, cin, cout, sh, ur, ss, gs; };
+                                struct GdnSupKA { uint64_t desc, ov; uint32_t pep, oep, cin, cout, sh, ur, ss, gs; uint64_t fault; };
+                                static_assert(sizeof(GdnSupKA) == 56u, "kernarg ABI drift");
                                 const uint64_t s_layer_bytes = 32ULL * 128ULL * 128ULL * 4ULL;
                                 const uint32_t s_rhead = opt.spec_gdn ? 0u : ring_head;
                                 for (size_t g = 0; g < 2; ++g) {
                                     const uint64_t s_ov = opt.spec_gdn
                                         ? (S[g].spec_gdn_s_slot_va[spec_gdn_active] + static_cast<uint64_t>(cgi) * s_layer_bytes) : 0ULL;
-                                    const GdnSupKA ka{S[g].gdn_super_desc_va + cgi * sizeof(ornith_super::GdnSuperDesc), s_ov, pep, aep, cin, cout, s_rhead, 0u, super_sense | 0x80000000u, gdn_sense};
+                                    const GdnSupKA ka{S[g].gdn_super_desc_va + cgi * sizeof(ornith_super::GdnSuperDesc), s_ov, pep, aep, cin, cout, s_rhead, 0u, super_sense | 0x80000000u, gdn_sense, io_fault_va[g]};
                                     VJ_CHECK(rt.enqueue_kernel(g, *K[g].m1_gdn_super, swgs * 256u, 1, 1, 256, 1, 1, &ka, sizeof(ka), true));
                                 }
                             } else {
                                 const uint32_t cai = ai++; ++super_sense;
-                                struct GqaSupKA { uint64_t desc; uint32_t pep, oep, pos0, ss; };
+                                struct GqaSupKA { uint64_t desc; uint32_t pep, oep, pos0, ss; uint64_t fault; };
+                                static_assert(sizeof(GqaSupKA) == 32u, "kernarg ABI drift");
                                 for (size_t g = 0; g < 2; ++g) {
-                                    const GqaSupKA ka{S[g].gqa_super_desc_va + cai * sizeof(ornith_super::GqaSuperDesc), pep, aep, 1u, super_sense | 0x80000000u};
+                                    const GqaSupKA ka{S[g].gqa_super_desc_va + cai * sizeof(ornith_super::GqaSuperDesc), pep, aep, 1u, super_sense | 0x80000000u, io_fault_va[g]};
                                     VJ_CHECK(rt.enqueue_kernel(g, *K[g].m1_gqa_super, swgs * 256u, 1, 1, 256, 1, 1, &ka, sizeof(ka), true));
                                 }
                             }
                             stamp(0, tidx); stamp(1, tidx); ++tidx;
                             ++super_sense;
-                            struct MoeSupKA { uint64_t desc; uint32_t aep, oep, ss; };
+                            struct MoeSupKA { uint64_t desc; uint32_t aep, oep, ss; uint64_t fault; };
+                            static_assert(sizeof(MoeSupKA) == 32u, "kernarg ABI drift");
                             for (size_t g = 0; g < 2; ++g) {
-                                const MoeSupKA ka{S[g].moe_super_desc_va + il * sizeof(ornith_super::MoeSuperDesc), aep, mep, super_sense | 0x80000000u};
+                                const MoeSupKA ka{S[g].moe_super_desc_va + il * sizeof(ornith_super::MoeSuperDesc), aep, mep, super_sense | 0x80000000u, io_fault_va[g]};
                                 const bool use_q3_k = allow_q3_fast && (swgs == 240u) && K[g].m1_moe_super_q3 &&
                                                       (layers[g][il].w_gu_d8_w_va != 0ULL) &&
                                                       (layers[g][il].gu_d8_w_stride == 2304u);
@@ -4124,12 +4760,13 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                                 struct VocKA { uint64_t wq, wd, xq, xd, bv, bi; uint32_t lr, cols, ro, stride, M; };
                                 const VocKA vka{out_w[g].qs_va, out_w[g].ds_va, S[g].x_q8_va, S[g].x_ds_va, S[g].argmax_val_va, S[g].argmax_id_va,
                                                 voc_rows[g], D, voc_off[g], out_w[g].row_stride_bytes, 1u};
-                                VJ_CHECK(rt.enqueue_kernel(g, *((K[g].vocab_m1 && std::getenv("VEGAJET_VOCAB_MUBUF") && std::strcmp(std::getenv("VEGAJET_VOCAB_MUBUF"), "1") == 0) ? K[g].vocab_m1 : K[g].vocab_argmax), kVocabBlocks * 256u, 1, 1, 256, 1, 1, &vka, sizeof(vka), true));
+                                VJ_CHECK(rt.enqueue_kernel(g, *((K[g].vocab_m1 && std::getenv("VEGAJET_VOCAB_MUBUF") && std::strcmp(std::getenv("VEGAJET_VOCAB_MUBUF"), "1") == 0) ? K[g].vocab_m1 : (K[g].vocab_ilp != nullptr ? K[g].vocab_ilp : K[g].vocab_argmax)), kVocabBlocks * 256u, 1, 1, 256, 1, 1, &vka, sizeof(vka), true));
                             }
                             stamp(0, tidx); stamp(1, tidx); ++tidx;
                         }
                         VJ_CHECK(rt.submit_batch(0) && rt.submit_batch(1));
                         VJ_CHECK(rt.wait_idle(0) && rt.wait_idle(1));
+                        if (device_fault_check("super profile")) fail_run(res.error);
                         std::vector<uint64_t> t0(tidx), t1(tidx);
                         VJ_CHECK(rt.download_from_vram(0, t0.data(), ts_va[0], tidx * 8u));
                         VJ_CHECK(rt.download_from_vram(1, t1.data(), ts_va[1], tidx * 8u));
@@ -4214,6 +4851,9 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
     };
 
     // Execute the full benchmark body (including raw, Suffix, MTP, DFlash2+Hyb, pp512/pp2048) as a reusable lambda!
+    // v1.2 C5: a speculative/MTP/DFlash driver that disagrees with the raw greedy reference must fail the
+    // run (non-zero exit) instead of only printing a lossless= counter next to a tok/s number.
+
     auto run_full_bench_body = [&](bool include_prefill, warm::SweepVariantResult* vout) -> bool {
         uint64_t ue0 = 0, de0 = 0, ue1 = 0, de1 = 0;
         read_ecc_totals(ue0, de0);
@@ -4222,6 +4862,18 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         uint32_t spec_eq = 0, spec_tot = 0;
         int spec_fd = -1;
         bool all_lossless = true;
+        // eq = matching prefix tokens, n_ref = raw reference length, n_got = driver output length.
+        auto validate_spec = [&](const char* what, size_t eq, size_t n_ref, size_t n_got, int first_diff) {
+            if (eq == n_ref && n_got == n_ref) return;
+            all_lossless = false;
+            if (bench_spec_mismatch) return;
+            bench_spec_mismatch = true;
+            bench_spec_mismatch_msg = std::string("speculative validation failed: ") + what + " matched " +
+                                      std::to_string(eq) + "/" + std::to_string(n_ref) +
+                                      " greedy tokens vs the raw reference (got " + std::to_string(n_got) +
+                                      " tokens, first_diff=" + std::to_string(first_diff) + ")";
+            std::fprintf(stderr, "[BENCH-VALIDATE] FAIL %s\n", bench_spec_mismatch_msg.c_str());
+        };
         {
         std::printf("\n=== ORNITH-122B LIVE 2x MI50 BENCHMARK SUITE ===\n");
         const std::vector<int32_t> p_base = {760, 6511, 314, 9338, 369};
@@ -4285,8 +4937,6 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                         chunk, n_prompt, n_gdn_layers, opt.pf_gdn, opt.gdn_state_dump.c_str());
             for (int32_t t : cont) std::printf(" %d", t);
             std::printf("\n");
-            rt.free_buffer(tap_buf);
-            rt.free_buffer(io_buf);
             res.ok = true;
             return false;
         }
@@ -4379,7 +5029,6 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             (void) step_batch(p128, 0u, opt.use_wy_prefill, false, false);
             ab(128u, "prefill");
             rt.free_buffer(cmp);
-            rt.free_buffer(io_buf);
             res.ok = true;
             return false;
         }
@@ -4392,8 +5041,6 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             std::vector<int32_t> ids;
             std::ofstream df(opt.dump_hidden_path, std::ios::binary);
             if (!df) {
-                rt.free_buffer(tap_buf);
-                rt.free_buffer(io_buf);
                 res.error = "Cannot open hidden-state dump file " + opt.dump_hidden_path;
                 return false;
             }
@@ -4419,8 +5066,6 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             std::printf("[DUMP] ids:");
             for (int32_t v : ids) std::printf(" %d", v);
             std::printf("\n");
-            rt.free_buffer(tap_buf);
-            rt.free_buffer(io_buf);
             res.ok = df.good();
             if (!res.ok) res.error = "Short write to hidden-state dump file " + opt.dump_hidden_path;
             return false;
@@ -4473,8 +5118,6 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             const uint32_t V_tot = voc_rows[0] + voc_rows[1];
             std::ofstream lf(opt.dump_logits_path, std::ios::binary);
             if (!lf) {
-                rt.free_buffer(tap_buf);
-                rt.free_buffer(io_buf);
                 res.error = "Cannot open logits dump file " + opt.dump_logits_path;
                 return false;
             }
@@ -4503,8 +5146,6 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                             pi + 1u, n_pos, M_pr, opt.prefill_dot8 ? 1 : 0, opt.dot8_clip_alpha,
                             top1, (top1 >= 0 && static_cast<uint32_t>(top1) < V_tot) ? logits[top1] : 0.0f);
             }
-            rt.free_buffer(tap_buf);
-            rt.free_buffer(io_buf);
             res.ok = lf.good();
             if (!res.ok) res.error = "Short write to logits dump file " + opt.dump_logits_path;
             return false;
@@ -4519,8 +5160,9 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                 return double(w.rows) * (double(w.cols) * 0.5 + double(w.cols / 32u) * 4.0);
             };
             const double gu_d8_row_b = double(dot8_gu_iq2s_layout(1u, D).read_bytes_per_row());
-            const double dn_d8_row_b = double(dot8_iq3_layout(1u, local_ff).read_bytes_per_row());
             for (size_t g = 0; g < 2; ++g) {
+                const uint32_t local_ff = ff_size[g];
+                const double dn_d8_row_b = double((asym_experts ? dot8_iq3_asym_layout(1u, local_ff) : dot8_iq3_layout(1u, local_ff)).read_bytes_per_row());
                 double bg = double(voc_rows[g]) * (double(D) + double(D / 32u) * 2.0);
                 for (uint32_t il = 0; il < 48u; ++il) {
                     const auto& lw = layers[g][il];
@@ -4621,6 +5263,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             }
             res.suffix_exact_matches = eq;
             res.suffix_total_tokens  = static_cast<uint32_t>(raw128.size());
+            validate_spec("tg128 suffix-tree draft", eq, raw128.size(), suf128.size(), first_diff);
             std::printf("[BENCH tg128 Suffix ] %.2f tok/s (%.2fx vs raw) | lossless=%u/%u (first_diff=%d) | hits=%llu acc=%llu/%llu | 0 B VRAM\n",
                         res.tg128_suffix_tps, res.tg128_suffix_tps / std::max(res.tg128_raw_tps, 1e-6),
                         eq, res.suffix_total_tokens, first_diff,
@@ -4644,6 +5287,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             for (size_t i = 0; i < raw_prose.size() && i < mtp_prose.size(); ++i) {
                 if (raw_prose[i] == mtp_prose[i]) ++eqp; else if (fdp == -1) fdp = static_cast<int>(i);
             }
+            validate_spec("tg128 MTP (pure nextn) prose", eqp, raw_prose.size(), mtp_prose.size(), fdp);
             std::printf("[BENCH tg128 MTP K=%u] %.2f tok/s (%.2fx vs raw %.2f) | prose lossless=%u/%zu (first_diff=%d) | acc=%llu/%llu (%.1f%%)\n",
                         opt.mtp_k, mtp_prose_tps, mtp_prose_tps / std::max(raw_prose_tps, 1e-6), raw_prose_tps,
                         eqp, raw_prose.size(), fdp,
@@ -4658,6 +5302,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             for (size_t i = 0; i < raw128.size() && i < hyb128.size(); ++i) {
                 if (raw128[i] == hyb128[i]) ++eqh; else if (fdh == -1) fdh = static_cast<int>(i);
             }
+            validate_spec("tg128 MTP+suffix hybrid code", eqh, raw128.size(), hyb128.size(), fdh);
             std::printf("[BENCH tg128 Hybrid ] %.2f tok/s (%.2fx vs raw) | code lossless=%u/%zu (first_diff=%d) | sfx_hits=%llu acc=%llu/%llu (%.1f%%)\n",
                         hyb128_tps, hyb128_tps / std::max(res.tg128_raw_tps, 1e-6),
                         eqh, raw128.size(), fdh,
@@ -4721,6 +5366,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             float  df_pmin_cur = opt.dflash_p_min;
             auto df_now_ms = []() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
             auto dflash_draft = [&](int32_t anchor_tok, uint32_t s_pos, uint32_t k_draft) -> std::vector<int32_t> {
+                require_token(anchor_tok, "DFlash anchor embedding");
                 const double td_a = df_now_ms();
                 const uint32_t B = k_draft + 1u;
                 const uint32_t T = k_draft;
@@ -4876,8 +5522,9 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                     if (pred < 0 || static_cast<uint32_t>(pred) >= vocab) {
                         std::printf("  [DFERR pos=%u t=%u] invalid draft tok=%d (u0=%d:%.2f)\n", s_pos, t, pred, topi[0], topv[0]);
                         std::fflush(stdout);
-                        pred = 0;
+                        fail_run("DFlash draft argmax is outside the vocabulary");
                     }
+                    require_token(pred, "DFlash draft argmax");
                     drafts.push_back(pred);
                 }
                 const double td_d = df_now_ms();
@@ -4919,6 +5566,11 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                 evict::CostModel ecost;
                 ecost.fixed_us = 2500.0; ecost.per_token_us = 350.0; ecost.per_expert_us = 14.0;
                 evict::EvictController evict_ctl(ecfg, ecost);
+                // v1.2 C7+S1: depth and inflation from the measured per-M verify time + live acceptance.
+                const bool v12_spec_gov = (std::getenv("VEGAJET_V12_SPEC_GOV") != nullptr &&
+                                           std::getenv("VEGAJET_V12_SPEC_GOV")[0] == '1');
+                spec_policy::MeasuredDepthGovernor df_gov;
+                uint32_t df_gov_depth_sum = 0u, df_gov_depth_n = 0u;
 
                 uint32_t pos = 0u;
                 int32_t last_pred = -1;
@@ -4942,7 +5594,11 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                 const auto td0 = std::chrono::steady_clock::now();
                 while (static_cast<int>(gen.size()) < n_gen) {
                     const uint32_t rem = static_cast<uint32_t>(n_gen - static_cast<int>(gen.size()));
-                    const uint32_t k_target = use_evict ? evict_ctl.next_depth() : k_draft;
+                    uint32_t k_target = use_evict ? evict_ctl.next_depth() : k_draft;
+                    if (v12_spec_gov) {
+                        const uint32_t gd = df_gov.next_depth(std::min<uint32_t>(k_draft, df.block_size - 1u));
+                        if (gd > 0u) { k_target = std::min(k_target, gd); df_gov_depth_sum += gd; ++df_gov_depth_n; }
+                    }
                     const uint32_t k_cur = std::min<uint32_t>({k_target, df.block_size - 1u, kGdnRingSlots - 2u, (rem > 1u) ? (rem - 1u) : 0u});
                     const uint32_t k_sfx = std::min<uint32_t>({opt.suffix_max_draft, kGdnRingSlots - 2u, (rem > 1u) ? (rem - 1u) : 0u});
                     if (k_cur == 0u) {
@@ -4988,6 +5644,10 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                         else if (use_hybrid_suffix) cascade.commit(drafts[acc]);
                         ++acc;
                     }
+                    if (v12_spec_gov) {
+                        df_gov.observe_verify(std::min<uint32_t>(dk + 1u, 17u), t2 - t1);
+                        df_gov.observe_accept(dk, acc);
+                    }
                     if (std::getenv("VEGAJET_DFLASH2_DEBUG") && pos < 64u) {
                         std::printf("  [DFVER pos=%u acc=%u/%u] tgt=[%d,%d,%d,%d,%d] dft=[%d,%d,%d,%d,%d]\n",
                                     pos, acc, dk,
@@ -5000,7 +5660,11 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                         else if (use_hybrid_suffix) cascade.commit(preds[acc]);
                     }
                     if (use_evict && !used_suffix && dk > 0u) {
-                        evict_ctl.observe(dk, acc, 1.0 + 0.35 * static_cast<double>(dk));
+                        // Measured time inflation replaces the fabricated 1 + 0.35*dk constant (C7); before the
+                        // first measurement the old constant keeps the controller warm-started.
+                        double infl = v12_spec_gov ? df_gov.time_inflation(dk + 1u) : 0.0;
+                        if (!(infl > 0.0)) infl = 1.0 + 0.35 * static_cast<double>(dk);
+                        evict_ctl.observe(dk, acc, infl);
                     }
                     acc_tot += acc; dr_tot += dk;
                     const uint32_t n_commit = acc + 1u;
@@ -5026,6 +5690,11 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                                 t_dr / n_cyc, df_t_body / n_cyc, df_t_lm / n_cyc, df_t_sel / n_cyc,
                                 t_ver / n_cyc, t_inj / n_cyc,
                                 static_cast<double>(n_gen - 1) / n_cyc);
+                    if (v12_spec_gov && df_gov_depth_n > 0u)
+                        std::printf("[V12 SPEC_GOV gpu=%zu] depth %.2f | alpha %.3f | t_ver(M=4) %.2f ms | inflation(M=8) %.2f\n",
+                                    df_gpu,
+                                    static_cast<double>(df_gov_depth_sum) / static_cast<double>(df_gov_depth_n),
+                                    df_gov.alpha(), df_gov.measured_ms(4u), df_gov.time_inflation(8u));
                 }
                 return gen;
             };
@@ -5089,7 +5758,10 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                         static_cast<unsigned long long>(hacc), static_cast<unsigned long long>(hdr),
                         hdr ? (100.0 * hacc / hdr) : 0.0);
             if (df_hyb_tps > best_spec_tps) { best_spec_tps = df_hyb_tps; spec_eq = eqh; spec_tot = static_cast<uint32_t>(raw128.size()); spec_fd = fdh; }
-            if (eqp != raw_prose.size() || eqc != raw128.size() || eqh != raw128.size()) all_lossless = false;
+            validate_spec("tg128 DFlash2 code", eqc, raw128.size(), df_code.size(), fdc);
+            validate_spec("tg128 DFlash2+hybrid code", eqh, raw128.size(), df_hyb.size(), fdh);
+            if (eqp != raw_prose.size()) all_lossless = false;
+
             read_hwmon_max(pass_pwr, pass_tmem);
             max_pwr = std::max(max_pwr, pass_pwr); max_tmem = std::max(max_tmem, pass_tmem);
         }
@@ -5199,6 +5871,8 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         read_ecc_totals(ue_base, de_base);
         auto gen_fn = [&](const std::vector<int32_t>& prompt_ids, int32_t max_tokens,
                           const OrnithGpuOptions::ServeTokenCb& on_tok) {
+            run_state.check();
+            if (device_faulted) fail_run(res.error);
             if (max_tokens <= 0) return;
             double cur_pwr = 0.0, cur_tmem = 0.0;
             uint64_t ue_now = 0, de_now = 0;
@@ -5211,13 +5885,24 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                              static_cast<unsigned long long>(de_now - de_base));
                 return;
             }
-            reset_state();
             std::vector<int32_t> pids = prompt_ids;
             if (pids.empty()) pids.push_back(tok.bos_id() >= 0 ? tok.bos_id() : 0);
             if (pids.size() >= opt.max_ctx) {
                 pids.erase(pids.begin(), pids.begin() + static_cast<std::ptrdiff_t>(pids.size() - (opt.max_ctx - 1u)));
             }
             const uint32_t n_prompt = static_cast<uint32_t>(pids.size());
+            // v1.2 D1 (VEGAJET_V12_SERVE_SPEC=1): serve through the same suffix-tree speculative driver the bench
+            // measures (`tg128 Suffix`), which commits only tokens that match the greedy argmax, so the served text is
+            // unchanged while the verify batches raise throughput. Off: the plain M=1 greedy loop below.
+            if (v12_serve_spec()) {
+                const SuffixTokenCb report = [&](int32_t tid, uint32_t n_comp, double pp_ms, double dec_ms) {
+                    return on_tok(tid, n_prompt, n_comp, pp_ms, dec_ms);
+                };
+                double spec_tps = 0.0;
+                (void)run_greedy_suffix(pids, max_tokens, &spec_tps, nullptr, nullptr, nullptr, &report, opt.max_ctx);
+                return;
+            }
+            reset_state();
             auto tp0 = std::chrono::steady_clock::now();
             uint32_t pos = 0;
             int32_t cur = -1;
@@ -5230,7 +5915,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                 pos += static_cast<uint32_t>(cnt);
             }
             const double prefill_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp0).count();
-            if (cur < 0) return;
+            require_token(cur, "serve prefill argmax");
             if (!on_tok(cur, n_prompt, 1u, prefill_ms, 0.0)) return;
             auto td0 = std::chrono::steady_clock::now();
             for (int32_t s = 1; s < max_tokens && pos < opt.max_ctx; ++s) {
@@ -5242,7 +5927,8 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             }
         };
         const bool sup_on = !(std::getenv("VEGAJET_ENABLE_SUPER") != nullptr && std::getenv("VEGAJET_ENABLE_SUPER")[0] == '0');
-        const std::string desc = std::string("ornith-gfx906-tp2 (super=") + (sup_on ? "on" : "off") + ", greedy)";
+        const std::string desc = std::string("ornith-gfx906-tp2 (super=") + (sup_on ? "on" : "off") + ", greedy" +
+                                 (v12_serve_spec() ? "+suffix-spec)" : ")");
         opt.serve_hook(gen_fn, desc);
         parity_code_match = golden::kCodeRef32.size();
     } else if (!base_opt.sweep_spec.empty()) {
@@ -5312,6 +5998,8 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                             static_cast<unsigned long long>(rt.reload_generation()),
                             warm::json_escape(rerr).c_str());
                 std::fflush(stdout);
+                // A partial reload/rebind invalidates cached K[] pointers. Never accept another command.
+                if (!ok_res) fail_run("Hot-reload failed; runner stopped: " + rerr);
                 return;
             }
             if (cmd.kind == warm::CommandKind::Parity) {
@@ -5366,6 +6054,21 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         }
     }
 
+    } catch (const guard::RunFailure& failure) {
+        run_state.latch(failure.what());
+        res.error = run_state.error();
+        rt.abort_dispatches();
+        res.ok = false;
+    }
+    if (v12_dense_persist()) {
+        std::printf("[D13] kernel=ornith_gemv_q4a8_m1_w32_persist_kernel launches=%llu\n",
+                    static_cast<unsigned long long>(dense_persist_launches));
+        if (dense_persist_launches == 0u && res.error.empty())
+            res.error = "D13 requested but no persistent GEMV launched";
+    }
+    device_fault_check("run end");   // latch while io_fault_host is still allocated
+    res.ok = false;
+    rt.free_buffer(tap_buf);
     rt.free_buffer(io_buf);
     telem.stop();
     max_tmem = std::max(max_tmem, telem.max_tmem_c);
@@ -5379,12 +6082,17 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                 telem.max_avg_w, telem.max_mean_w(), avg_limit, telem.max_avg1s_w, telem.peak_w, max_tmem,
                 static_cast<unsigned long long>(telem.samples), !telem_ran ? "SKIPPED (no samples)" : (telem_ok ? "PASS" : "FAIL"));
     (void)max_pwr;
+    if (!run_state.error().empty() || !res.error.empty() || device_faulted) { res.ok = false; return res; }
     if (parity_code_match != golden::kCodeRef32.size()) {
         res.error = "Tier-1 llama.cpp code parity failed: " + std::to_string(parity_code_match) + "/" +
                     std::to_string(golden::kCodeRef32.size()) + " exact greedy tokens";
         return res;
     }
     if (!telem_ok) { res.error = "power/thermal telemetry gate failed (see [TELEM])"; return res; }
+    // v1.2 C5: a speculative/MTP mismatch in --bench is a hard failure, not a metric.
+    if (bench_spec_mismatch) { res.error = bench_spec_mismatch_msg; return res; }
+    // v1.2 C1: a fail-closed device fault is never reported as a clean run, even if the caller kept going.
+    if (device_faulted) return res;
     res.ok = true;
     return res;
 }
@@ -6121,10 +6829,11 @@ int run_ornith_gemv_ab_bench(const std::string& hsaco_dir) {
             }
             VJ_CHECK(rt.upload_to_vram(0, mdesc_va, mds.data(), mds.size() * sizeof(ornith_super::MoeSuperDesc)));
             uint32_t s_sense = 1u;
-            struct MoeSupKA { uint64_t desc; uint32_t ar_ep, out_ep, ssense; };
+            struct MoeSupKA { uint64_t desc; uint32_t ar_ep, out_ep, ssense; uint64_t fault; };
+            static_assert(sizeof(MoeSupKA) == 32u, "kernarg ABI drift");
             // 1-layer check first!
             {
-                const MoeSupKA ka{mdesc_va, 0u, 0u, s_sense++};
+                const MoeSupKA ka{mdesc_va, 0u, 0u, s_sense++, 0ULL};
                 VJ_CHECK(rt.enqueue_kernel(0, *k_moe_sup, 192u * 256u, 1, 1, 256, 1, 1, &ka, sizeof(ka), true));
                 VJ_CHECK(rt.submit_batch(0) && rt.wait_idle(0));
                 VJ_CHECK(rt.download_from_vram(0, cur_out.data(), out_va, kD * 4u));
@@ -6136,7 +6845,7 @@ int run_ornith_gemv_ab_bench(const std::string& hsaco_dir) {
                 std::printf("  [SUPER-B 192-WG vs F0+B0] bit_exact=%u/%u max_abs_diff=%.3e\n", exact, kD, mdiff);
             }
             time48("(SUPER-B) 192-WG fused Front+Back (g32, 0 AR)", front_mb + back_mb, [&](uint32_t b) {
-                const MoeSupKA ka{mdesc_va + static_cast<uint64_t>(b) * sizeof(ornith_super::MoeSuperDesc), 0u, 0u, s_sense++};
+                const MoeSupKA ka{mdesc_va + static_cast<uint64_t>(b) * sizeof(ornith_super::MoeSuperDesc), 0u, 0u, s_sense++, 0ULL};
                 VJ_CHECK(rt.enqueue_kernel(0, *k_moe_sup, 192u * 256u, 1, 1, 256, 1, 1, &ka, sizeof(ka), true));
             });
 
@@ -6208,8 +6917,9 @@ int run_ornith_gemv_ab_bench(const std::string& hsaco_dir) {
                 gd.super_bar = sbar_va; gd.D = kD; gd.nk = 8u; gd.nv = 32u;
                 gd.conv_dim = 6144u; gd.z_off = 6144u; gd.alpha_off = 10240u; gd.beta_off = 10272u; gd.eps = 1e-6f;
                 VJ_CHECK(rt.upload_to_vram(0, gd_va, &gd, sizeof(gd)));
-                struct GdnSupKA { uint64_t desc, sring_ov; uint32_t prev_ep, out_ep, cin, cout, shead, uring, ssense, gsense; };
-                const GdnSupKA gska{gd_va, 0ULL, 0u, 0u, 0u, 1u, 0u, 0u, s_sense++, g_sense++};
+                struct GdnSupKA { uint64_t desc, sring_ov; uint32_t prev_ep, out_ep, cin, cout, shead, uring, ssense, gsense; uint64_t fault; };
+                static_assert(sizeof(GdnSupKA) == 56u, "kernarg ABI drift");
+                const GdnSupKA gska{gd_va, 0ULL, 0u, 0u, 0u, 1u, 0u, 0u, s_sense++, g_sense++, 0ULL};
                 VJ_CHECK(rt.enqueue_kernel(0, *k_gdn_sup, 192u * 256u, 1, 1, 256, 1, 1, &gska, sizeof(gska), true));
                 VJ_CHECK(rt.submit_batch(0) && rt.wait_idle(0));
                 VJ_CHECK(rt.download_from_vram(0, cur_out.data(), out_va, kD * 4u));
@@ -6258,8 +6968,9 @@ int run_ornith_gemv_ab_bench(const std::string& hsaco_dir) {
                 qa.w_o_qs = w_out_q; qa.w_o_dm = w_out_d; qa.o_rows = kD; qa.o_cols = mid_c; qa.o_qs_stride = out_st;
                 qa.super_bar = sbar_va; qa.D = kD; qa.eps = 1e-6f;
                 VJ_CHECK(rt.upload_to_vram(0, qa_va, &qa, sizeof(qa)));
-                struct GqaSupKA { uint64_t desc; uint32_t prev_ep, out_ep, pos0, ssense; };
-                const GqaSupKA qska{qa_va, 0u, 0u, pos0, s_sense++};
+                struct GqaSupKA { uint64_t desc; uint32_t prev_ep, out_ep, pos0, ssense; uint64_t fault; };
+                static_assert(sizeof(GqaSupKA) == 32u, "kernarg ABI drift");
+                const GqaSupKA qska{qa_va, 0u, 0u, pos0, s_sense++, 0ULL};
                 VJ_CHECK(rt.enqueue_kernel(0, *k_gqa_sup, 192u * 256u, 1, 1, 256, 1, 1, &qska, sizeof(qska), true));
                 VJ_CHECK(rt.submit_batch(0) && rt.wait_idle(0));
                 VJ_CHECK(rt.download_from_vram(0, cur_out.data(), out_va, kD * 4u));
@@ -6505,8 +7216,13 @@ public:
         info_.vocab_size = static_cast<uint32_t>(bpe_tok_.vocab_size());
         info_.quant_summary = "VJ_Q4_A8+VJ_Q3_IQ2S+VJ_Q4_DOT8";
 
-        // Default to the qualified fast M=1 super-kernel layout unless the operator overrides via env.
-        setenv("VEGAJET_RAW_ONLY", "1", 0);
+        // Default to the qualified fast M=1 super-kernel layout unless the operator overrides via env. With the
+        // speculative serving driver on, RAW_ONLY must be off: it sizes the GDN ring to one slot and promotes the expert
+        // weights in place for M=1, neither of which the M>=2 verify step can use.
+        if (v12_serve_spec())
+            setenv("VEGAJET_RAW_ONLY", "0", 1);
+        else
+            setenv("VEGAJET_RAW_ONLY", "1", 0);
         setenv("VEGAJET_GU_Q3", "1", 0);
         setenv("VEGAJET_VA_CLUSTER", "1", 0);
         setenv("VEGAJET_VOCAB_MUBUF", "1", 0);
@@ -6564,8 +7280,8 @@ public:
         worker_ = std::thread([this, model_path, opt]() mutable {
             const OrnithBenchMetrics m = run_ornith_gpu(model_path, "", opt);
             std::lock_guard<std::mutex> lk(mu_);
-            if (!ready_) {
-                start_err_ = m.error.empty() ? "Ornith GPU engine exited before ready" : m.error;
+            if (!stop_) {
+                start_err_ = m.error.empty() ? "Ornith GPU engine stopped unexpectedly" : m.error;
                 failed_ = true;
                 cv_ready_.notify_all();
             }
@@ -6589,6 +7305,9 @@ public:
     const std::string& description() const { return description_; }
     ModelInfo model_info() const override { return info_; }
     const BpeTokenizer& tokenizer() const override { return legacy_tok_; }
+    // The live runner decodes greedily (temperature/top_p/top_k are not implemented): `vegajet serve` turns that into
+    // HTTP 400 for sampling parameters that differ from the greedy defaults instead of ignoring them.
+    bool supports_sampling() const override { return false; }
 
     std::string format_chat(const std::vector<ChatMessage>& messages) const override {
         std::string out;
@@ -6603,14 +7322,16 @@ public:
                   const GenerationParams& params,
                   const TokenCallback& on_token) override {
         std::unique_lock<std::mutex> lk(mu_);
-        if (stop_ || failed_ || !ready_) return;
+        if (failed_) throw guard::RunFailure(start_err_);
+        if (stop_ || !ready_) throw guard::RunFailure("Ornith GPU engine is not running");
         req_prompt_ = prompt_tokens;
         req_max_tokens_ = params.max_tokens > 0 ? params.max_tokens : 64;
         req_cb_ = on_token;
         req_done_ = false;
         has_req_ = true;
         cv_req_.notify_one();
-        cv_done_.wait(lk, [this] { return req_done_ || stop_; });
+        cv_done_.wait(lk, [this] { return req_done_ || stop_ || failed_; });
+        if (failed_) throw guard::RunFailure(start_err_);
     }
 
 private:

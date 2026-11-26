@@ -7,6 +7,9 @@
 # vgpr_count rises above the ceiling, and also fail once the kernel fits its class (then delete the waiver).
 # An unlisted kernel fails the gate, so new kernels must be classified here.
 
+vj_moe_m1_back_asym_s224_kernel tiled
+vj_moe_down_asym_kernel tiled
+vj_moe_down_asym_q4a8_kernel tiled
 vegajet_megakernel_vm tiled
 kfd_memcpy_u32 tiled
 kfd_memset_u32 tiled
@@ -19,6 +22,8 @@ ornith_p2p_ar_res_rms_quant_kernel tiled
 ornith_p2p_ar_res_rms_quant_prepush_kernel tiled
 ornith_gemv_q4a8_m1_w32_kernel stream
 ornith_gemv_q4a8_m1_w16_kernel stream
+ornith_gemv_q4a8_m1_w32_persist_kernel stream
+ornith_gemv_q4a8_mn_kernel tiled
 ornith_gemm_q4a8_tcc_kernel tiled 73
 ornith_gemm_q4a8_m8_kernel tiled
 ornith_gemm_q4a8_m12_kernel tiled
@@ -38,6 +43,7 @@ ornith_moe_group_sort_kernel tiled
 ornith_moe_gu_iq2s_grouped_kernel tiled 81
 ornith_moe_down_iq3xxs_grouped_kernel tiled
 ornith_vocab_argmax_q8_kernel stream
+ornith_vocab_argmax_q8_ilp_kernel stream
 ornith_vocab_logits_q8_kernel stream
 ornith_vocab_argmax_q8_batch6_kernel stream
 ornith_vocab_argmax_q8_batch12_l2_kernel stream
@@ -76,6 +82,7 @@ ornith_moe_m1_rtr_shgu_kernel stream
 ornith_moe_m1_top8_swiglu_kernel tiled
 ornith_gdn_recur_splitv_quant_kernel stream
 ornith_gdn_conv_recur_splitv_quant_m1_kernel tiled
+ornith_gdn_conv_recur_colthread_quant_m1_kernel tiled
 ornith_moe_m1_back_kernel tiled
 ornith_moe_m1_back_s224_kernel tiled
 ornith_moe_m1_back_s240_kernel tiled
@@ -92,6 +99,7 @@ vj_flash_splitkv_any_partial_kernel stream
 vj_flash_splitkv_any_merge_quant_kernel stream
 vj_spec_gdn_verify_kernel stream
 vj_spec_gdn_norm_quant_kernel stream
+vj_spec_gdn_verify_fused_nq_kernel tiled
 vj_moe_down_dot8_kernel stream
 vj_moe_down_dot8_prepush_kernel stream
 vj_moe_gu_dot8_kernel stream
@@ -131,6 +139,14 @@ ornith_m1_gdn_super_kernel tiled
 ornith_m1_gqa_super_kernel tiled
 ornith_m1_moe_super_kernel tiled
 ornith_m1_moe_super_q3_kernel tiled
+ornith_m1_gdn_super_kernel_vol tiled
+ornith_m1_gqa_super_kernel_vol tiled
+ornith_m1_moe_super_kernel_vol tiled
+ornith_m1_moe_super_q3_kernel_vol tiled
+ornith_m1_gdn_super_kernel_iq2sreg tiled
+ornith_m1_gqa_super_kernel_iq2sreg tiled
+ornith_m1_moe_super_kernel_iq2sreg tiled
+ornith_m1_moe_super_q3_kernel_iq2sreg tiled
 vj_dflash2_tap_copy_kernel tiled
 vj_dflash2_quant_q8_kernel tiled
 vj_dflash2_embed_block_kernel tiled

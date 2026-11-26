@@ -2,6 +2,7 @@
 #include "core/gguf_reader.hpp"
 
 #include <algorithm>
+#include <new>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
@@ -102,6 +103,9 @@ bool is_integer(GgufValueType t) {
            t != GgufValueType::ARRAY;
 }
 
+// No real model has a 1 T-element axis; this keeps every later product far from overflow.
+constexpr uint64_t kMaxTensorDim = 1ull << 40;
+
 } // namespace
 
 std::string GgufValue::to_string(size_t max_items) const {
@@ -134,7 +138,21 @@ std::string GgufValue::to_string(size_t max_items) const {
     }
 }
 
-uint64_t GgufTensorInfo::n_bytes() const { return ggml_row_bytes(type, n_elems()); }
+uint64_t GgufTensorInfo::n_elems() const {
+    uint64_t n = 1;
+    for (uint32_t d = 0; d < 4; ++d)
+        if (__builtin_mul_overflow(n, ne[d], &n)) return 0;
+    return n;
+}
+
+uint64_t GgufTensorInfo::n_bytes() const {
+    const GgmlTypeTraits tr = ggml_type_traits(type);
+    const uint64_t n = n_elems();
+    if (tr.block_elems == 0 || n == 0 || n % tr.block_elems != 0) return 0;
+    uint64_t bytes = 0;
+    if (__builtin_mul_overflow(n / tr.block_elems, static_cast<uint64_t>(tr.block_bytes), &bytes)) return 0;
+    return bytes;
+}
 
 GgufFile::~GgufFile() { close(); }
 
@@ -217,7 +235,16 @@ bool GgufFile::open(const std::string& path) {
         return fail("general.alignment must be a power of two");
     alignment_ = align;
 
-    tensors_.reserve(n_tensors);
+    // Minimum 32 bytes per tensor info: name length + n_dims + one axis + type + offset.
+    const uint64_t info_room = file_size_ - std::min(r.pos(), file_size_);
+    if (n_tensors > info_room / 32)
+        return fail("implausible tensor count " + std::to_string(n_tensors) + " for " +
+                    std::to_string(info_room) + " bytes of tensor info");
+    try {
+        tensors_.reserve(n_tensors);
+    } catch (const std::bad_alloc&) {
+        return fail("tensor table of " + std::to_string(n_tensors) + " entries is too large");
+    }
     for (uint64_t t = 0; t < n_tensors; ++t) {
         GgufTensorInfo ti;
         if (!r.str(ti.name, 1 << 16) || !r.pod(ti.n_dims) || ti.n_dims > 4)
@@ -230,10 +257,25 @@ bool GgufFile::open(const std::string& path) {
     }
     data_offset_ = (r.pos() + alignment_ - 1) / alignment_ * alignment_;
     for (const auto& ti : tensors_) {
-        const uint64_t nb = ti.n_bytes();
-        if (nb == 0 && ggml_type_traits(ti.type).name == nullptr)
+        const GgmlTypeTraits tr = ggml_type_traits(ti.type);
+        if (tr.name == nullptr)
             return fail("tensor " + ti.name + " has unknown ggml type " + std::to_string(ti.type));
-        if (data_offset_ + ti.offset + nb > file_size_)
+        if (ti.n_dims == 0) return fail("tensor " + ti.name + " has no dimensions");
+        for (uint32_t d = 0; d < ti.n_dims; ++d) {
+            if (ti.ne[d] == 0) return fail("tensor " + ti.name + " has a zero-sized dimension");
+            if (ti.ne[d] > kMaxTensorDim)
+                return fail("tensor " + ti.name + " has an implausible dimension " + std::to_string(ti.ne[d]));
+        }
+        const uint64_t n_elems = ti.n_elems();
+        if (n_elems == 0) return fail("tensor " + ti.name + " element count overflows 64 bits");
+        const uint64_t nb = ti.n_bytes();
+        if (nb == 0)
+            return fail("tensor " + ti.name + " has no byte size (" + std::to_string(n_elems) +
+                        " elements is not a whole number of " + tr.name + " blocks of " +
+                        std::to_string(tr.block_elems) + ", or the byte size overflows)");
+        // Overflow-safe: `offset` and `nb` are file-controlled, so a plain sum can wrap.
+        if (data_offset_ > file_size_ || ti.offset > file_size_ - data_offset_ ||
+            nb > file_size_ - data_offset_ - ti.offset)
             return fail("tensor " + ti.name + " extends past end of file");
     }
     return true;
@@ -286,6 +328,13 @@ const GgufTensorInfo* GgufFile::tensor(const std::string& name) const {
 
 const uint8_t* GgufFile::tensor_data(const GgufTensorInfo& t) {
     if (fd_ < 0) return nullptr;
+    // Re-validate the range here: callers may hand in tensor infos that were never vetted by open().
+    const uint64_t nb = t.n_bytes();
+    if (nb == 0 || data_offset_ > file_size_ || t.offset > file_size_ - data_offset_ ||
+        nb > file_size_ - data_offset_ - t.offset) {
+        err_ = path_ + ": tensor " + t.name + " extends past end of file";
+        return nullptr;
+    }
     if (!map_) {
         void* m = ::mmap(nullptr, file_size_, PROT_READ, MAP_PRIVATE, fd_, 0);
         if (m == MAP_FAILED) { err_ = path_ + ": mmap failed"; return nullptr; }
