@@ -24,8 +24,9 @@ vegajet --version | -v
 | `chat` | Interactive chat REPL against any OpenAI-compatible server (`/stats`, `/clear`, `/save`, `/load`) | no |
 
 On a `-DVEGAJET_CPU_ONLY=ON` build no subcommand opens a device node: `bench` and `run` plan, validate, report that
-execution is unavailable and exit with the plan's status; `soak`, `--bench-ar`, `--bench-gemv` and
-`serve <model-file>` exit 3; `plan`, `inspect`, `doctor` (read-only checks), `serve --mock`, `top` and `chat` are
+execution is unavailable and exit with the plan's status; `--bench-ar --dry-run` prints a plan without GPU access.
+`soak`, executing `--bench-ar`, `--bench-gemv` and `serve <model-file>` exit 3;
+`plan`, `inspect`, `doctor` (read-only checks), `serve --mock`, `top` and `chat` are
 complete.
 
 ## Global options
@@ -155,7 +156,9 @@ validation failure, 2 usage error.
 | `--interactive-fifo PATH` | Same, reading commands from a named pipe (`tools/vj_bench_warm.sh` drives it). |
 | `--sweep "A ; B"` | Run several variants in one warm process; each variant is a flag list and/or `VAR=value` settings, separated by `;`. |
 | `--dump-golden-layers DIR` | Capture the golden layer fixture (layer 0 GDN + layer 3 GQA) for `vegajet_layer_test` / `tools/vj_dev.sh` into DIR. |
-| `--bench-ar` | All-reduce micro-bench only (GPU builds). |
+| `--bench-ar` | Print an FP16 N-rank collective/topology plan; `--dry-run` is CPU-only and exits 0. Without dry-run GPU execution remains TP2 only until M3 (default TP2 when omitted); other TP degrees fail closed with exit 3. The diagnostic plan CLI admits 1..256 ranks. |
+| `--tp-profile FILE` | With `--bench-ar`, read schema-1 hardware profile `gpus[].p2p` in owner rank order. Missing edges use host bounce; absent profile means unknown P2P. Plan-only until M3. |
+| `--tp-plan FILE` | With `--bench-ar`, load strict schema-1 owner topology overrides (`stages`, `max_tp`, `min_p2p_gbs`, `allow_host_tp`, `host_bounce`); invalid coverage/capability fails. Plan-only until M3. |
 | `--bench-gemv` | GEMV A/B micro-bench only (GPU builds). |
 
 Before the Ornith GPU runner reserves its per-GPU arenas (2 GPUs, about 30 GiB each), `bench` and `run` check the

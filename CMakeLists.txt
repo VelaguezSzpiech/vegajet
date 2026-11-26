@@ -75,6 +75,7 @@ add_library(vegajet_core STATIC
     core/quant_unpackers.cpp
     core/sharder.cpp
     core/tp_sharder.cpp
+    core/tp_collective.cpp
     core/topology_planner.cpp
     core/hw_profile.cpp
     core/kv_cache.cpp
@@ -295,6 +296,7 @@ vj_test(test_quant_unpackers)
 vj_test(test_ornith_loader)
 vj_test(test_sharder)
 vj_test(test_tp_sharder)
+vj_test(test_tp_collective)
 vj_test(test_topology_planner)
 vj_test(test_grid_planner)
 vj_test(test_hsaco_gate)
@@ -403,6 +405,10 @@ set_source_files_properties(tests/test_moe_route_group.cpp core/moe_route_group.
 
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_FOUND)
+    add_test(NAME test_tp_collective_cli
+             COMMAND ${Python3_EXECUTABLE} -B tests/test_tp_collective_cli.py
+             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    set_tests_properties(test_tp_collective_cli PROPERTIES ENVIRONMENT "VJ_TP_BINARY=$<TARGET_FILE:vegajet>")
     add_test(NAME test_v12_fix_contracts
              COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/test_v12_fix_contracts.py)
     add_test(NAME test_tools

@@ -9,10 +9,15 @@
 #include "core/kfd_runtime.hpp"
 #include "core/portability.hpp"
 #include "core/tokenizer.hpp"
+#include "core/tp_collective.hpp"
 #include "models/ornith/ornith_gpu.hpp"
 #include "models/registry.hpp"
 
 #include <algorithm>
+#include <charconv>
+#include <fstream>
+#include <iterator>
+#include <stdexcept>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
@@ -47,7 +52,9 @@ void usage(const char* cmd) {
                 "                    [--dump-hidden FILE] [--dump-logits FILE] [--dump-tokens FILE] [--gdn-state-dump FILE] [--prefill-seq]\n"
                 "                    [--interactive] [--interactive-fifo PATH] [--sweep \"VAR_A ; VAR_B\"]\n"
                 "                    [--dump-golden-layers DIR]\n"
-                "                    | --bench-ar [--hsaco-dir DIR] | --bench-gemv [--hsaco-dir DIR]\n"
+                "                    | --bench-ar [--tp N] [--dry-run] [--tp-profile FILE] [--tp-plan FILE]\n"
+                "                    | --bench-gemv [--hsaco-dir DIR]\n"
+                "  AR plans:         FP16 N-rank plan only with --dry-run; execution remains TP2 until M3.\n"
                 "  GPU selection:    [--gpu IDX[,IDX|A-B]...|all|list] (CLI-wide; overrides VJ_GPU_DEVICES)\n"
                 "  Dry-run load through the model plugin, per-GPU footprint, decode/prefill graph summary and\n"
                 "  code-object validation (private_segment_fixed_size == 0, every graph kernel symbol exported).\n"
@@ -60,7 +67,8 @@ void usage(const char* cmd) {
 
 int run_bench(const std::string& cmd, const std::vector<std::string>& args) {
     std::string model_path, draft, mask_embd, prompt, hsaco_dir, dump_hidden, dump_logits, json_out, dump_tokens;
-    std::string interactive_fifo, sweep_spec, dump_golden_layers_dir;
+    std::string interactive_fifo, sweep_spec, dump_golden_layers_dir, tp_profile, tp_plan;
+    bool tp_given = false;
     bool interactive = false;
     std::vector<std::string> hsaco;
     uint32_t tp = 1, ctx = 32768;
@@ -79,7 +87,19 @@ int run_bench(const std::string& cmd, const std::vector<std::string>& args) {
         const std::string& a = args[i];
         auto next = [&]() -> std::string { return i + 1 < args.size() ? args[++i] : std::string(); };
         if (a == "--help" || a == "-h") { usage(cmd.c_str()); return 0; }
-        else if (a == "--tp") tp = static_cast<uint32_t>(std::atoi(next().c_str()));
+        else if (a == "--tp") {
+            const auto value = next();
+            const auto parsed = std::from_chars(value.data(), value.data() + value.size(), tp);
+            if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() || tp == 0) {
+                std::fprintf(stderr, "--tp requires a positive unsigned rank count\n"); return 2;
+            }
+            tp_given = true;
+        }
+        else if (a == "--tp-profile" || a == "--tp-plan") {
+            auto& path = a == "--tp-profile" ? tp_profile : tp_plan;
+            path = next();
+            if (path.empty() || path[0] == '-') { std::fprintf(stderr, "%s requires a file\n", a.c_str()); return 2; }
+        }
         else if (a == "--vram-gib") vram_gib = std::atof(next().c_str());
         else if (a == "--ctx") ctx = static_cast<uint32_t>(std::atoi(next().c_str()));
         else if (a == "--reuse") reuse = std::atof(next().c_str());
@@ -164,7 +184,40 @@ int run_bench(const std::string& cmd, const std::vector<std::string>& args) {
                              "(run one bench --dump-tokens per variant)\n");
         return 2;
     }
+    if (!bench_ar && (!tp_profile.empty() || !tp_plan.empty())) {
+        std::fprintf(stderr, "--tp-profile/--tp-plan currently require --bench-ar\n"); return 2;
+    }
     if (bench_ar) {
+        if (!tp_given) tp = 2; // preserve the legacy standalone benchmark default
+        if (tp > 256) { std::fprintf(stderr, "--bench-ar plan CLI admits at most 256 ranks (matrix resource bound)\n"); return 2; }
+        if (ar_int8) { std::fprintf(stderr, "--bench-ar M2 planning supports FP16 wire only\n"); return 2; }
+        try {
+            auto read = [](const std::string& path) {
+                std::ifstream input(path);
+                if (!input) throw std::invalid_argument("cannot read plan/profile: " + path);
+                std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+                if (input.bad()) throw std::invalid_argument("failed reading plan/profile: " + path);
+                return text;
+            };
+            tp::PeerMatrix peers(tp, std::vector<tp::PeerLink>(tp));
+            if (!tp_profile.empty()) {
+                peers = tp::peer_matrix_from_json(read(tp_profile));
+                if (peers.size() != tp) throw std::invalid_argument("--tp does not match hardware profile rank count");
+            } else std::printf("No peer profile: P2P capability unknown; all remote plan edges use host-bounce.\n");
+            const auto options = tp_plan.empty() ? tp::CollectiveOptions{} : tp::collective_options_from_json(read(tp_plan));
+            const auto topology = tp::plan_topology(peers, options);
+            const auto collective = tp::plan_collective(3072, peers, options);
+            std::printf("%s", tp::format_collective_plan(collective, topology).c_str());
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "--bench-ar plan: %s\n", e.what()); return 2;
+        }
+        if (dry_only) return 0;
+        if (tp != 2) {
+            std::fprintf(stderr, "--bench-ar GPU execution supports TP=2 only until milestone 3; TP=%u is plan-only (use --dry-run)\n", tp); return 3;
+        }
+        if (!tp_profile.empty() || !tp_plan.empty()) {
+            std::fprintf(stderr, "--bench-ar owner profile/plan execution requires milestone 3; use --dry-run\n"); return 3;
+        }
         if (!kfd::Runtime::compiled_with_gpu()) { std::fprintf(stderr, "--bench-ar: this build has no GPU backend\n"); return 3; }
         return ornith::run_ornith_ar_bench(hsaco_dir);
     }
@@ -255,6 +308,10 @@ int run_bench(const std::string& cmd, const std::vector<std::string>& args) {
     }
 
     if (kfd::Runtime::compiled_with_gpu() && !dry_only && model->name() == "ornith") {
+        if (tp != 2) {
+            std::fprintf(stderr, "GPU execution supports TP=2 only until milestone 3; TP=%u is plan-only (use --dry-run)\n", tp);
+            return finish(3);
+        }
         // Alpha portability: refuse before the runner reserves its per-GPU arenas, with what is needed vs found,
         // instead of failing late inside the 2 x ~30 GiB allocation on a smaller host.
         {

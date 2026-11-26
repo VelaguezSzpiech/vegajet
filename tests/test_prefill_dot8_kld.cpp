@@ -118,7 +118,7 @@ int main() {
         for (int k = 0; k < 32; ++k) ref_dp += w_ref[k] * x_ref[k];
         int32_t dot8_dp = 0;
         for (int k = 0; k < 4; ++k) dot8_dp = sim_sdot8(p[k], x_q4[k], dot8_dp);
-        const int32_t reconstructed = dot8_dp + (sum_x << 3);
+        const int32_t reconstructed = dot8_dp + sum_x * 8;
         if (reconstructed != ref_dp) {
             std::fprintf(stderr, "FAIL dense affine trial=%d: got=%d expected=%d\n", trial, reconstructed, ref_dp);
             return 1;

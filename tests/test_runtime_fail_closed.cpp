@@ -41,7 +41,19 @@ extern "C" int __wrap_ioctl(int, unsigned long op, ...) {
     if (forced_errno) { errno = forced_errno; return -1; }
     if (op == AMDKFD_IOC_DESTROY_QUEUE && destroy_error) { errno = destroy_error; return -1; }
     if (!io_ok) { errno = EIO; return -1; }
-    if (op == AMDKFD_IOC_ALLOC_MEMORY_OF_GPU) {
+    if (op == AMDKFD_IOC_GET_PROCESS_APERTURES_NEW) {
+        // Keep fake GPUVM allocations in ASan HighMem, not its reserved shadow gap.
+        auto* a = static_cast<kfd_ioctl_get_process_apertures_new_args*>(arg);
+        if (a->kfd_process_device_apertures_ptr) {
+            auto* apertures = reinterpret_cast<kfd_process_device_apertures*>(a->kfd_process_device_apertures_ptr);
+            for (uint32_t i = 0; i < a->num_of_nodes; ++i) {
+                apertures[i] = {};
+                apertures[i].gpu_id = i + 1;
+                apertures[i].gpuvm_base = 0x200000000000ULL;
+                apertures[i].gpuvm_limit = 0x210000000000ULL;
+            }
+        } else a->num_of_nodes = 3;
+    } else if (op == AMDKFD_IOC_ALLOC_MEMORY_OF_GPU) {
         static uint64_t handle = 1000;
         auto* a = static_cast<kfd_ioctl_alloc_memory_of_gpu_args*>(arg);
         a->handle = ++handle;
