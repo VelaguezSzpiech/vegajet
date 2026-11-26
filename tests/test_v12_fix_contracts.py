@@ -6,6 +6,14 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class FixContracts(unittest.TestCase):
+    def test_batched_collective_epochs(self):
+        src = (ROOT / 'models/ornith/ornith_gpu.cpp').read_text()
+        batch = src[src.index('    auto step_mtp_batch ='):src.index('    auto step_mtp_batch =') + 17000]
+        for stage in ('attn', 'moe'):
+            self.assertIn('const auto ' + stage + '_collective = dispatch::next_collective(ar_epoch);\n        for (size_t g', batch)
+            self.assertIn('const uint32_t ep = ' + stage + '_collective.epoch;', batch)
+            self.assertIn('const uint32_t pp = ' + stage + '_collective.parity;', batch)
+
     def test_layer_super_abi(self):
         src = (ROOT / 'tests/vegajet_layer_test.cpp').read_text()
         for kind in ('Gdn', 'Gqa', 'Moe'):

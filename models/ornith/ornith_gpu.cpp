@@ -12,6 +12,7 @@
 #include "core/spec_policy.hpp"
 #include "core/spec_cascade.hpp"
 #include "core/suffix_trie.hpp"
+#include "core/v12_dispatch.hpp"
 #include "core/evict_controller.hpp"
 #include "core/host_preflight.hpp"
 #include "core/moe_lru_cache.hpp"
@@ -3988,10 +3989,11 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         }
 
         // Post-attention AR + RMS over M rows (one slice, M <= 16), same slot as the M=1 path.
+        const auto attn_collective = dispatch::next_collective(ar_epoch);
         for (size_t g = 0; g < 2; ++g) {
             const size_t peer = 1u - g;
-            const uint32_t ep = ar_epoch++;
-            const uint32_t pp = ep & 1u;
+            const uint32_t ep = attn_collective.epoch;
+            const uint32_t pp = attn_collective.parity;
             struct ArKA {
                 uint64_t xp, ptx, lrx, pfl, lfl, bar, h, w, xn, xq, xd;
                 uint32_t M, D, ep, dn;
@@ -4036,10 +4038,11 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         }
 
         // Post-MoE AR + shared-head norm over M rows; no LM head here (catch-up only ingests).
+        const auto moe_collective = dispatch::next_collective(ar_epoch);
         for (size_t g = 0; g < 2; ++g) {
             const size_t peer = 1u - g;
-            const uint32_t ep = ar_epoch++;
-            const uint32_t pp = ep & 1u;
+            const uint32_t ep = moe_collective.epoch;
+            const uint32_t pp = moe_collective.parity;
             struct ArKA {
                 uint64_t xp, ptx, lrx, pfl, lfl, bar, h, w, xn, xq, xd;
                 uint32_t M, D, ep, dn;
