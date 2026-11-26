@@ -4,6 +4,8 @@
 #include <sys/ioctl.h>
 #include <linux/kfd_ioctl.h>
 #include "tests/test_common.hpp"
+#include "tests/live_hsaco_fixture.hpp"
+#include <fcntl.h>
 #include <cerrno>
 #include <cstdarg>
 #include <cstdio>
@@ -21,7 +23,11 @@ extern "C" int __wrap_ioctl(int, unsigned long op, ...) {
     void* arg = va_arg(ap, void*);
     va_end(ap);
     if (!io_ok) { errno = EIO; return -1; }
-    if (op == AMDKFD_IOC_MAP_MEMORY_TO_GPU) {
+    if (op == AMDKFD_IOC_ALLOC_MEMORY_OF_GPU) {
+        static uint64_t handle = 1000;
+        auto* a = static_cast<kfd_ioctl_alloc_memory_of_gpu_args*>(arg);
+        a->handle = ++handle;
+    } else if (op == AMDKFD_IOC_MAP_MEMORY_TO_GPU) {
         auto* a = static_cast<kfd_ioctl_map_memory_to_gpu_args*>(arg);
         a->n_success = std::min(map_done, a->n_devices);
         if (a->n_success != a->n_devices) { errno = EIO; return -1; }
@@ -142,11 +148,32 @@ struct RuntimeTestAccess {
         first.name = "missing";
         first.path = "/nonexistent/vegajet-runtime-test.hsaco";
         rt.loaded_modules_.push_back(first);
+        Runtime::LoadedModule valid;
+        valid.name = "valid";
+        valid.path = std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : ".") +
+                     "/runtime-reload-" + std::to_string(getpid()) + ".hsaco";
+        const auto bytes = vjtest::live_hsaco_fixture();
+        FILE* file = std::fopen(valid.path.c_str(), "wb");
+        VJ_CHECK(file && std::fwrite(bytes.data(), 1, bytes.size(), file) == bytes.size());
+        std::fclose(file);
+        rt.loaded_modules_.insert(rt.loaded_modules_.begin(), valid);
+        rt.kernels_.resize(1);
+        rt.devices_[0].drm_fd = ::open("/dev/zero", O_RDWR);
+        VJ_CHECK(rt.devices_[0].drm_fd >= 0);
+        rt.kfd_fd_ = dup(rt.devices_[0].drm_fd);
+        rt.va_cursor_ = 0x10000000000ULL; rt.va_limit_ = 0x20000000000ULL;
+        io_ok = true; map_done = unmap_done = 32;
         std::string err;
         VJ_CHECK(!rt.reload_all_hsacos(&err));
+        VJ_CHECK(rt.reload_generation_ == 1); // first module committed, second failed
         VJ_CHECK(err.find("runtime stopped") != std::string::npos);
         VJ_CHECK(!rt.open_ && rt.queues_.empty());
         VJ_CHECK(!rt.execute({}, &err) && err == "Runtime is not open");
+        rt.shutdown();
+        VJ_CHECK(rt.retained_buffers_.empty());
+        std::remove(valid.path.c_str());
+        io_ok = false;
+        free_calls = 0;
     }
 };
 }
