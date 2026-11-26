@@ -5999,6 +5999,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         }
     }
 
+    device_fault_check("run end");   // latch while io_fault_host is still allocated
     rt.free_buffer(io_buf);
     telem.stop();
     max_tmem = std::max(max_tmem, telem.max_tmem_c);
@@ -6018,7 +6019,6 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         return res;
     }
     if (!telem_ok) { res.error = "power/thermal telemetry gate failed (see [TELEM])"; return res; }
-    device_fault_check("run end");   // catches a fault from a dispatch queued outside step_batch
     // v1.2 C5: a speculative/MTP mismatch in --bench is a hard failure, not a metric.
     if (bench_spec_mismatch) { res.error = bench_spec_mismatch_msg; return res; }
     // v1.2 C1: a fail-closed device fault is never reported as a clean run, even if the caller kept going.
