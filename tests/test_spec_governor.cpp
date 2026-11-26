@@ -5,6 +5,8 @@
 #include "tests/test_common.hpp"
 
 #include <cstdio>
+#include <cmath>
+#include <random>
 #include <vector>
 
 using namespace vegajet;
@@ -49,7 +51,7 @@ int main() {
     {
         MeasuredDepthGovernor gov;
         for (uint32_t i = 0; i < 4; ++i) {
-            gov.observe_accept(15u, 1u);  // alpha ~0.067
+            gov.observe_accept(15u, 0u);  // no accepted conditional trials
             for (uint32_t m = 1; m <= 16; ++m) gov.observe_verify(m, 4.0 + 0.15 * static_cast<double>(m));
         }
         VJ_CHECK(gov.alpha() < 0.1);
@@ -117,6 +119,19 @@ int main() {
         VJ_CHECK(gov.alpha() > 0.0);  // neutral prior, still a legal acceptance
     }
 
+    // The same conditional acceptance must not fall just because K is deeper.
+    for (uint32_t depth : {1u, 4u, 8u, 15u}) {
+        MeasuredDepthConfig cfg;
+        cfg.alpha_window = 20000u;
+        MeasuredDepthGovernor gov(cfg);
+        std::mt19937 rng(721);
+        for (uint32_t i = 0; i < 20000u; ++i) {
+            uint32_t accepted = 0;
+            while (accepted < depth && rng() % 10u != 0u) ++accepted;
+            gov.observe_accept(depth, accepted);
+        }
+        VJ_CHECK(std::abs(gov.alpha() - 0.9) < 0.01);
+    }
     std::printf("test_spec_governor: ok\n");
     return 0;
 }
