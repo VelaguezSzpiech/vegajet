@@ -46,8 +46,9 @@ struct GgufTensorInfo {
     uint64_t ne[4] = {1, 1, 1, 1};
     uint32_t type = 0;       // GgmlType id
     uint64_t offset = 0;     // relative to data_offset
-    uint64_t n_elems() const { return ne[0] * ne[1] * ne[2] * ne[3]; }
-    uint64_t n_bytes() const;  // 0 if the type is unknown
+    // Overflow-checked element count: 0 if the dims product does not fit in 64 bits.
+    uint64_t n_elems() const;
+    uint64_t n_bytes() const;  // 0 if the type is unknown, the geometry is unaligned, or it overflows
 };
 
 class GgufFile {
