@@ -108,6 +108,8 @@ add_library(vegajet_core STATIC
     core/request_scheduler.cpp
     core/gpu_select.cpp
     core/engine_factory.cpp
+    core/fp_oracles.cpp
+    core/dflash_step_ref.cpp
     ops/op_desc.cpp
     ops/layer_plan.cpp
 )
@@ -367,6 +369,14 @@ vj_test(test_spec_cascade)
 vj_test(test_fr_spec_lossless)
 vj_test(test_fwht_kld_oracle)
 vj_test(test_gdn_verify_oracle)
+# v1.3 oracles: FP64 GDN verify / EVICT dedup reference + DFlash single-step hidden-state diff.
+vj_test(test_fp_oracles)
+vj_test(test_dflash_step_ref)
+add_executable(vj_dflash_hidden_diff tools/dflash_hidden_diff.cpp)
+target_include_directories(vj_dflash_hidden_diff PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_link_libraries(vj_dflash_hidden_diff PRIVATE vegajet_core Threads::Threads)
+target_compile_options(vj_dflash_hidden_diff PRIVATE ${VJ_WARN})
+add_test(NAME vj_dflash_hidden_diff_selftest COMMAND vj_dflash_hidden_diff --self-test)
 vj_test(test_bpe_tokenizer)
 vj_test(test_paged_kv)
 vj_test(test_ple_pregather)
