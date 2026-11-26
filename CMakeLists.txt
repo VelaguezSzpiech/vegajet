@@ -74,6 +74,7 @@ add_library(vegajet_core STATIC
     core/quant_repacker.cpp
     core/quant_unpackers.cpp
     core/sharder.cpp
+    core/tp_sharder.cpp
     core/topology_planner.cpp
     core/hw_profile.cpp
     core/kv_cache.cpp
@@ -293,6 +294,7 @@ set_tests_properties(test_runtime_fail_closed PROPERTIES TIMEOUT 30)
 vj_test(test_quant_unpackers)
 vj_test(test_ornith_loader)
 vj_test(test_sharder)
+vj_test(test_tp_sharder)
 vj_test(test_topology_planner)
 vj_test(test_grid_planner)
 vj_test(test_hsaco_gate)
