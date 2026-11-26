@@ -90,6 +90,15 @@ class FixContracts(unittest.TestCase):
             self.assertIn('const uint32_t ep = ' + stage + '_collective.epoch;', batch)
             self.assertIn('const uint32_t pp = ' + stage + '_collective.parity;', batch)
 
+    def test_expert_metadata_precedes_runtime_and_payload_reads(self):
+        src = (ROOT / 'models/ornith/ornith_gpu.cpp').read_text()
+        run = src[src.index('OrnithBenchMetrics run_ornith_gpu(', src.index('#else')):]
+        self.assertLess(run.index('validate_expert_tensor('), run.index('kfd::Runtime rt;'))
+        self.assertLess(run.index('validate_expert_tensor('), run.index('f.tensor_data('))
+        self.assertIn('load_mtp_experts ? 49u : 48u', run)
+        for name in ('ffn_gate_exps.weight', 'ffn_up_exps.weight', 'ffn_down_exps.weight'):
+            self.assertIn(name, run[:run.index('kfd::Runtime rt;')])
+
     def test_slice_protocol_all_schedules(self):
         # Abstract publication/observation model, not GPU execution. A host drain
         # gates the next publish on BOTH observations, including delayed rank B.

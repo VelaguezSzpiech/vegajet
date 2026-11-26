@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+#include "models/ornith/expert_tensor_checks.hpp"
 #include "core/bpe_tokenizer.hpp"
 #include "core/engine_factory.hpp"
 #include "core/engine_interface.hpp"
@@ -870,6 +871,20 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         res.error = "VEGAJET_V12_ASYM_EXPERTS=1 cannot be combined with VEGAJET_V12_BATCH_CATCHUP=1: "
                     "batched MTP requires symmetric 512-column experts; disable either toggle";
         return res;
+    }
+
+    // Validate metadata before mapping expert payloads or initializing GPU arenas.
+    const char* raw_env = std::getenv("VEGAJET_RAW_ONLY");
+    const bool load_mtp_experts = !(raw_env && raw_env[0] == '1') &&
+                                  f.tensor("blk.48.nextn.eh_proj.weight") != nullptr;
+    for (uint32_t il = 0; il < (load_mtp_experts ? 49u : 48u); ++il) {
+        const std::string prefix = "blk." + std::to_string(il) + ".";
+        for (const char* suffix : {"ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"}) {
+            const std::string name = prefix + suffix;
+            if (!validate_expert_tensor(f.tensor(name), name, hp.n_embd, hp.n_ff_exp, hp.n_expert,
+                                        std::strcmp(suffix, "ffn_down_exps.weight") == 0, il < 48u, &res.error))
+                return res;
+        }
     }
 
     kfd::Runtime rt;

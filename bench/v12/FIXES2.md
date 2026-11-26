@@ -73,3 +73,24 @@ of 256 and 384 FP16 rows (two/three slices) through the runner/harness. Confirm 
 cannot publish its next slice until B has consumed the prior one. An intentionally
 non-returning B must surface a host completion timeout, not return output tokens.
 The CPU schedule regression covers that delayed-B ordering without hardware.
+
+## P-M3 — expert payload validation
+
+All 48 trunk layers and the active optional MTP layer are validated before runtime
+initialization and before expert payload mapping/reads. The GPU runner explicitly
+requires D=3072, n_ff_exp=1024, n_expert=256 for its fixed-layout expert kernels.
+Gate/Up must be IQ2_S with 984-byte rows; Down must be IQ3_XXS with 392-byte rows.
+Require exact [input, output, expert] axes (or equivalent flattened 2-D rows),
+including a unit unused fourth axis and exact payload byte count. MTP's generic
+uploader accepts registered decodable/block-aligned types, with the same shape
+checks, rather than needlessly constraining its existing source quantization.
+Errors include the tensor name and expected layout/type. No toggle: malformed or
+unsupported input fails closed; healthy model bytes and tokens are unchanged.
+
+`test_ornith_expert_layout` covers canonical/flat layouts, wrong/missing types,
+small declared tensors, n_ff_exp disagreement, wrong/swapped axes with equal byte
+counts, extra dimensions, and overflow-sized axes. CPU source contracts pin the
+check before runtime initialization and payload access; no GPU is needed to run
+these validators. On MI50, mutate one expert descriptor in a copy of the model
+(type, n_ff_exp, axis, or tiny extent) and require the named error without GPU
+allocation/upload. The unchanged healthy file must still load and match tokens.
