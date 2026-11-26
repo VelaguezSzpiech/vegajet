@@ -20,9 +20,12 @@
 #include "core/host_preflight.hpp"
 #include "core/moe_lru_cache.hpp"
 #include "core/warm_bench.hpp"
+#include "core/rank_timing.hpp"
+#include "models/ornith/ornith_dot8_route.hpp"
 #include "models/ornith/ornith_golden.hpp"
 #include "models/ornith/ornith_gpu.hpp"
 #include "models/ornith/ornith_tp_exec.hpp"
+#include "core/placement.hpp"
 
 #include "core/spec_engine.hpp"
 #include "core/spec_tree.hpp"
@@ -838,7 +841,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         return res;
     }
     auto t_load0 = std::chrono::steady_clock::now();
-    if (opt.tp == 2) { // Legacy fast-path preflight; generic ranks use their own capacity plan.
+    if (opt.tp == 2 && opt.placement_json.empty()) { // Legacy fast-path preflight; generic ranks use their own capacity plan.
         const auto budget = preflight::check_arena(preflight::gfx906_vram_bytes("/"), preflight::kOrnithArenaGiB,
                                                    preflight::kOrnithGpus, "the Ornith-122B GPU runner");
         if (!budget.ok) { res.error = budget.message; return res; }
@@ -849,7 +852,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
     BpeTokenizer tok;
     if (!tok.load_from_gguf(gguf_path, &res.error)) return res;
 
-    if (opt.tp != 2) {
+    if (opt.tp != 2 || !opt.placement_json.empty()) {
         const auto ids = opt.dump_prompt_ids.empty() ? tok.encode(prompt_text.empty() ? "Hello" : prompt_text) : opt.dump_prompt_ids;
         return run_ornith_nrank(f, tok, ids, opt);
     }
@@ -1264,6 +1267,24 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
     const auto all_D_rows = iota_range(0, D);
     const uint32_t max_batch = std::max<uint32_t>(128u, opt.prefill_chunk);
     const uint64_t arena_cap_bytes = static_cast<uint64_t>(30.5 * 1073741824.0);
+    // v1.3 dot8-wire [VEGAJET_V13_DOT8_PROMOTE=1]: the planner's TensorPlan::format picks the routed Gate+Up
+    // format per layer; the heuristic layer count, --gu-dot8-layers and VJ_Q3 are not mixed in (fail closed).
+    const bool v13_dot8 = dot8_promote_enabled();
+    Dot8UploadPlan v13_dot8_plan;
+    if (v13_dot8) {
+        if (opt.gu_dot8_layers != 0u || std::getenv("VEGAJET_GU_DOT8_LAYERS") || std::getenv("VEGAJET_GU_Q3")) {
+            res.error = "VEGAJET_V13_DOT8_PROMOTE: --gu-dot8-layers / VEGAJET_GU_DOT8_LAYERS / VEGAJET_GU_Q3 conflict with the planned formats";
+            return res;
+        }
+        Dot8KernelRoutes routes;
+        routes.gate_up_dot8 = K[0].moe_gu_d8 && K[1].moe_gu_d8;
+        routes.down_dot8 = K[0].moe_down_d8 && K[1].moe_down_d8;
+        routes.gate_up_geometry = (asym_experts || local_ff == 512u) && D == 3072u;
+        if (!resolve_dot8_upload_plan(planner.tensor_plan(), std::min<uint32_t>(hp.n_trunk, 48u), has_mtp_tensor, routes,
+                                      v13_dot8_plan, &res.error)) return res;
+        std::printf("[ornith::dot8] VEGAJET_V13_DOT8_PROMOTE: plan -> %u/48 Gate+Up layers VJ_Q4_DOT8, %u Down tensors VJ_Q4_DOT8\n",
+                    v13_dot8_plan.gate_up_layers, v13_dot8_plan.down_layers);
+    }
     // Wave 3: Model-agnostic spare-VRAM DOT8 promotion via plan_dot8_promotion (crossover law enforced).
     // When opt.gu_dot8_layers == 0 (auto), compute exact spare VRAM pool after reserving 1.5 GiB/GPU headroom
     // and promote IQ2_S Gate+Up layers for M >= 2 speculative verify where L2-cached DOT8 beats IQ2_S.
@@ -1272,7 +1293,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         target_gu_dot8_layers = static_cast<uint32_t>(std::max(0, std::atoi(gd_env)));
     }
     const bool no_auto_dot8 = (std::getenv("VEGAJET_NO_AUTO_DOT8") != nullptr && std::getenv("VEGAJET_NO_AUTO_DOT8")[0] == '1');
-    if (target_gu_dot8_layers == 0u && !no_auto_dot8 && (asym_experts || local_ff == 512u) && D == 3072u) {
+    if (!v13_dot8 && target_gu_dot8_layers == 0u && !no_auto_dot8 && (asym_experts || local_ff == 512u) && D == 3072u) {
         const Dot8RowLayout gu_lay = dot8_gu_iq2s_layout(256ULL * local_ff, D);
         const uint64_t est_base_vram = raw_only_vram ? (24600ULL << 20) : (26400ULL << 20);
         const uint64_t headroom      = raw_only_vram ? (640ULL << 20)   : (1600ULL << 20);
@@ -1424,7 +1445,9 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                     promoted_in_place = true;
                 }
             }
-            if (!promoted_in_place && il < target_gu_dot8_layers && (asym_experts || local_ff == 512u) && D == 3072u) {
+            const bool gu_dot8_wanted = v13_dot8 ? (il < v13_dot8_plan.gate_up_dot8.size() && v13_dot8_plan.gate_up_dot8[il] != 0u)
+                                                 : (il < target_gu_dot8_layers);
+            if (!promoted_in_place && gu_dot8_wanted && (asym_experts || local_ff == 512u) && D == 3072u) {
                 const Dot8RowLayout lay = dot8_gu_iq2s_layout(n_rows_rank, D);
                 const uint64_t reserve_tail = raw_only_vram
                     ? (static_cast<uint64_t>(47u - il) * (505ULL << 20) + (768ULL << 20))
@@ -1466,6 +1489,10 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                     }
                     ++gu_dot8_promoted;
                     promoted_in_place = raw_only_vram;
+                } else if (v13_dot8) {
+                    res.error = "VEGAJET_V13_DOT8_PROMOTE: blk." + std::to_string(il) +
+                                " Gate+Up planned as VJ_Q4_DOT8 does not fit the VRAM reserve";
+                    return res;
                 }
             }
             if (!promoted_in_place && asym_experts) {
@@ -1650,6 +1677,10 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         }
         std::printf("  uploaded blk.48 nextn MTP head | GPU0=%.2f GiB GPU1=%.2f GiB\n",
                     rt.vram_arena(0).used() / 1073741824.0, rt.vram_arena(1).used() / 1073741824.0);
+    }
+    if (v13_dot8 && gu_dot8_promoted != v13_dot8_plan.gate_up_layers) {
+        res.error = "VEGAJET_V13_DOT8_PROMOTE: uploaded Gate+Up DOT8 layers differ from the plan";
+        return res;
     }
     if (gu_dot8_promoted > 0u) {
         std::printf("  promoted %u/48 layers Gate+Up IQ2_S -> exact VJ_Q4_DOT8 (%s)\n",
@@ -5241,9 +5272,19 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             std::printf("[AR-TIMELINE] %u stamped AllReduces, %.2f tok/s with stamps; last %u tokens, us per token:\n", n, tl_tps, toks);
             if (toks >= 2u) {
                 const uint32_t first = n - toks * per_tok;
+                // v1.3 M7: the same stamps through core/rank_timing. Only the AllReduce kernel is stamped here, so the
+                // device time between two AllReduces is booked as unstamped (other kernels), never as host gap.
+                ranktiming::Aggregator ar_timer(2);
+                std::string terr;
                 for (size_t g = 0; g < 2; ++g) {
                     std::vector<uint64_t> ts(static_cast<size_t>(n) * 6u);
                     VJ_CHECK(rt.download_from_vram(g, ts.data(), S[g].ar_ts_va, ts.size() * 8u));
+                    for (uint32_t i = first; i < n && terr.empty(); ++i) {
+                        const uint64_t* t = &ts[static_cast<size_t>(i) * 6u];
+                        const char* stage = ((i - first) & 1u) ? "allreduce_after_moe" : "allreduce_after_mixer";
+                        if (t[3] < t[2]) terr = "peer stamp before flag stamp";
+                        else (void)ar_timer.add(static_cast<uint32_t>(g), stage, t[0], t[5] ? t[5] : t[4], t[3] - t[2], false, &terr);
+                    }
                     // sums: [class 0 = even AR of a layer (after the mixer), 1 = odd (after the MoE)][phase]
                     double sum[2][6] = {}; uint32_t waits[2] = {0, 0}; double wmax = 0.0;
                     for (uint32_t i = first; i < n; ++i) {
@@ -5267,6 +5308,11 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                                     sum[c][3] / toks, sum[c][4] / toks, sum[c][5] / toks);
                     double tot = 0.0; for (auto& r : sum) for (double v : r) tot += v;
                     std::printf("  gpu%zu total %.0f us/token (wait %.0f, max single wait %.1f us)\n", g, tot / toks, (sum[0][2] + sum[1][2]) / toks, wmax);
+                }
+                if (!terr.empty()) std::printf("[RANK-TIMING note] tp2-ar-timeline stamps rejected: %s\n", terr.c_str());
+                else {
+                    const auto report = ar_timer.report("tp2-ar-timeline", toks);
+                    std::printf("%s%s%s\n", ranktiming::to_table(report).c_str(), ranktiming::kLogTag, ranktiming::to_json(report).c_str());
                 }
             }
         }
@@ -7294,6 +7340,7 @@ public:
         opt.hsaco_dir = spec.hsaco_dir;
         opt.tp = spec.tp;
         opt.tp_shard_json = spec.tp_shards; opt.tp_collective_json = spec.tp_plan;
+        opt.placement_json = spec.placement_json;
         opt.max_ctx = std::max<uint32_t>(spec.context, 256u);
         opt.run_bench = false;
         opt.run_parity = false;

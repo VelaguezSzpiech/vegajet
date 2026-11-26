@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:vegajet:placement:1",
+  "title": "VegaJet declarative placement, schema 1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "tp_groups"],
+  "properties": {
+    "schema": {"const": 1},
+    "tp_groups": {
+      "type": "array", "minItems": 1,
+      "items": {
+        "type": "object", "additionalProperties": false, "required": ["id", "devices"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "devices": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/device"}}
+        }
+      }
+    },
+    "pipeline_stages": {
+      "type": "array",
+      "items": {
+        "type": "object", "additionalProperties": false, "required": ["tp_group", "layer_begin", "layer_end"],
+        "properties": {
+          "tp_group": {"type": "string", "minLength": 1},
+          "layer_begin": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+          "layer_end": {"type": "integer", "minimum": 1, "maximum": 4294967295}
+        }
+      }
+    },
+    "replicas": {
+      "type": "array",
+      "items": {
+        "type": "object", "additionalProperties": false, "required": ["id", "tp_group"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "tp_group": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "drafter": {
+      "type": "object", "additionalProperties": false, "required": ["kind", "device"],
+      "properties": {"kind": {"enum": ["DFlash2", "MTP"]}, "device": {"$ref": "#/$defs/device"}}
+    }
+  },
+  "$defs": {
+    "device": {
+      "oneOf": [
+        {"type": "object", "additionalProperties": false, "required": ["unique_id"], "properties": {"unique_id": {"type": "string", "minLength": 1}}},
+        {"type": "object", "additionalProperties": false, "required": ["bdf"], "properties": {"bdf": {"type": "string", "pattern": "^[0-9a-f]{4}:[0-9a-f]{2}:[0-1][0-9a-f]\\.[0-7]$"}}}
+      ]
+    }
+  },
+  "$comment": "Cross-field checks are performed by core/placement: unique physical devices, group references, half-open layer coverage, N=1 replicas and model-adapter capacity. Executor admission is separate and fail-closed."
+}

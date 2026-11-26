@@ -20,11 +20,13 @@
 //     {<mode>: {label, tokens, speedup_vs_raw, acceptance_pct}}, "kld": {dot8_prefill_kld}, "parity":
 //     {code_vs_tier1: {match,total,verdict}, <mode>_lossless: {match,total}}, "first_diff": {<mode>: n},
 //     "spill": {private_segment_bytes_max}, "telemetry": {...}, "gpus": [{id, tmem_c, power_cap_w}],
-//     "ras": {gpuN: {block: {ue, de, ce}}} }
+//     "ras": {gpuN: {block: {ue, de, ce}}}, "rank_timing": vegajet.rank_timing.v1 object or null (core/rank_timing) }
 // Writing to an existing file of the same schema, model and commit merges: measured values of this run replace
 // the stored ones, the rest is kept (so a W4A8 run and a --prefill-dot8 run fill one scorecard), telemetry keeps
 // the worst case and RAS deltas add up.
 #pragma once
+
+#include "core/rank_timing.hpp"
 
 #include <cstdint>
 #include <map>
@@ -79,6 +81,8 @@ struct Record {
     std::string telem_verdict;
     std::optional<uint64_t> spill_bytes_max;
     std::vector<GpuState> gpus_before, gpus_after;
+    // v1.3 M7: per-rank / per-stage s_memrealtime split from the engine's [RANK-TIMING] line (null when not stamped)
+    std::optional<ranktiming::Report> rank_timing;
 };
 
 bool parse_line(const std::string& line, Record& r);  // true when the line was recognized

@@ -30,6 +30,10 @@ void vj_tp_allreduce_fp16(vegajet::tp::CollectiveArgs a) {
         return;
     }
     const uint64_t frame = uint64_t(a.epoch & 1u) * a.ranks + a.rank;
+    // v1.3 M7: s_memrealtime at entry / flags posted / every peer seen / reduction stored, written by lane 0 into
+    // status bytes 8..39 only after the reduction, so the stamps add no PCIe store inside the timed phases.
+    const uint64_t t0 = __builtin_amdgcn_s_memrealtime();
+    uint64_t t1 = 0, t2 = 0;
     unsigned bad = 0;
     #pragma nounroll
     for (uint64_t pair = lane; pair < (a.elements + 1) / 2; pair += 64) {
@@ -55,6 +59,7 @@ void vj_tp_allreduce_fp16(vegajet::tp::CollectiveArgs a) {
         for (unsigned d = 0; d < a.ranks; ++d)
             push(reinterpret_cast<uint32_t*>(routes[d].push_flags + frame * 64), a.epoch);
         drain();
+        t1 = __builtin_amdgcn_s_memrealtime();
         #pragma nounroll
         for (unsigned s = 0; s < a.ranks; ++s) {
             const uint64_t source_frame = uint64_t(a.epoch & 1u) * a.ranks + s;
@@ -69,6 +74,7 @@ void vj_tp_allreduce_fp16(vegajet::tp::CollectiveArgs a) {
             }
             if (!found) { ready = 0; push(status, 4); break; }
         }
+        t2 = __builtin_amdgcn_s_memrealtime();
     }
     ready = __shfl(ready, 0);
     __syncthreads();
@@ -84,5 +90,13 @@ void vj_tp_allreduce_fp16(vegajet::tp::CollectiveArgs a) {
             sum = s == 0 ? value : __fadd_rn(sum, value);
         }
         output[i] = sum;
+    }
+    __syncthreads();
+    if (!lane) {
+        const uint64_t t3 = __builtin_amdgcn_s_memrealtime();
+        push(status + 2, static_cast<uint32_t>(t0)); push(status + 3, static_cast<uint32_t>(t0 >> 32));
+        push(status + 4, static_cast<uint32_t>(t1)); push(status + 5, static_cast<uint32_t>(t1 >> 32));
+        push(status + 6, static_cast<uint32_t>(t2)); push(status + 7, static_cast<uint32_t>(t2 >> 32));
+        push(status + 8, static_cast<uint32_t>(t3)); push(status + 9, static_cast<uint32_t>(t3 >> 32));
     }
 }

@@ -127,6 +127,12 @@ bool after_ratio(const std::string& line, const char* key, long& a, long& b) {  
 bool parse_line(const std::string& line, Record& r) {
     double x = 0;
     long n = 0, m = 0;
+    if (const auto at_tag = line.find(ranktiming::kLogTag); at_tag != std::string::npos) {
+        ranktiming::Report rt;
+        if (!ranktiming::from_json(line.substr(at_tag + std::strlen(ranktiming::kLogTag)), rt, nullptr)) return false;
+        r.rank_timing = std::move(rt);
+        return true;
+    }
     if (line.find("[BENCH tg128 raw M=1]") != std::string::npos) {
         Scan c{line};
         c.find("[BENCH tg128 raw M=1]");
@@ -300,7 +306,8 @@ std::string to_json(const Record& r) {
         .add("kld", Obj().add("dot8_prefill_kld", opt(r.dot8_kld)).str(2)).add("parity", par.str(2)).add("first_diff", first_diff.str(2))
         .add("spill", Obj().add("private_segment_bytes_max", opt(r.spill_bytes_max)).str(2)).add("telemetry", tel.str(2))
         .add("gpus", gpus).add("ras", ras.str(2))
-        .add("ras_window", q(r.gpus_after.empty() ? "absolute" : "delta"));
+        .add("ras_window", q(r.gpus_after.empty() ? "absolute" : "delta"))
+        .add("rank_timing", r.rank_timing ? ranktiming::to_json(*r.rank_timing) : "null");
     return root.str(0) + "\n";
 }
 
@@ -371,6 +378,11 @@ bool from_json(const std::string& text, Record& r, std::string* err) {
     }
     if (const auto* s = at(v, "spill"))
         if (auto x = gnum(*s, "private_segment_bytes_max")) r.spill_bytes_max = static_cast<uint64_t>(*x);
+    if (const auto* rt = at(v, "rank_timing"); rt && !rt->is_null()) {
+        ranktiming::Report rep;
+        if (!ranktiming::from_value(*rt, rep, err)) return false;
+        r.rank_timing = std::move(rep);
+    }
     if (const auto* t = at(v, "telemetry")) {
         r.power_avg_w = gnum(*t, "power_rolling_avg_w");
         r.power_avg_limit_w = gnum(*t, "power_avg_limit_w");
@@ -421,6 +433,7 @@ void merge(Record& into, const Record& run) {
     if (!run.plan_status.empty()) into.plan_status = run.plan_status;
     if (!run.error.empty()) into.error = run.error;
     into.timestamp_utc = run.timestamp_utc;
+    take(into.rank_timing, run.rank_timing);
     into.gpu_selection = run.gpu_selection;
     into.tp = run.tp;
     take(into.raw_tok_s, run.raw_tok_s); take(into.raw_ms_per_tok, run.raw_ms_per_tok); take(into.eff_hbm2_gbs, run.eff_hbm2_gbs);

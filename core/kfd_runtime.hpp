@@ -282,6 +282,10 @@ public:
     bool configure_collective(uint64_t elements, const tp::CollectiveOptions& options, std::string* err);
     bool collective_allreduce(const std::vector<uint64_t>& partials, const std::vector<uint64_t>& outputs,
                               uint64_t elements, std::string* err);
+    // v1.3 M7: rank's own s_memrealtime stamps of the last completed collective_allreduce, read from its status
+    // slot: [0] kernel entry, [1] own payload + flags posted, [2] every peer flag seen, [3] reduction stored.
+    // false when the last call had no collective kernel (bypass) or the stamps are missing / out of order.
+    bool collective_stamps(size_t rank, uint64_t out[4]) const;
 
     // Opens /dev/kfd with default arena sizing (30.5 GiB ceiling, 64 MiB pinned staging).
     bool open(std::string* err);

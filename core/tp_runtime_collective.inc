@@ -100,6 +100,10 @@ bool Runtime::collective_allreduce(const std::vector<uint64_t>& partials, const 
     if (collective_epoch_ == UINT32_MAX) return fail("epoch exhausted; recreate runtime after quiescence");
     const uint32_t epoch = ++collective_epoch_;
     const uint32_t n = static_cast<uint32_t>(devices_.size());
+    // M7 stamps (status bytes 8..39 of each rank) are cleared so a stale epoch can never be read back as this one.
+    for (uint32_t r = 0; r < n; ++r)
+        std::memset(static_cast<uint8_t*>(collective_status_.host_ptr) + uint64_t(r) * 64 + 8, 0, 32);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
     for (uint32_t r = 0; r < n; ++r) {
         tp::CollectiveArgs args{partials[r], outputs[r], collective_routes_.va + uint64_t(r) * n * sizeof(tp::CollectiveRoute),
                                 collective_status_.va + uint64_t(r) * 64, elements, collective_plan_.payload_stride,
@@ -116,4 +120,11 @@ bool Runtime::collective_allreduce(const std::vector<uint64_t>& partials, const 
     for (uint32_t r = 0; r < n; ++r)
         if (status[r * 16]) return fail("rank " + std::to_string(r) + " protocol status=" + std::to_string(status[r * 16]));
     return true;
+}
+
+bool Runtime::collective_stamps(size_t rank, uint64_t out[4]) const {
+    if (!open_ || failed_ || collective_plan_.bypass || rank >= devices_.size() || !collective_status_.host_ptr) return false;
+    const auto* s = reinterpret_cast<const volatile uint64_t*>(static_cast<const uint8_t*>(collective_status_.host_ptr) + rank * 64 + 8);
+    for (int i = 0; i < 4; ++i) out[i] = s[i];
+    return out[0] && out[0] <= out[1] && out[1] <= out[2] && out[2] <= out[3];
 }

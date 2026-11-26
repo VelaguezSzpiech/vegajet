@@ -15,6 +15,7 @@
 #include "core/tp_executor.hpp"
 #include "models/ornith/ornith_gpu.hpp"
 #include "models/ornith/ornith_tp_exec.hpp"
+#include "core/placement.hpp"
 #include "models/registry.hpp"
 
 #include <algorithm>
@@ -112,6 +113,7 @@ void usage(const char* cmd) {
                 "                    | --bench-ar [--tp N] [--dry-run] [--tp-profile FILE] [--tp-plan FILE]\n"
                 "                    | --bench-gemv [--hsaco-dir DIR]\n"
                 "  N-rank raw:       [--tp-shards FILE] [--tp-plan FILE]; FP16 wire, sequential per-op prefill/decode.\n"
+                "  Placement:        [--placement FILE] [--placement-print]; print validates/proposes without execution.\n"
                 "  GPU selection:    [--gpu IDX[,IDX|A-B]...|all|list] (CLI-wide; overrides VJ_GPU_DEVICES)\n"
                 "  Dry-run load through the model plugin, per-GPU footprint, decode/prefill graph summary and\n"
                 "  code-object validation (private_segment_fixed_size == 0, every graph kernel symbol exported).\n"
@@ -125,6 +127,8 @@ void usage(const char* cmd) {
 int run_bench(const std::string& cmd, const std::vector<std::string>& args) {
     std::string model_path, draft, mask_embd, prompt, hsaco_dir, dump_hidden, dump_logits, json_out, dump_tokens;
     std::string interactive_fifo, sweep_spec, dump_golden_layers_dir, tp_profile, tp_plan, tp_shards, shard_text, collective_text;
+    std::string placement_path, placement_text;
+    bool placement_print = false;
     bool tp_given = false;
     std::vector<std::string> explicit_flags;
     bool interactive = false;
@@ -177,6 +181,8 @@ int run_bench(const std::string& cmd, const std::vector<std::string>& args) {
         else if (a == "--no-fuse-router") fuse_router = false;
         else if (a == "--fuse-back") fuse_back = true;
         else if (a == "--no-fuse-back") fuse_back = false;
+        else if (a == "--placement") { placement_path = next(); if (placement_path.empty() || placement_path[0] == '-') { std::fprintf(stderr, "--placement needs a file\n"); return 2; } }
+        else if (a == "--placement-print") { placement_print = true; dry_only = true; }
         else if (a == "--profile-stages") profile_stages = true;
         else if (a == "--spec-force-reject") force_reject = true;
         else if (a == "--dot8-ab") dot8_ab = true;
@@ -244,7 +250,7 @@ int run_bench(const std::string& cmd, const std::vector<std::string>& args) {
         return 2;
     }
     if (tp > 256) { std::fprintf(stderr, "--tp exceeds the 256-rank runtime bound\n"); return 2; }
-    if (!bench_ar && !tp_profile.empty()) {
+    if (!bench_ar && !placement_print && !tp_profile.empty()) {
         std::fprintf(stderr, "--tp-profile requires --bench-ar; decode uses selected-device identities and --tp-shards\n"); return 2;
     }
     if (bench_ar && !tp_shards.empty()) { std::fprintf(stderr, "--tp-shards is for decode, not --bench-ar\n"); return 2; }
@@ -254,9 +260,21 @@ int run_bench(const std::string& cmd, const std::vector<std::string>& args) {
             if (!input) throw std::runtime_error("cannot read TP JSON: " + path);
             return std::string(std::istreambuf_iterator<char>(input), {});
         };
+        if (bench_ar && (!placement_path.empty() || placement_print)) throw std::runtime_error("placement is not supported by --bench-ar");
+        if (!placement_path.empty()) {
+            placement_text = read_json(placement_path);
+            const auto config = placement::from_json(placement_text);
+            if (!placement_print) {
+                const auto why = placement::executor_error(config);
+                if (!why.empty()) throw std::runtime_error(why);
+                const auto ranks = config.tp_groups.at(0).devices.size();
+                if (tp_given && tp != ranks) throw std::runtime_error("placement TP-group size conflicts with --tp");
+                tp = static_cast<uint32_t>(ranks);
+            }
+        }
         if (!tp_shards.empty()) { shard_text = read_json(tp_shards); (void)tp::shard_options_from_json(shard_text); }
         if (!tp_plan.empty()) { collective_text = read_json(tp_plan); (void)tp::collective_options_from_json(collective_text); }
-        if (!bench_ar && tp == 2 && (!tp_shards.empty() || !tp_plan.empty()))
+        if (!bench_ar && placement_text.empty() && tp == 2 && (!tp_shards.empty() || !tp_plan.empty()))
             throw std::runtime_error("TP=2 legacy fast path does not support --tp-shards/--tp-plan overrides");
     } catch (const std::exception& e) { std::fprintf(stderr, "%s\n", e.what()); return 2; }
     if (bench_ar) {
@@ -303,7 +321,7 @@ int run_bench(const std::string& cmd, const std::vector<std::string>& args) {
     if (!model) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
     // The Ornith GPU runner's live default is its two-rank fast path; --tp overrides it. Other plugins
     // keep the single-device planning default.
-    if (!tp_given && model->name() == "ornith") tp = 2;
+    if (!tp_given && placement_text.empty() && !placement_print && model->name() == "ornith") tp = 2;
     LoadOptions opt;
     opt.gpus.assign(tp, GpuTarget{60, 800.0, 1.725, static_cast<uint64_t>(vram_gib * GiB)});
     for (size_t i = 0; i < bws.size() && i < tp; ++i) opt.gpus[i].bw_hbm_gbs = bws[i];
@@ -311,6 +329,38 @@ int run_bench(const std::string& cmd, const std::vector<std::string>& args) {
     opt.batch_reuse_factor = reuse;
     opt.draft_gguf = draft;
     const LoadReport rep = model->load(f, opt);
+    if (!placement_text.empty() || placement_print) {
+        try {
+            if (!rep.ok) throw std::runtime_error(rep.error);
+            const auto* om = dynamic_cast<const ornith::OrnithModel*>(model.get());
+            if (!om) throw std::runtime_error("placement capacity adapter unsupported for this model plugin");
+            auto devices = placement::selected_profiles();
+            tp::PeerMatrix peers;
+            if (!tp_profile.empty()) {
+                std::ifstream input(tp_profile);
+                if (!input) throw std::runtime_error("cannot read placement profile");
+                const std::string text(std::istreambuf_iterator<char>(input), {});
+                devices = tp::profiles_from_json(text);
+                peers = tp::peer_matrix_from_json(text);
+            } else if (placement_text.empty()) peers = placement::selected_peers(devices);
+            const auto shard_options = shard_text.empty() ? tp::ShardOptions{} : tp::shard_options_from_json(shard_text);
+            const auto capacity = [&](const auto& ranks, uint32_t begin, uint32_t end) {
+                auto h = om->hparams();
+                h.recurrent = std::vector<bool>(h.recurrent.begin() + begin, h.recurrent.begin() + end);
+                h.n_trunk = end - begin;
+                h.n_gdn = static_cast<uint32_t>(std::count(h.recurrent.begin(), h.recurrent.end(), true));
+                h.n_attn = h.n_trunk - h.n_gdn;
+                (void)ornith::raw_layout(h, ctx, ranks, shard_options);
+            };
+            const auto config = placement_text.empty()
+                ? placement::propose(devices, peers, om->hparams().n_trunk, capacity,
+                    collective_text.empty() ? tp::CollectiveOptions{} : tp::collective_options_from_json(collective_text))
+                : placement::from_json(placement_text);
+            placement::validate(config, devices, om->hparams().n_trunk, capacity);
+            if (placement_print) { std::printf("%s\n", placement::to_json(config).c_str()); return 0; }
+            placement::bind_executor(config, tp);
+        } catch (const std::exception& e) { std::fprintf(stderr, "--placement: %s\n", e.what()); return 2; }
+    }
     std::printf("== %s plan: plugin=%s arch=%s TP=%u ctx=%u reuse=%.1f -> %s\n", cmd.c_str(), model->name().c_str(),
                 rep.architecture.c_str(), tp, ctx, reuse, rep.ok ? "fits" : rep.error.c_str());
     for (size_t i = 0; i < rep.weight_bytes_per_gpu.size(); ++i)
@@ -382,7 +432,7 @@ int run_bench(const std::string& cmd, const std::vector<std::string>& args) {
             rc = 1;
         } else {
             try {
-                if (tp != 2) {
+                if (tp != 2 || !placement_text.empty()) {
                     const auto layout = ornith::raw_layout(om->hparams(), ctx, devs,
                         shard_text.empty() ? tp::ShardOptions{} : tp::shard_options_from_json(shard_text));
                     for (size_t r = 0; r < layout.ranks.size(); ++r) {
@@ -473,6 +523,7 @@ int run_bench(const std::string& cmd, const std::vector<std::string>& args) {
         gopt.fr_spec_rows    = fr_spec;
         gopt.tp              = tp;
         gopt.tp_shard_json = shard_text; gopt.tp_collective_json = collective_text;
+        gopt.placement_json = placement_text;
         gopt.tp_bandwidths = bws;
         gopt.mtp_k           = mtp_k;
         gopt.gu_grp_verify   = gu_grp_verify;
@@ -503,10 +554,10 @@ int run_bench(const std::string& cmd, const std::vector<std::string>& args) {
         gopt.dump_golden_layers_dir = dump_golden_layers_dir;
         if (!prompt.empty()) gopt.dump_prompt_ids = prompt_ids;
         gopt.moe_back_wgs    = back_wgs;
-        if (tp != 2) {
-            const std::set<std::string> per_op = {"--tp", "--tp-shards", "--tp-plan", "--tp-profile", "--ctx", "--vram-gib", "--bw-gbs",
+        if (tp != 2 || !placement_text.empty()) {
+            const std::set<std::string> per_op = {"--placement", "--placement-print", "--tp", "--tp-shards", "--tp-plan", "--tp-profile", "--ctx", "--vram-gib", "--bw-gbs",
                 "--prompt", "--n-predict", "--hsaco-dir", "--hsaco", "--json-out", "--dry-run", "--ar-wire", "--reuse",
-                "--prefill-seq", "--no-fast-prefill", "--no-fuse-router", "--no-fuse-back", "--no-gdn-splitv", "--ab-no-prepush"};
+                "--prefill-seq", "--no-fast-prefill", "--no-fuse-router", "--no-fuse-back", "--no-gdn-splitv", "--ab-no-prepush", "--profile-stages"};
             for (const auto& flag : explicit_flags) if (!per_op.count(flag)) {
                 std::fprintf(stderr, "generic Ornith: unsupported feature %s (TP=%u)\n", flag.c_str(), tp); return finish(2);
             }

@@ -225,6 +225,7 @@ bool Runtime::open(std::string* err) {
 }
 bool Runtime::configure_collective(uint64_t, const tp::CollectiveOptions&, std::string* err) { return open(err); }
 bool Runtime::collective_allreduce(const std::vector<uint64_t>&, const std::vector<uint64_t>&, uint64_t, std::string* err) { return open(err); }
+bool Runtime::collective_stamps(size_t, uint64_t*) const { return false; }
 bool Runtime::init(double, size_t, std::string* err, size_t) { return open(err); }
 void Runtime::shutdown() { open_ = false; }
 bool Runtime::abort_dispatches() { open_ = false; failed_ = true; return true; }

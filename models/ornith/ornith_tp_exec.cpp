@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 #include "models/ornith/ornith_tp_exec.hpp"
 #include "core/q4_dot8_repack.hpp"
+#include "core/placement.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -47,16 +48,25 @@ std::string ornith_admit(uint32_t tp, const tp::FeatureFlags& features) {
 }
 
 std::string ornith_raw_admit(const OrnithGpuOptions& o) {
+    if (!o.placement_json.empty()) {
+        try {
+            const auto config = placement::from_json(o.placement_json);
+            const auto why = placement::executor_error(config);
+            if (!why.empty()) return why;
+            if (config.tp_groups[0].devices.size() != o.tp) return "placement TP-group size conflicts with --tp";
+
+        } catch (const std::exception& e) { return e.what(); }
+    }
     const auto base = ornith_admit(o.tp, ornith_feature_flags(o));
     if (!base.empty()) return base;
-    if (o.tp == 2) return (!o.tp_shard_json.empty() || !o.tp_collective_json.empty())
+    if (o.tp == 2 && o.placement_json.empty()) return (!o.tp_shard_json.empty() || !o.tp_collective_json.empty())
         ? "TP=2 legacy fast path: TP JSON overrides unsupported" : "";
     auto no = [](const char* name) { return std::string("generic Ornith: unsupported feature ") + name; };
     if (!o.max_ctx || o.max_ctx > 8192) return no("context outside 1..8192");
     if (o.fr_spec_rows || o.zero_tax_catchup) return no("MTP/FR-Spec/catch-up");
     if (o.spec_flash || o.spec_force_reject || o.gu_grp_verify || o.down_grp_verify) return no("speculative verify");
     if (o.gu_dot8_layers || o.dot8_ab) return no("Gate/Up promotion or DOT8 A/B");
-    if (o.profile_stages || o.pp_stages || o.ar_timeline) return no("stage/AR timeline diagnostics");
+    if (o.pp_stages || o.ar_timeline) return no("pp-stage/AR timeline diagnostics (TP=2 only; use --profile-stages)");
     if (!o.dump_hidden_path.empty() || !o.dump_logits_path.empty() || !o.gdn_state_dump.empty() || !o.dump_golden_layers_dir.empty())
         return no("hidden/logits/state/golden dump");
     if (o.interactive || !o.interactive_fifo.empty() || !o.sweep_spec.empty()) return no("interactive/sweep");

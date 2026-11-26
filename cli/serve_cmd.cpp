@@ -16,6 +16,8 @@
 #include <fstream>
 #include "core/tp_sharder.hpp"
 #include "core/tp_collective.hpp"
+#include "core/placement.hpp"
+#include "cli/inspect.hpp"
 
 namespace vegajet::cli {
 
@@ -56,6 +58,7 @@ void print_serve_usage(std::FILE* f) {
     std::fprintf(f,
                  "Usage: vegajet serve <model-file>|--model FILE [--gpu IDX[,IDX|A-B]...|all|list] [--tp N] [--ctx T]\n"
                  "                     [--slots N] [--hsaco-dir DIR] [--tp-shards FILE] [--tp-plan FILE] [common options]\n"
+                 "                     [--placement FILE] [--placement-print]\n"
                  "       vegajet serve --mock [--gguf TOKENIZER-FILE] [--slots N] [common options]\n"
                  "  common: [--host 127.0.0.1] [--port 8080] [--model-id NAME] [--max-queue 16]\n"
                  "          [--chat-format auto|chatml|qwen25|qwen3|ornith] [--enable-thinking] [--reasoning-format auto|none]\n"
@@ -94,6 +97,8 @@ int parse_serve_args(const std::vector<std::string>& args, ServeConfig& c, std::
         else if (a == "--max-queue") { if (!value(v) || !parse_uint(v, 1, 4096, n)) return fail("--max-queue takes 1..4096"); c.max_queue = static_cast<uint32_t>(n); }
         else if (a == "--tp") { if (!value(v) || !parse_uint(v, 1, 256, n)) return fail("--tp takes 1..256"); c.tp = static_cast<uint32_t>(n); }
         else if (a == "--ctx") { if (!value(v) || !parse_uint(v, 256, 1u << 20, n)) return fail("--ctx takes 256..1048576"); c.ctx = static_cast<uint32_t>(n); }
+        else if (a == "--placement") { if (!value(c.placement) || c.placement.empty() || c.placement[0] == '-') return fail("--placement needs a file"); }
+        else if (a == "--placement-print") c.placement_print = true;
         else if (a == "--tp-shards") { if (!value(c.tp_shards)) return fail("--tp-shards needs a file"); }
         else if (a == "--tp-plan") { if (!value(c.tp_plan)) return fail("--tp-plan needs a file"); }
         else if (a == "--hsaco-dir") { if (!value(c.hsaco_dir)) return fail("--hsaco-dir needs a directory"); }
@@ -125,6 +130,7 @@ int parse_serve_args(const std::vector<std::string>& args, ServeConfig& c, std::
     }
     if (c.mock && !c.model_path.empty()) return fail("--mock and a model file are mutually exclusive");
     if (!c.mock && c.model_path.empty()) return fail("serve needs a model file (or --mock)");
+    if (c.mock && (!c.placement.empty() || c.placement_print)) return fail("placement requires a model engine, not --mock");
     if (c.mock && (!c.tp_shards.empty() || !c.tp_plan.empty())) return fail("TP JSON requires a model engine");
     if (c.mock && c.tp > 1) return fail("--tp applies to a model file, not --mock");
     return 0;
@@ -179,6 +185,31 @@ int run_serve(const std::vector<std::string>& args, const gpusel::Selection& gpu
     }
     if (c.help) { print_serve_usage(stdout); return 0; }
 
+    if (c.placement_print) {
+        std::vector<std::string> plan = {c.model_path, "--placement-print", "--ctx", std::to_string(c.ctx)};
+        if (!c.placement.empty()) { plan.push_back("--placement"); plan.push_back(c.placement); }
+        if (!c.tp_shards.empty()) { plan.push_back("--tp-shards"); plan.push_back(c.tp_shards); }
+        if (!c.tp_plan.empty()) { plan.push_back("--tp-plan"); plan.push_back(c.tp_plan); }
+        return run_bench("bench", plan);
+    }
+    std::string placement_text;
+    gpusel::Selection effective_gpus = gpus;
+    if (!c.placement.empty()) {
+        try {
+            std::ifstream input(c.placement);
+            if (!input) throw std::runtime_error("cannot read placement JSON");
+            placement_text.assign(std::istreambuf_iterator<char>(input), {});
+            const auto config = placement::from_json(placement_text);
+            const auto why = placement::executor_error(config);
+            if (!why.empty()) throw std::runtime_error(why);
+            const auto ranks = static_cast<uint32_t>(config.tp_groups.at(0).devices.size());
+            if (c.tp && c.tp != ranks) throw std::runtime_error("placement TP-group size conflicts with --tp");
+            c.tp = ranks;
+            placement::bind_executor(config, c.tp);
+            if (!gpusel::resolve(nullptr, std::getenv(gpusel::kEnvVar), effective_gpus, &err)) throw std::runtime_error(err);
+        } catch (const std::exception& e) { std::fprintf(stderr, "[vegajet] %s\n", e.what()); return 2; }
+    }
+
     // ---- tokenizer + chat template
     bpe::Tokenizer tok;
     bpe::ChatFormat fmt = bpe::ChatFormat::ChatML;
@@ -214,7 +245,7 @@ int run_serve(const std::vector<std::string>& args, const gpusel::Selection& gpu
     } else {
         const std::vector<gpusel::Device> devs = gpusel::scan_topology(gpusel::sysfs_root());
         std::vector<size_t> picked;
-        if (!devs.empty() && !gpusel::pick_devices(gpus, devs, picked, &err)) {
+        if (!devs.empty() && !gpusel::pick_devices(effective_gpus, devs, picked, &err)) {
             std::fprintf(stderr, "[vegajet] %s\n", err.c_str());
             return 2;
         }
@@ -232,6 +263,7 @@ int run_serve(const std::vector<std::string>& args, const gpusel::Selection& gpu
         spec.tp = c.tp;
         spec.context = c.ctx;
         spec.hsaco_dir = c.hsaco_dir;
+        spec.placement_json = placement_text;
         try {
             auto read_json = [](const std::string& path) {
                 std::ifstream input(path);
@@ -240,7 +272,7 @@ int run_serve(const std::vector<std::string>& args, const gpusel::Selection& gpu
             };
             if (!c.tp_shards.empty()) { spec.tp_shards = read_json(c.tp_shards); (void)tp::shard_options_from_json(spec.tp_shards); }
             if (!c.tp_plan.empty()) { spec.tp_plan = read_json(c.tp_plan); (void)tp::collective_options_from_json(spec.tp_plan); }
-            if (spec.tp == 2 && (!spec.tp_shards.empty() || !spec.tp_plan.empty()))
+            if (spec.tp == 2 && placement_text.empty() && (!spec.tp_shards.empty() || !spec.tp_plan.empty()))
                 throw std::runtime_error("TP=2 legacy fast path does not support TP JSON overrides");
         } catch (const std::exception& e) { std::fprintf(stderr, "%s\n", e.what()); return 2; }
         if (!serve::EngineRegistry::instance().create(spec, handle, &err)) {

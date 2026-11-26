@@ -34,7 +34,17 @@ OrnithBenchMetrics run_ornith_nrank(GgufFile& f, BpeTokenizer& tokenizer, const 
         OrnithModel model;
         const auto report = model.load(f, lo);
         if (!report.ok) throw std::runtime_error(report.error);
+        if (dot8_promote_enabled()) {
+            // v1.3 dot8-wire: this path uploads Gate+Up as merged IQ2_S and Down as exact DOT8 only.
+            Dot8KernelRoutes routes;
+            routes.down_dot8 = true;  // vj_moe_dot8 is a required module below; a missing kernel throws at launch
+            Dot8UploadPlan dot8_plan;
+            std::string dot8_error;
+            if (!resolve_dot8_upload_plan(model.tensor_plan(), model.hparams().n_trunk, false, routes, dot8_plan, &dot8_error))
+                throw std::runtime_error("generic Ornith: " + dot8_error);
+        }
         const auto& hp = model.hparams();
+        if (!opt.placement_json.empty()) placement::bind_executor(placement::from_json(opt.placement_json), opt.tp);
         kfd::Runtime rt;
         std::string error;
         if (!rt.init(30.5, 64, &error, opt.tp)) throw std::runtime_error(error);
@@ -45,11 +55,22 @@ OrnithBenchMetrics run_ornith_nrank(GgufFile& f, BpeTokenizer& tokenizer, const 
             char bdf[32];
             std::snprintf(bdf, sizeof(bdf), "%04x:%02x:%02x.%x", d.pci_domain, d.location_id >> 8, (d.location_id >> 3) & 31, d.location_id & 7);
             p.bdf = bdf; p.n_cu = d.n_cu; p.mclk = 1;
+            const auto key = tp::device_key(p.bdf, gpusel::sysfs_root());
+            if (key.rfind("uid:", 0) == 0) p.unique_id = key.substr(4);
             p.bw_hbm_gbs = opt.tp_bandwidths.empty() ? 1 : opt.tp_bandwidths.at(devices.size());
             p.usable_vram_bytes = rt.vram_arena(devices.size()).capacity() - rt.vram_arena(devices.size()).used();
             devices.push_back(p);
         }
         const auto shard_options = opt.tp_shard_json.empty() ? tp::ShardOptions{} : tp::shard_options_from_json(opt.tp_shard_json);
+        if (!opt.placement_json.empty()) {
+            const auto config = placement::from_json(opt.placement_json);
+            const auto ordered = placement::executor_devices(config, devices);
+            for (size_t r = 0; r < devices.size(); ++r)
+                if (devices[r].bdf != ordered[r].bdf) throw std::runtime_error("placement executor rank order mismatch");
+            placement::validate(config, devices, hp.n_trunk, [&](const auto& ranks, uint32_t, uint32_t) {
+                (void)raw_layout(hp, context, ranks, shard_options);
+            });
+        }
         const auto layout = raw_layout(hp, context, devices, shard_options);
         // Explicit module allow-list: unrelated experimental artifacts never become dependencies.
         for (const char* module : {"vj_kfd_base", "vj_tp_collective", "vj_ornith_ar", "vj_ornith_gemm",
@@ -257,6 +278,57 @@ OrnithBenchMetrics run_ornith_nrank(GgufFile& f, BpeTokenizer& tokenizer, const 
                 a{w.qs_va, w.dm_va, xq, xd, out, w.rows, w.cols, w.row_stride_bytes, 0, 0};
             launch(r, "ornith_gemv_q4a8_m1_w32_kernel", (w.rows + 7) / 8, 256, a);
         };
+        // v1.3 M7 --profile-stages: per decode token, kfd_stamp_clock_u64 (vj_kfd_base) brackets every stage on every
+        // rank, and the collective kernel stamps its own entry / flags posted / peers seen / exit
+        // (Runtime::collective_stamps). Only stamps of one GPU are subtracted; core/rank_timing does the split.
+        const uint32_t n_stamps = 4u * hp.n_trunk + 2u;
+        std::vector<uint64_t> stamp_va(opt.tp, 0);
+        std::vector<std::vector<uint64_t>> ar_stamp(opt.tp);  // 4 stamps per AllReduce, 2 AllReduces per layer
+        std::vector<std::vector<uint8_t>> ar_stamped(opt.tp);
+        ranktiming::Aggregator rank_timer(opt.tp);
+        uint32_t timed_tokens = 0;
+        bool timing_on = false;
+        if (opt.profile_stages)
+            for (size_t r = 0; r < opt.tp; ++r) {
+                stamp_va[r] = alloc(r, uint64_t(n_stamps) * 8);
+                ar_stamp[r].assign(uint64_t(hp.n_trunk) * 8, 0);
+                ar_stamped[r].assign(uint64_t(hp.n_trunk) * 2, 0);
+            }
+        auto stamp = [&](size_t r, uint32_t idx) {
+            if (!timing_on) return;
+            struct { uint64_t dst; uint32_t idx, pad; } a{stamp_va[r], idx, 0};
+            launch(r, "kfd_stamp_clock_u64", 1, 64, a);
+        };
+        auto ar_mark = [&](uint32_t slot) {  // right after collective_allreduce: the status slot holds this call's stamps
+            if (!timing_on) return;
+            for (size_t r = 0; r < opt.tp; ++r) ar_stamped[r][slot] = rt.collective_stamps(r, &ar_stamp[r][uint64_t(slot) * 4]);
+        };
+        auto book_token = [&]() {  // after the token's last flush, before any host read-back of this token
+            if (!timing_on) return;
+            std::string terr;
+            for (size_t r = 0; r < opt.tp; ++r) {
+                std::vector<uint64_t> s(n_stamps);
+                check(rt.download_from_vram(r, s.data(), stamp_va[r], s.size() * 8));
+                const auto rank = static_cast<uint32_t>(r);
+                auto add = [&](const char* stage, uint64_t b, uint64_t e, uint64_t w) {
+                    if (!rank_timer.add(rank, stage, b, e, w, true, &terr)) throw std::runtime_error("generic Ornith: rank timing: " + terr);
+                };
+                auto ar = [&](uint32_t slot) {
+                    const uint64_t* t = &ar_stamp[r][uint64_t(slot) * 4];
+                    if (ar_stamped[r][slot]) add("allreduce", t[0], t[3], t[2] - t[1]);
+                    else rank_timer.break_chain(rank);  // bypass copy (N=1) or no stamps: the interval is unstamped work
+                };
+                rank_timer.break_chain(rank);  // token boundary: embedding upload / argmax / stamp read-back kernels
+                for (uint32_t il = 0; il < hp.n_trunk; ++il) {
+                    add("mixer", s[4 * il], s[4 * il + 1], 0);
+                    ar(2 * il);
+                    add("moe", s[4 * il + 2], s[4 * il + 3], 0);
+                    ar(2 * il + 1);
+                }
+                add("final_norm+vocab", s[4 * hp.n_trunk], s[4 * hp.n_trunk + 1], 0);
+            }
+            ++timed_tokens;
+        };
         auto step = [&](int32_t token, uint32_t position) {
             if (token < 0 || uint64_t(token) >= hp.vocab || position >= context)
                 throw std::runtime_error("generic Ornith: token/context out of range");
@@ -266,6 +338,7 @@ OrnithBenchMetrics run_ornith_nrank(GgufFile& f, BpeTokenizer& tokenizer, const 
             for (uint32_t il = 0; il < hp.n_trunk; ++il) {
                 for (size_t r : layout.rank_order) {
                     auto& s = ranks[r]; auto& state = s.layers[il]; const auto& w = state.w; const auto& m = layout.ranks[r];
+                    stamp(r, 4 * il);
                     norm(r, w.attn_norm_va, il ? s.reduced : 0);
                     if (w.is_gdn && !m.groups.empty()) {
                         const uint32_t nk = m.groups.size(), nv = m.v_heads.size(), cd = m.conv_rows.size();
@@ -291,11 +364,14 @@ OrnithBenchMetrics run_ornith_nrank(GgufFile& f, BpeTokenizer& tokenizer, const 
                         launch(r, "ornith_attn_flash_nrank_kernel", nq, 256, flash);
                         gemv(r, w.w_o, s.aq, s.ad, s.partial);
                     } else zero(r, s.partial, 3072 * 4);
+                    stamp(r, 4 * il + 1);
                 }
                 flush();
                 check(rt.collective_allreduce(partials, outputs, 3072, &error));
+                ar_mark(2 * il);
                 for (size_t r : layout.rank_order) {
                     auto& s = ranks[r]; const auto& w = s.layers[il].w; const auto& map = layout.ranks[r];
+                    stamp(r, 4 * il + 2);
                     const uint32_t ff = map.ff.size(), sf = map.shared_ff.size();
                     norm(r, w.post_attn_norm_va, s.reduced);
                     struct { uint64_t wr, wg, xn, logits; uint32_t m, d; }
@@ -321,12 +397,14 @@ OrnithBenchMetrics run_ornith_nrank(GgufFile& f, BpeTokenizer& tokenizer, const 
                         struct { uint64_t dst, src, words; } copy{s.partial, s.shared, 3072};
                         launch(r, "kfd_memcpy_u32", 12, 256, copy);
                     }
+                    stamp(r, 4 * il + 3);
                 }
                 flush();
                 check(rt.collective_allreduce(partials, outputs, 3072, &error));
+                ar_mark(2 * il + 1);
             }
             for (size_t r : layout.rank_order) {
-                auto& s = ranks[r]; norm(r, s.final_norm, s.reduced);
+                auto& s = ranks[r]; stamp(r, 4 * hp.n_trunk); norm(r, s.final_norm, s.reduced);
                 if (layout.ranks[r].vocab.size()) {
                     struct { uint64_t wq, wd, xq, xd, out; uint32_t rows, cols, stride; }
                         v{s.vocab.qs_va, s.vocab.ds_va, s.xq, s.xd, s.logits, s.vocab.rows, 3072, s.vocab.row_stride_bytes};
@@ -335,8 +413,10 @@ OrnithBenchMetrics run_ornith_nrank(GgufFile& f, BpeTokenizer& tokenizer, const 
                         top{s.logits, s.argmax, s.argmax + 4, s.vocab.rows, static_cast<uint32_t>(layout.ranks[r].vocab.begin)};
                     launch(r, "ornith_local_argmax_nrank", 1, 64, top);
                 }
+                stamp(r, 4 * hp.n_trunk + 1);
             }
             flush();
+            book_token();
             float best = -std::numeric_limits<float>::infinity(); int32_t chosen = -1;
             // Canonical rank/range order gives lower-global-token tie breaking.
             for (size_t r : layout.rank_order) {
@@ -379,11 +459,21 @@ OrnithBenchMetrics run_ornith_nrank(GgufFile& f, BpeTokenizer& tokenizer, const 
         for (uint32_t i = 0; i < prompt_ids.size(); ++i) next = step(prompt_ids[i], i);
         const double prefill_seconds = now_sec() - prefill_start;
         const double decode_start = now_sec();
+        timing_on = opt.profile_stages;  // decode tokens only; prefill and serve requests are never stamped
         for (int i = 0; i < opt.decode_tokens; ++i) {
             generated.push_back(next);
             if (i + 1 < opt.decode_tokens) next = step(next, static_cast<uint32_t>(prompt_ids.size()) + i);
         }
         const double decode_seconds = now_sec() - decode_start;
+        timing_on = false;
+        if (opt.profile_stages) {
+            if (!timed_tokens) std::printf("[RANK-TIMING note] no decode token was stamped (needs --n-predict >= 2)\n");
+            else {
+                const auto report = rank_timer.report("nrank-profile-stages", timed_tokens);
+                std::printf("%s%s%s\n", ranktiming::to_table(report).c_str(), ranktiming::kLogTag, ranktiming::to_json(report).c_str());
+                std::printf("[RANK-TIMING note] the decode tok/s of this run includes the stamp dispatches and read-backs\n");
+            }
+        }
         result.pp512_tps = prompt_ids.size() / prefill_seconds;
         result.tg128_raw_tps = opt.decode_tokens > 1 ? (opt.decode_tokens - 1) / decode_seconds : 0;
         result.parity_simple_text = tokenizer.decode(generated);

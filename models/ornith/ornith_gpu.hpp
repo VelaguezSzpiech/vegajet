@@ -30,6 +30,7 @@ struct OrnithGpuOptions {
     // any other count goes through the generic N-rank executor and its admission.
     uint32_t    tp              = 2;
     std::string tp_shard_json, tp_collective_json;
+    std::string placement_json;
     std::vector<double> tp_bandwidths;
     bool        use_suffix_spec = false;
     bool        use_wy_prefill  = true;

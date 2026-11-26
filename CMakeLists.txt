@@ -75,6 +75,7 @@ add_library(vegajet_core STATIC
     core/quant_unpackers.cpp
     core/sharder.cpp
     core/tp_sharder.cpp
+    core/placement.cpp
     core/tp_collective.cpp
     core/tp_executor.cpp
     core/tp_runtime_topology.cpp
@@ -234,6 +235,7 @@ set(VEGAJET_MODEL_SOURCES
     models/builtin_models.cpp
     models/qwen4exp/qwen4exp_model.cpp
     models/ornith/ornith_loader.cpp
+    models/ornith/ornith_dot8_route.cpp
     models/ornith/ornith_runner.cpp
     models/ornith/ornith_tp_exec.cpp
     models/ornith/ornith_gpu.cpp
@@ -247,15 +249,13 @@ target_link_libraries(vegajet_models PUBLIC vegajet_core)
 target_compile_options(vegajet_models PRIVATE ${VJ_WARN})
 
 # `vegajet serve` (+ the CLI-wide --gpu option) as a library so tests can link it.
-add_library(vegajet_cli STATIC cli/serve_cmd.cpp)
-target_link_libraries(vegajet_cli PUBLIC vegajet_core Threads::Threads)
+add_library(vegajet_cli STATIC cli/serve_cmd.cpp cli/bench.cpp cli/tp_ar_bench.cpp)
+target_link_libraries(vegajet_cli PUBLIC vegajet_models Threads::Threads)
 target_compile_options(vegajet_cli PRIVATE ${VJ_WARN})
 
 add_executable(vegajet
     cli/main.cpp
     cli/inspect.cpp
-    cli/bench.cpp
-    cli/tp_ar_bench.cpp
     cli/soak.cpp
 )
 target_link_libraries(vegajet PRIVATE vegajet_cli vegajet_models Threads::Threads)
@@ -307,6 +307,7 @@ vj_test(test_quant_unpackers)
 vj_test(test_ornith_loader)
 vj_test(test_sharder)
 vj_test(test_tp_sharder)
+vj_test(test_placement)
 vj_test(test_tp_collective)
 vj_test(test_tp_executor)
 vj_test(test_ornith_raw_layout)
@@ -342,6 +343,8 @@ vj_test(test_q4_dot8)
 vj_test(test_v13_dot8_promo)
 # v1.3 universal IQ3_XXS / IQ2_S DOT8 repacker: odd-256B rows + XOR tile swizzle, CPU reference dot.
 vj_test(test_v13_dot8_universal)
+# v1.3 dot8-wire: TensorPlan::format -> GPU upload/kernel route resolution, fail closed.
+vj_test(test_v13_dot8_route)
 # ---- Radix prefix cache (KV blocks + recurrent-state snapshots) and B=1..8 continuous batching (serving_prefix_batching) ----
 target_sources(vegajet_core PRIVATE core/prefix_cache.cpp core/cont_batch.cpp)
 vj_test(test_prefix_batching)
@@ -440,6 +443,10 @@ set_source_files_properties(tests/test_moe_route_group.cpp core/moe_route_group.
 
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_FOUND)
+    add_test(NAME test_placement_cli
+             COMMAND ${Python3_EXECUTABLE} -B tests/test_placement_cli.py
+             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    set_tests_properties(test_placement_cli PROPERTIES ENVIRONMENT "VJ_TP_BINARY=$<TARGET_FILE:vegajet>")
     add_test(NAME test_tp_collective_cli
              COMMAND ${Python3_EXECUTABLE} -B tests/test_tp_collective_cli.py
              WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
@@ -510,7 +517,7 @@ add_test(NAME vegajet_doctor_dry_run COMMAND vegajet doctor --os --dry-run --roo
 set_tests_properties(vegajet_doctor_dry_run PROPERTIES WILL_FAIL TRUE)
 
 # ---- `vegajet bench --json-out` (core/bench_json, schema vegajet.bench.v1) ----------------------
-target_sources(vegajet_core PRIVATE core/bench_json.cpp)
+target_sources(vegajet_core PRIVATE core/bench_json.cpp core/rank_timing.cpp)
 # -DVEGAJET_GIT_COMMIT=<sha> overrides (builds from a `git archive` export have no repository to ask).
 set(VEGAJET_GIT_COMMIT "" CACHE STRING "commit recorded in bench JSON (default: git rev-parse at configure time)")
 set(VJ_GIT_COMMIT "${VEGAJET_GIT_COMMIT}")
@@ -524,6 +531,8 @@ endif()
 # Captured at configure time: re-run cmake after a commit to refresh it.
 target_compile_definitions(vegajet PRIVATE VEGAJET_GIT_COMMIT="${VJ_GIT_COMMIT}")
 vj_test(test_bench_json)
+# v1.3 M7: per-rank / per-stage s_memrealtime split (core/rank_timing), synthetic stamps N=1,2,3,8.
+vj_test(test_rank_timing)
 # M6: `vegajet bench --dump-tokens` writer + the token_compare.py gate that run.sh uses.
 vj_test(test_token_dump)
 if(Python3_FOUND)

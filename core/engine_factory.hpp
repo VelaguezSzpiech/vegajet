@@ -31,6 +31,7 @@ struct EngineSpec {
     uint32_t context = 8192;
     std::string hsaco_dir;
     std::string tp_shards, tp_plan; // validated JSON text in EngineSpec; file paths in ServeConfig
+    std::string placement_json;
 };
 
 struct EngineHandle {
