@@ -36,7 +36,10 @@ struct Value {
 
 class Parser {
 public:
-    explicit Parser(std::string_view s, int max_depth = 64) : s_(s), max_depth_(max_depth) {}
+    // max_nodes bounds the Value tree (one node per value), so a body made of delimiters ("[[[[…]]]]", "[{},{},…]")
+    // cannot cost hundreds of bytes of heap per input byte.
+    explicit Parser(std::string_view s, int max_depth = 64, size_t max_nodes = 1u << 20)
+        : s_(s), max_depth_(max_depth), max_nodes_(max_nodes) {}
     bool parse(Value& out) {
         ws();
         if (!val(out, 0)) return false;
@@ -44,8 +47,12 @@ public:
         return i_ == s_.size();
     }
     size_t error_offset() const { return i_; }
+    bool node_limit_hit() const { return limit_ == Limit::Nodes; }
+    bool depth_limit_hit() const { return limit_ == Limit::Depth; }
+    size_t nodes() const { return nodes_; }
 
 private:
+    enum class Limit : uint8_t { None, Depth, Nodes };
     void ws() { while (i_ < s_.size() && (s_[i_] == ' ' || s_[i_] == '\t' || s_[i_] == '\n' || s_[i_] == '\r')) ++i_; }
     bool lit(std::string_view w) {
         if (s_.substr(i_, w.size()) != w) return false;
@@ -53,7 +60,9 @@ private:
         return true;
     }
     bool val(Value& v, int depth) {
-        if (depth > max_depth_ || i_ >= s_.size()) return false;
+        if (i_ >= s_.size()) return false;
+        if (depth > max_depth_) { limit_ = Limit::Depth; return false; }
+        if (++nodes_ > max_nodes_) { limit_ = Limit::Nodes; return false; }
         const char c = s_[i_];
         if (c == '{') return object(v, depth);
         if (c == '[') return array(v, depth);
@@ -187,9 +196,16 @@ private:
     std::string_view s_;
     size_t i_ = 0;
     int max_depth_;
+    size_t max_nodes_;
+    size_t nodes_ = 0;
+    Limit limit_ = Limit::None;
 };
 
-inline bool parse(std::string_view s, Value& out) { return Parser(s).parse(out); }
+// Convenience parse with explicit bounds. A body above them fails cleanly (Parser::node_limit_hit() /
+// depth_limit_hit()); the caller answers 413/400 instead of letting the allocation abort the process.
+inline bool parse(std::string_view s, Value& out, int max_depth = 64, size_t max_nodes = 1u << 20) {
+    return Parser(s, max_depth, max_nodes).parse(out);
+}
 
 // Escapes for a JSON string body (no surrounding quotes). Bytes >= 0x80 pass through (input must be valid UTF-8).
 inline std::string escape(std::string_view s) {

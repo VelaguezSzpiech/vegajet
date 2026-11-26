@@ -240,6 +240,32 @@ std::string error_response(int status, std::string_view msg, bool keep_alive, co
     return http_response(status, "application/json", error_json(msg, type), keep_alive, extra);
 }
 
+// Bounded request-body parse. The JSON Value tree costs ~50x the body size, so a hostile body used to reach
+// std::bad_alloc and abort the process (S-B1). Limits are checked while parsing; allocation failures are caught and
+// turned into 413/400. Returns 0 on success, otherwise the HTTP status to answer with.
+int parse_body_bounded(std::string_view body, size_t max_nodes, json::Value& out, std::string& err) {
+    json::Parser p(body, 64, max_nodes);
+    try {
+        if (p.parse(out)) return 0;
+    } catch (const std::bad_alloc&) {
+        err = "request body is too expensive to parse (out of memory); send a smaller request";
+        return 413;
+    } catch (const std::exception& e) {
+        err = std::string("request body could not be parsed: ") + e.what();
+        return 400;
+    }
+    if (p.node_limit_hit()) {
+        err = "request body holds more than " + std::to_string(max_nodes) + " JSON values";
+        return 413;
+    }
+    if (p.depth_limit_hit()) {
+        err = "request body nests more than 64 JSON levels deep";
+        return 400;
+    }
+    err = "request body is not valid JSON";
+    return 400;
+}
+
 std::string fmt_num(double v) {
     char b[64];
     std::snprintf(b, sizeof(b), "%.3f", v);
@@ -505,8 +531,23 @@ struct OpenAiServer::Impl {
             c.in.erase(0, p.consumed);
             c.sent_continue = false;
             ++n_requests;
-            route(fd, req);
+            // Nothing escapes into the I/O thread: an exception here would std::terminate the process (S-B1).
+            try {
+                route(fd, req);
+            } catch (const std::bad_alloc&) {
+                respond_if_idle(fd, error_response(503, "server out of memory while building the response", false), false);
+            } catch (const std::exception& e) {
+                respond_if_idle(fd, error_response(500, e.what(), false), false);
+            } catch (...) {
+                respond_if_idle(fd, error_response(500, "internal server error", false), false);
+            }
         }
+    }
+
+    // A route() that already handed the socket to a worker must not also write to it.
+    void respond_if_idle(int fd, std::string bytes, bool keep_alive) {
+        auto it = conns.find(fd);
+        if (it != conns.end() && !it->second.busy) respond(fd, std::move(bytes), keep_alive);
     }
 
     void route(int fd, const HttpRequest& req) {
@@ -566,12 +607,17 @@ struct OpenAiServer::Impl {
                 return;
             }
             json::Value root;
-            if (!json::parse(req.body, root)) {
-                fail(400, "request body is not valid JSON");
+            std::string err;
+            if (req.body.size() > opt.max_chat_body_bytes) {
+                fail(413, "request body is larger than this server accepts (" +
+                              std::to_string(opt.max_chat_body_bytes) + " bytes)");
+                return;
+            }
+            if (const int st = parse_body_bounded(req.body, opt.max_json_nodes, root, err); st) {
+                fail(st, err);
                 return;
             }
             // Greedy-only generators (ServerOptions::greedy_only) answer 400 for sampling knobs they cannot honor.
-            std::string err;
             if (opt.greedy_only && !greedy_knobs_supported(root, err)) {
                 fail(400, err);
                 return;
@@ -816,6 +862,32 @@ struct OpenAiServer::Impl {
     };
 
     void run_job(Job& job) {
+        bool released = false, posted = false;
+        try {
+            run_job_impl(job, released, posted);
+        } catch (const std::bad_alloc&) {
+            job_failed(job, released, posted, "server out of memory while building the response");
+        } catch (const std::exception& e) {
+            job_failed(job, released, posted, e.what());
+        } catch (...) {
+            job_failed(job, released, posted, "internal server error");
+        }
+    }
+
+    // A generation job that threw must still release its queue slot and hand the socket back, or the server would
+    // stall (S-B1). Answer 500 only if nothing was written yet.
+    void job_failed(const Job& job, bool released, bool posted, const char* msg) {
+        if (!posted) {
+            if (!released) send_blocking(job.fd, error_response(500, msg, false));
+            std::lock_guard<std::mutex> lk(mu);
+            if (!released) --in_flight;
+            done.push_back({job.fd, false});
+        }
+        ++n_errors;
+        wake();
+    }
+
+    void run_job_impl(Job& job, bool& released, bool& posted) {
         const int fd = job.fd;
         set_nonblocking(fd, false);
         timeval tv{opt.send_timeout_ms / 1000, (opt.send_timeout_ms % 1000) * 1000};
@@ -930,6 +1002,7 @@ struct OpenAiServer::Impl {
             std::lock_guard<std::mutex> lk(mu);
             --in_flight;
         }
+        released = true;
 
         bool keep_alive = false;
         if (gone || stopping) {
@@ -1010,6 +1083,7 @@ struct OpenAiServer::Impl {
             std::lock_guard<std::mutex> lk(mu);
             done.push_back({fd, keep_alive});
         }
+        posted = true;
         wake();
     }
 

@@ -74,6 +74,10 @@ struct ServerOptions {
     int32_t max_tokens_cap = 0;         // 0: no cap
     size_t max_header_bytes = 16 * 1024;
     size_t max_body_bytes = 8u << 20;
+    // /v1/chat/completions and /v1/messages bodies above this answer 413: the JSON Value tree costs ~50x the body, so
+    // the parse is bounded by bytes and by node count before any allocation happens (S-B1, S-M4).
+    size_t max_chat_body_bytes = 1u << 20;
+    size_t max_json_nodes = 65536;      // JSON values accepted per request body; beyond this 413
     size_t max_queue = 16;              // queued + running generations
     size_t max_connections = 256;
     int idle_timeout_ms = 30000;        // idle keep-alive / slow-header connections are closed after this
