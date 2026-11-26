@@ -318,6 +318,7 @@ Exit codes: 0 ok (end of input or `/quit`), 1 server unreachable (`GET /health` 
 | `VEGAJET_V12_IQ2S_REG` | Ornith GPU bench | `1`: bind the `vj_ornith_super_iq2sreg` super-kernels, which decode IQ2_S Gate+Up from the 4 KiB `iq2s_grid32` table held in L1D instead of a 4 KiB LDS copy (8,896 B -> 4,800 B LDS, bit-exact). Off by default; mutually exclusive with `VEGAJET_V12_BARRIER_VOL`. |
 | `VEGAJET_RAW_TG512` | Ornith GPU bench | `1`: also measure raw M=1 over 512 tokens after tg128. |
 | `VEGAJET_RAW_ONLY` | Ornith GPU bench | `1`: raw M=1 only; skips the MTP head and uses the smaller raw-only VRAM budget for DOT8 promotion. |
+| `VEGAJET_V12_SERVE_SPEC` | `vegajet serve` (Ornith GPU engine) | `1`: serve through the suffix-tree speculative driver (`tg128 Suffix` verify path, greedy-lossless) and keep `VEGAJET_RAW_ONLY` off; unset or `0`: plain greedy M=1 serving. Default off. |
 | `VEGAJET_GU_DOT8_LAYERS` | Ornith GPU bench | Number of Gate+Up layers to promote to DOT8 (overrides the automatic choice; `0` = automatic). |
 | `VEGAJET_GU_Q3` | Ornith GPU bench | `1` (any value > 0): routed Gate+Up as lossless 3-bit VJ_Q3_IQ2S in place on all 48 layers. Off by default. |
 | `HOME` | doctor, roofline profile | Location of `~/.config/vegajet/hw_profile.json` (unset: a file under `/tmp`). |

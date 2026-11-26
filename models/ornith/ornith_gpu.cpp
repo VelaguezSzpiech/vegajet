@@ -788,6 +788,12 @@ bool write_vram_bin(kfd::Runtime& rt, size_t gpu_idx, uint64_t va, uint64_t byte
     return true;
 }
 
+// v1.2 serving levers (read once per run): serve-side speculative decode.
+static bool v12_serve_spec() {
+    const char* v = std::getenv("VEGAJET_V12_SERVE_SPEC");
+    return v != nullptr && v[0] == '1';
+}
+
 } // namespace
 
 OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
@@ -3451,8 +3457,15 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         VJ_CHECK(rt.wait_idle(0) && rt.wait_idle(1));
     };
 
+    // Speculative decode driver (the bench's `tg128 Suffix` path): draft a suffix-tree chain, verify the whole batch,
+    // keep only the tokens that match the greedy argmax, so the emitted sequence is the raw greedy one by
+    // construction. Optional `on_tok` sees every committed token (same order, same ids as the returned vector) and can
+    // stop the run; `pos_cap` bounds the KV position (serving passes opt.max_ctx).
+    using SuffixTokenCb = std::function<bool(int32_t tid, uint32_t n_comp, double prefill_ms, double decode_ms)>;
     auto run_greedy_suffix = [&](const std::vector<int32_t>& prompt_ids, int n_gen, double* out_tps,
-                                 uint64_t* out_hits = nullptr, uint64_t* out_acc = nullptr, uint64_t* out_dr = nullptr) -> std::vector<int32_t> {
+                                 uint64_t* out_hits = nullptr, uint64_t* out_acc = nullptr, uint64_t* out_dr = nullptr,
+                                 const SuffixTokenCb* on_tok = nullptr,
+                                 uint32_t pos_cap = 0xFFFFFFFFu) -> std::vector<int32_t> {
         reset_state();
         spec::SuffixTree sfx;
         sfx.extend(prompt_ids);
@@ -3462,6 +3475,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
 
         uint32_t pos = 0;
         int32_t last_pred = -1;
+        const auto tp0 = std::chrono::steady_clock::now();
         for (size_t off = 0; off < prompt_ids.size(); off += opt.prefill_chunk) {
             const size_t cnt = std::min<size_t>(opt.prefill_chunk, prompt_ids.size() - off);
             std::vector<int32_t> chunk(prompt_ids.begin() + off, prompt_ids.begin() + off + cnt);
@@ -3476,13 +3490,18 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         gen.push_back(last_pred);
         sfx.push(last_pred);
         uint64_t hits = 0, acc_tot = 0, dr_tot = 0;
+        const double prefill_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp0).count();
+        if (on_tok && !(*on_tok)(last_pred, 1u, prefill_ms, 0.0)) return gen;
 
         auto td0 = std::chrono::steady_clock::now();
-        while (static_cast<int>(gen.size()) < n_gen) {
+        while (static_cast<int>(gen.size()) < n_gen && pos < pos_cap) {
             const uint32_t rem = static_cast<uint32_t>(n_gen - static_cast<int>(gen.size()));
+            const uint32_t room = pos_cap - pos;
             std::vector<int32_t> qctx = ctx;
             qctx.push_back(gen.back());
-            const uint32_t k_max = std::min<uint32_t>({opt.suffix_max_draft, kGdnRingSlots - 2u, (rem > 1u) ? (rem - 1u) : 0u});
+            const uint32_t k_max = std::min<uint32_t>({opt.suffix_max_draft, kGdnRingSlots - 2u, (rem > 1u) ? (rem - 1u) : 0u,
+                                                       (room > 1u) ? (room - 1u) : 0u});
             std::vector<int32_t> draft_toks;
             if (k_max > 0u) {
                 double chain_score = 1.0;
@@ -3495,11 +3514,18 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                     qctx.push_back(nodes[0].token);
                 }
             }
+            const auto notify = [&](int32_t tid) {
+                if (!on_tok) return true;
+                const double dec_ms =
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - td0).count();
+                return (*on_tok)(tid, static_cast<uint32_t>(gen.size()), prefill_ms, dec_ms);
+            };
             if (draft_toks.empty()) {
                 auto preds = step_batch({gen.back()}, pos++, false, false, true);
                 ctx.push_back(gen.back());
                 gen.push_back(preds[0]);
                 sfx.push(preds[0]);
+                if (!notify(preds[0])) return gen;
             } else {
                 ++hits;
                 const uint32_t dk = static_cast<uint32_t>(draft_toks.size());
@@ -3519,10 +3545,12 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                     gen.push_back(draft_toks[j]);
                     ctx.push_back(draft_toks[j]);
                     sfx.push(draft_toks[j]);
+                    if (!notify(draft_toks[j])) return gen;
                 }
                 if (static_cast<int>(gen.size()) < n_gen) {
                     gen.push_back(preds[acc]);
                     sfx.push(preds[acc]);
+                    if (!notify(preds[acc])) return gen;
                 }
                 const uint32_t n_commit = acc + 1u;
                 ring_head = (ring_head + n_commit) % kGdnRingSlots;
@@ -5643,13 +5671,24 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                              static_cast<unsigned long long>(de_now - de_base));
                 return;
             }
-            reset_state();
             std::vector<int32_t> pids = prompt_ids;
             if (pids.empty()) pids.push_back(tok.bos_id() >= 0 ? tok.bos_id() : 0);
             if (pids.size() >= opt.max_ctx) {
                 pids.erase(pids.begin(), pids.begin() + static_cast<std::ptrdiff_t>(pids.size() - (opt.max_ctx - 1u)));
             }
             const uint32_t n_prompt = static_cast<uint32_t>(pids.size());
+            // v1.2 D1 (VEGAJET_V12_SERVE_SPEC=1): serve through the same suffix-tree speculative driver the bench
+            // measures (`tg128 Suffix`), which commits only tokens that match the greedy argmax, so the served text is
+            // unchanged while the verify batches raise throughput. Off: the plain M=1 greedy loop below.
+            if (v12_serve_spec()) {
+                const SuffixTokenCb report = [&](int32_t tid, uint32_t n_comp, double pp_ms, double dec_ms) {
+                    return on_tok(tid, n_prompt, n_comp, pp_ms, dec_ms);
+                };
+                double spec_tps = 0.0;
+                (void)run_greedy_suffix(pids, max_tokens, &spec_tps, nullptr, nullptr, nullptr, &report, opt.max_ctx);
+                return;
+            }
+            reset_state();
             auto tp0 = std::chrono::steady_clock::now();
             uint32_t pos = 0;
             int32_t cur = -1;
@@ -5674,7 +5713,8 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             }
         };
         const bool sup_on = !(std::getenv("VEGAJET_ENABLE_SUPER") != nullptr && std::getenv("VEGAJET_ENABLE_SUPER")[0] == '0');
-        const std::string desc = std::string("ornith-gfx906-tp2 (super=") + (sup_on ? "on" : "off") + ", greedy)";
+        const std::string desc = std::string("ornith-gfx906-tp2 (super=") + (sup_on ? "on" : "off") + ", greedy" +
+                                 (v12_serve_spec() ? "+suffix-spec)" : ")");
         opt.serve_hook(gen_fn, desc);
         parity_code_match = golden::kCodeRef32.size();
     } else if (!base_opt.sweep_spec.empty()) {
@@ -6945,8 +6985,13 @@ public:
         info_.vocab_size = static_cast<uint32_t>(bpe_tok_.vocab_size());
         info_.quant_summary = "VJ_Q4_A8+VJ_Q3_IQ2S+VJ_Q4_DOT8";
 
-        // Default to the qualified fast M=1 super-kernel layout unless the operator overrides via env.
-        setenv("VEGAJET_RAW_ONLY", "1", 0);
+        // Default to the qualified fast M=1 super-kernel layout unless the operator overrides via env. With the
+        // speculative serving driver on, RAW_ONLY must be off: it sizes the GDN ring to one slot and promotes the expert
+        // weights in place for M=1, neither of which the M>=2 verify step can use.
+        if (v12_serve_spec())
+            setenv("VEGAJET_RAW_ONLY", "0", 1);
+        else
+            setenv("VEGAJET_RAW_ONLY", "1", 0);
         setenv("VEGAJET_GU_Q3", "1", 0);
         setenv("VEGAJET_VA_CLUSTER", "1", 0);
         setenv("VEGAJET_VOCAB_MUBUF", "1", 0);
