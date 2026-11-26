@@ -12,13 +12,13 @@
 
 namespace vegajet::ple {
 
-enum class RowFmt : uint8_t { F32 = 0, F16 = 1, Q8_0 = 2 };
+enum class RowFmt : uint8_t { F32 = 0, F16 = 1, Q8_0 = 2, Q4 = 3 };
 enum class Layout : uint8_t {
     LayerMajor = 0,  // out[((l * M) + m) * dim + d]   (one slab per layer: the layer kernel reads one block)
     TokenMajor = 1,  // out[((m * L) + l) * dim + d]
 };
 
-size_t row_bytes(RowFmt f, uint32_t dim);   // 0 if dim is invalid for the format (Q8_0 needs dim % 32 == 0)
+size_t row_bytes(RowFmt f, uint32_t dim);   // 0 if dim is invalid for the format (Q8_0/Q4 need dim % 32 == 0)
 
 struct PleTables {
     uint32_t n_layers = 0, vocab = 0, dim = 0;

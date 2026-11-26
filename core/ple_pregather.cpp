@@ -3,6 +3,8 @@
 
 #include <cstring>
 
+#include "core/host_q4.hpp"
+
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -35,6 +37,7 @@ size_t row_bytes(RowFmt f, uint32_t dim) {
         case RowFmt::F32: return size_t(dim) * 4;
         case RowFmt::F16: return size_t(dim) * 2;
         case RowFmt::Q8_0: return dim % 32 ? 0 : size_t(dim / 32) * 34;
+        case RowFmt::Q4: return dim % 32 ? 0 : size_t(dim / 32) * hostq4::kBlockBytes;
     }
     return 0;
 }
@@ -76,6 +79,7 @@ inline void row_to_f32(RowFmt f, const uint8_t* src, uint32_t dim, float* dst) {
                 for (uint32_t i = 0; i < 32; ++i) dst[b * 32 + i] = s * static_cast<float>(q[i]);
             }
             break;
+        case RowFmt::Q4: hostq4::unpack_row(src, dim, dst); break;
     }
 }
 
@@ -103,6 +107,7 @@ bool pregather(const PleTables& t, const int32_t* tokens, uint32_t m, float* out
 bool pregather_reference(const PleTables& t, const int32_t* tokens, uint32_t m, float* out, Layout lay) {
     if (!validate(t, tokens, m, nullptr)) return false;
     const size_t rb = row_bytes(t.fmt, t.dim);
+    std::vector<float> q4row(t.fmt == RowFmt::Q4 ? t.dim : 0);
     for (uint32_t l = 0; l < t.n_layers; ++l)
         for (uint32_t mi = 0; mi < m; ++mi)
             for (uint32_t d = 0; d < t.dim; ++d) {
@@ -110,7 +115,10 @@ bool pregather_reference(const PleTables& t, const int32_t* tokens, uint32_t m, 
                 float v = 0;
                 if (t.fmt == RowFmt::F32) std::memcpy(&v, row + 4 * d, 4);
                 else if (t.fmt == RowFmt::F16) { uint16_t h; std::memcpy(&h, row + 2 * d, 2); v = half_to_float(h); }
-                else {
+                else if (t.fmt == RowFmt::Q4) {
+                    if (d == 0) hostq4::unpack_row(row, t.dim, q4row.data());
+                    v = q4row[d];
+                } else {
                     uint16_t h;
                     std::memcpy(&h, row + (d / 32) * 34, 2);
                     v = half_to_float(h) * static_cast<float>(static_cast<int8_t>(row[(d / 32) * 34 + 2 + d % 32]));

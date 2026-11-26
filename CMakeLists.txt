@@ -110,6 +110,9 @@ add_library(vegajet_core STATIC
     core/engine_factory.cpp
     core/fp_oracles.cpp
     core/dflash_step_ref.cpp
+    core/host_q4.cpp
+    core/expert_pack.cpp
+    core/expert_stream.cpp
     ops/op_desc.cpp
     ops/layer_plan.cpp
 )
@@ -372,6 +375,15 @@ vj_test(test_gdn_verify_oracle)
 # v1.3 oracles: FP64 GDN verify / EVICT dedup reference + DFlash single-step hidden-state diff.
 vj_test(test_fp_oracles)
 vj_test(test_dflash_step_ref)
+# v1.3 expert offload: pack format + io_uring/O_DIRECT reader, decode LRU, 4-bit host tables.
+vj_test(test_host_q4)
+vj_test(test_expert_pack)
+vj_test(test_expert_stream)
+add_executable(vj_expert_pack tools/vj_expert_pack.cpp)
+target_include_directories(vj_expert_pack PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_link_libraries(vj_expert_pack PRIVATE vegajet_core Threads::Threads)
+target_compile_options(vj_expert_pack PRIVATE ${VJ_WARN})
+add_test(NAME vj_expert_pack_selftest COMMAND vj_expert_pack --self-test)
 add_executable(vj_dflash_hidden_diff tools/dflash_hidden_diff.cpp)
 target_include_directories(vj_dflash_hidden_diff PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(vj_dflash_hidden_diff PRIVATE vegajet_core Threads::Threads)
