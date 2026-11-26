@@ -65,6 +65,13 @@ constexpr uint32_t kMaxSpecBatch   = 16;  // speculative verify M <= 16 (bounded
 constexpr uint32_t kGdnRingSlots   = 17;  // == VJ_GDN_RING_SLOTS in the kernels: verify batches of up to 16 tokens
 constexpr uint32_t kVocabBlocks    = 240;
 
+// v1.2 decode-kernel levers. Read once per process; every one of them defaults OFF, so the
+// default path is byte-identical to v1.1.
+bool v12_vocab_ilp() {
+    static const bool on = [] { const char* e = std::getenv("VEGAJET_V12_VOCAB_ILP"); return e != nullptr && e[0] == '1'; }();
+    return on;
+}
+
 struct Q8WeightDev {
     uint64_t qs_va = 0;
     uint64_t ds_va = 0;
@@ -314,6 +321,7 @@ struct KernelTable {
     const kfd::LoadedKernel* moe_gu_iq2s_grp = nullptr;
     const kfd::LoadedKernel* moe_down_iq3_grp = nullptr;
     const kfd::LoadedKernel* vocab_m1 = nullptr;
+    const kfd::LoadedKernel* vocab_ilp = nullptr;  // v1.2 D3: 2-way ILP accumulator variant
     const kfd::LoadedKernel* vocab_argmax = nullptr;
     const kfd::LoadedKernel* vocab_argmax_b6 = nullptr;
     const kfd::LoadedKernel* vocab_argmax_b12 = nullptr;
@@ -929,6 +937,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             K[g].vocab_argmax     = need_k("ornith_vocab_argmax_q8_kernel");
             K[g].vocab_m1 = (hp.n_embd == 3072u)
                 ? rt.get_kernel(g, "ornith_vocab_argmax_q8_mubuf_kernel") : nullptr;
+            K[g].vocab_ilp = v12_vocab_ilp() ? rt.get_kernel(g, "ornith_vocab_argmax_q8_ilp_kernel") : nullptr;
             K[g].vocab_argmax_b6  = need_k("ornith_vocab_argmax_q8_batch6_kernel");
             K[g].vocab_argmax_b12 = need_k("ornith_vocab_argmax_q8_batch12_l2_kernel");
             K[g].m1_gdn_super     = rt.get_kernel(g, "ornith_m1_gdn_super_kernel");
@@ -3071,7 +3080,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                 } else if (use_b6) {
                     VJ_CHECK(rt.enqueue_kernel(g, *K[g].vocab_argmax_b6, kVocabBlocks * 256u, (voc_m + 5u) / 6u, 1, 256, 1, 1, &vka, sizeof(vka), true));
                 } else {
-                    VJ_CHECK(rt.enqueue_kernel(g, *((voc_m == 1u && K[g].vocab_m1 && std::getenv("VEGAJET_VOCAB_MUBUF") && std::strcmp(std::getenv("VEGAJET_VOCAB_MUBUF"), "1") == 0) ? K[g].vocab_m1 : K[g].vocab_argmax), kVocabBlocks * 256u, voc_m, 1, 256, 1, 1, &vka, sizeof(vka), true));
+                    VJ_CHECK(rt.enqueue_kernel(g, *((voc_m == 1u && K[g].vocab_m1 && std::getenv("VEGAJET_VOCAB_MUBUF") && std::strcmp(std::getenv("VEGAJET_VOCAB_MUBUF"), "1") == 0) ? K[g].vocab_m1 : ((voc_m == 1u && K[g].vocab_ilp != nullptr) ? K[g].vocab_ilp : K[g].vocab_argmax)), kVocabBlocks * 256u, voc_m, 1, 256, 1, 1, &vka, sizeof(vka), true));
                 }
             }
             disp += 1u;
@@ -3213,7 +3222,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             struct VocKA { uint64_t wq, wd, xq, xd, bv, bi; uint32_t lr, cols, ro, stride, M; };
             VocKA vka{out_w[0].qs_va, out_w[0].ds_va, S[0].x_q8_va, S[0].x_ds_va,
                       S[0].argmax_val_va, S[0].argmax_id_va, voc_rows[0], D, 0u, out_w[0].row_stride_bytes, 1u};
-            VJ_CHECK(rt.enqueue_kernel(0, *((K[0].vocab_m1 && std::getenv("VEGAJET_VOCAB_MUBUF") && std::strcmp(std::getenv("VEGAJET_VOCAB_MUBUF"), "1") == 0) ? K[0].vocab_m1 : K[0].vocab_argmax), kVocabBlocks * 256u, 1, 1, 256, 1, 1, &vka, sizeof(vka), true));
+            VJ_CHECK(rt.enqueue_kernel(0, *((K[0].vocab_m1 && std::getenv("VEGAJET_VOCAB_MUBUF") && std::strcmp(std::getenv("VEGAJET_VOCAB_MUBUF"), "1") == 0) ? K[0].vocab_m1 : (K[0].vocab_ilp != nullptr ? K[0].vocab_ilp : K[0].vocab_argmax)), kVocabBlocks * 256u, 1, 1, 256, 1, 1, &vka, sizeof(vka), true));
         }); });
         double t_ar = time_fn(8, [&]() {
             for (int i = 0; i < 96; ++i) {
@@ -3593,7 +3602,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                 VocKA vka{vw.qs_va, vw.ds_va, S[g].x_q8_va, S[g].x_ds_va,
                           S[g].argmax_val_va, S[g].argmax_id_va,
                           lr, D, ro, vw.row_stride_bytes, 1u};
-                VJ_CHECK(rt.enqueue_kernel(g, *((K[g].vocab_m1 && std::getenv("VEGAJET_VOCAB_MUBUF") && std::strcmp(std::getenv("VEGAJET_VOCAB_MUBUF"), "1") == 0) ? K[g].vocab_m1 : K[g].vocab_argmax), kVocabBlocks * 256u, 1, 1, 256, 1, 1, &vka, sizeof(vka), true));
+                VJ_CHECK(rt.enqueue_kernel(g, *((K[g].vocab_m1 && std::getenv("VEGAJET_VOCAB_MUBUF") && std::strcmp(std::getenv("VEGAJET_VOCAB_MUBUF"), "1") == 0) ? K[g].vocab_m1 : (K[g].vocab_ilp != nullptr ? K[g].vocab_ilp : K[g].vocab_argmax)), kVocabBlocks * 256u, 1, 1, 256, 1, 1, &vka, sizeof(vka), true));
             }
         }
         if (!do_submit) return -1;
@@ -4444,7 +4453,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                                 struct VocKA { uint64_t wq, wd, xq, xd, bv, bi; uint32_t lr, cols, ro, stride, M; };
                                 const VocKA vka{out_w[g].qs_va, out_w[g].ds_va, S[g].x_q8_va, S[g].x_ds_va, S[g].argmax_val_va, S[g].argmax_id_va,
                                                 voc_rows[g], D, voc_off[g], out_w[g].row_stride_bytes, 1u};
-                                VJ_CHECK(rt.enqueue_kernel(g, *((K[g].vocab_m1 && std::getenv("VEGAJET_VOCAB_MUBUF") && std::strcmp(std::getenv("VEGAJET_VOCAB_MUBUF"), "1") == 0) ? K[g].vocab_m1 : K[g].vocab_argmax), kVocabBlocks * 256u, 1, 1, 256, 1, 1, &vka, sizeof(vka), true));
+                                VJ_CHECK(rt.enqueue_kernel(g, *((K[g].vocab_m1 && std::getenv("VEGAJET_VOCAB_MUBUF") && std::strcmp(std::getenv("VEGAJET_VOCAB_MUBUF"), "1") == 0) ? K[g].vocab_m1 : (K[g].vocab_ilp != nullptr ? K[g].vocab_ilp : K[g].vocab_argmax)), kVocabBlocks * 256u, 1, 1, 256, 1, 1, &vka, sizeof(vka), true));
                             }
                             stamp(0, tidx); stamp(1, tidx); ++tidx;
                         }

@@ -308,6 +308,7 @@ Exit codes: 0 ok (end of input or `/quit`), 1 server unreachable (`GET /health` 
 | `VEGAJET_VA_CLUSTER` | KFD runtime | `1`: map the always-read (HOT) tensors into the first arena chunks (default 5 x 512 MiB) for TLB locality. Off by default. |
 | `VEGAJET_VA_HOT_MIB` | KFD runtime | HOT-tier size in MiB with `VEGAJET_VA_CLUSTER` (overrides the default 2560); `0` turns clustering off. |
 | `VEGAJET_VOCAB_MUBUF` | Ornith GPU bench | `1`: M=1 greedy vocab argmax through the MUBUF kernel variant. Off by default. |
+| `VEGAJET_V12_VOCAB_ILP` | Ornith GPU bench | `1`: M=1 greedy vocab argmax through the ILP kernel variant (two independent dp4a accumulator chains and two 16 B weight loads in flight per lane; same argmax, only the fp32 summation order changes). Off by default. |
 | `VEGAJET_SUPER_WGS` | Ornith GPU bench | Workgroups per M=1 super-kernel launch, 192..240 (default 240; other values ignored). |
 | `VEGAJET_MOE_Q3_FAST` | Ornith GPU bench | `0` turns off the dedicated Q3 MoE super-kernel. On by default; it is used only at 240 workgroups on layers whose Gate+Up is in the VJ_Q3_IQ2S layout (`VEGAJET_GU_Q3`). |
 | `VEGAJET_SUPER_PROFILE` | Ornith GPU bench | `1`: after the raw bench, a per-stage `s_memrealtime` profile of the super-kernels (diagnostic). |

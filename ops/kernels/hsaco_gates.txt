@@ -38,6 +38,7 @@ ornith_moe_group_sort_kernel tiled
 ornith_moe_gu_iq2s_grouped_kernel tiled 81
 ornith_moe_down_iq3xxs_grouped_kernel tiled
 ornith_vocab_argmax_q8_kernel stream
+ornith_vocab_argmax_q8_ilp_kernel stream
 ornith_vocab_logits_q8_kernel stream
 ornith_vocab_argmax_q8_batch6_kernel stream
 ornith_vocab_argmax_q8_batch12_l2_kernel stream

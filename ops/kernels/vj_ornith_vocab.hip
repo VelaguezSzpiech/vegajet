@@ -75,6 +75,103 @@ void ornith_vocab_argmax_q8_kernel(
     }
 }
 
+// ============================================================================
+// v1.2 D3: ILP variant of the LM-head argmax GEMV (VEGAJET_V12_VOCAB_ILP, default off).
+// Same math, same argmax (strict >, lowest row wins a tie), but a lane's 16 B chunks are
+// walked with two independent accumulator chains and two 16 B weight loads in flight, so the
+// dp4a/fma chain and the HBM round trip no longer serialize. Only the fp32 summation order
+// changes. 2 in-flight loads need the 48-VGPR (5 waves/SIMD) class ceiling instead of the 39
+// VGPR the single-chain kernel gets away with; the 240-block grid still fits one resident wave.
+// ============================================================================
+namespace {
+// One 16 B chunk of a vocab row: dp4a over 64 Q8 weights folded into acc.
+__device__ __forceinline__ float vj_vocab_chunk_acc(const uint4* __restrict__ x4, const float2* __restrict__ xds,
+                                                   const uint4* __restrict__ sm_x, const float* __restrict__ sm_xd,
+                                                   bool use_sm, uint32_t i, uint4 wv, uint16_t ds, float acc) {
+    const uint4  xv  = use_sm ? sm_x[i] : x4[i];
+    const float  xdi = use_sm ? sm_xd[i >> 1] : xds[i >> 1].x;
+    const int32_t dp = vegajet::ornith_dev::sdot4(wv.w, xv.w,
+                       vegajet::ornith_dev::sdot4(wv.z, xv.z,
+                       vegajet::ornith_dev::sdot4(wv.y, xv.y,
+                       vegajet::ornith_dev::sdot4(wv.x, xv.x, 0))));
+    return fmaf(vegajet::ornith_dev::fp16_to_f32(ds) * xdi, static_cast<float>(dp), acc);
+}
+}
+extern "C" __global__ __launch_bounds__(256, 5)
+void ornith_vocab_argmax_q8_ilp_kernel(
+    const int8_t*   __restrict__ w_qs,
+    const uint16_t* __restrict__ w_ds,
+    const int8_t*   __restrict__ x_q8,
+    const float2*   __restrict__ x_ds,
+    float*          __restrict__ blk_val,
+    int32_t*        __restrict__ blk_id,
+    uint32_t local_rows,
+    uint32_t cols,
+    uint32_t row_off,
+    uint32_t row_stride_bytes,
+    uint32_t M) {
+    const uint32_t m    = blockIdx.y;
+    const uint32_t wave = threadIdx.x >> 6;
+    const uint32_t lane = threadIdx.x & 63u;
+    if (m >= M) return;
+
+    __shared__ uint4 sm_x[192];
+    __shared__ float sm_xd[96];
+
+    const uint4*  x4  = reinterpret_cast<const uint4*>(x_q8 + static_cast<uint64_t>(m) * cols);
+    const float2* xds = x_ds + static_cast<uint64_t>(m) * (cols >> 5);
+    const uint32_t n16 = cols >> 4;
+    const bool use_sm = (cols <= 3072u);
+    if (use_sm) {
+        if (threadIdx.x < n16) sm_x[threadIdx.x] = x4[threadIdx.x];
+        if (threadIdx.x < (cols >> 5)) sm_xd[threadIdx.x] = xds[threadIdx.x].x;
+        __syncthreads();
+    }
+
+    float   best_v = -1e30f;
+    int32_t best_i = -1;
+
+    for (uint32_t row = blockIdx.x * 4u + wave; row < local_rows; row += gridDim.x * 4u) {
+        const uint4*    w4 = reinterpret_cast<const uint4*>(w_qs + static_cast<uint64_t>(row) * row_stride_bytes);
+        const uint16_t* ds = w_ds + static_cast<uint64_t>(row) * (cols >> 5);
+        float acc0 = 0.0f, acc1 = 0.0f;
+        uint32_t i = lane;
+        // 2 chunks per step: both loads issue before either dp4a chain, so a lane keeps 2 weight
+        // streams in flight and two independent accumulator chains (D=3072 -> one step + tail).
+        #pragma nounroll
+        for (; i + 64u < n16; i += 128u) {
+            const uint4 w0 = vegajet::ornith_dev::ldg_u32x4_stream(w4 + i);
+            const uint4 w1 = vegajet::ornith_dev::ldg_u32x4_stream(w4 + i + 64u);
+            acc0 = vj_vocab_chunk_acc(x4, xds, sm_x, sm_xd, use_sm, i,        w0, ds[i >> 1],        acc0);
+            acc1 = vj_vocab_chunk_acc(x4, xds, sm_x, sm_xd, use_sm, i + 64u,  w1, ds[(i >> 1) + 32u], acc1);
+        }
+        if (i < n16) {
+            acc0 = vj_vocab_chunk_acc(x4, xds, sm_x, sm_xd, use_sm, i,
+                                      vegajet::ornith_dev::ldg_u32x4_stream(w4 + i), ds[i >> 1], acc0);
+        }
+        float acc = acc0 + acc1;
+        acc = vegajet::ornith_dev::wave64_sum(acc);
+        if (lane == 0u && acc > best_v) {
+            best_v = acc;
+            best_i = static_cast<int32_t>(row_off + row);
+        }
+    }
+
+    __shared__ float   sm_v[4];
+    __shared__ int32_t sm_i[4];
+    if (lane == 0u) { sm_v[wave] = best_v; sm_i[wave] = best_i; }
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+        float   bv = sm_v[0];
+        int32_t bi = sm_i[0];
+        for (int k = 1; k < 4; ++k) {
+            if (sm_v[k] > bv) { bv = sm_v[k]; bi = sm_i[k]; }
+        }
+        blk_val[static_cast<uint64_t>(m) * gridDim.x + blockIdx.x] = bv;
+        blk_id[static_cast<uint64_t>(m) * gridDim.x + blockIdx.x]  = bi;
+    }
+}
+
 namespace {
 using v4 = unsigned __attribute__((ext_vector_type(4)));
 __device__ __forceinline__ v4 resource(const void* p) {
