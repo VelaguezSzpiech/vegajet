@@ -585,6 +585,78 @@ void test_m4_token_and_prompt_caps() {
     }
 }
 
+// ------------------------------------------------------------------------------------------------ S-M5
+// No authentication at all, a decorative API key in the banner, and Access-Control-Allow-Origin: * on every response.
+void test_m5_auth_and_cors() {
+    MockGen gen;
+    {
+        ServerOptions opt;
+        opt.port = 0;
+        opt.model_id = "m";
+        opt.api_key = "s3cret-key";
+        opt.metrics_text = [] { return std::string("# ok\n"); };
+        OpenAiServer srv(opt, [&](const GenerateRequest& r, const TokenSink& s) { return gen(r, s); });
+        std::string err;
+        VJ_CHECK(srv.start(&err));
+
+        // Monitoring stays open, generation does not.
+        VJ_CHECK(one(srv.port(), get_head("/health")).status == 200);
+        VJ_CHECK(one(srv.port(), get_head("/metrics")).status == 200);
+        Resp r = one(srv.port(), get_head("/v1/models"));
+        VJ_CHECK(r.status == 401);
+        VJ_CHECK(r.headers.count("www-authenticate") == 1);
+        VJ_CHECK(r.body.find("invalid_api_key") != std::string::npos);
+
+        r = chat(srv.port(), chat_body("m", "hi"));
+        VJ_CHECK(r.status == 401);
+        r = chat(srv.port(), chat_body("m", "hi"), "Authorization: Bearer wrong-key\r\n");
+        VJ_CHECK(r.status == 401);
+        r = chat(srv.port(), chat_body("m", "hi"), "Authorization: Bearer s3cret-key\r\n");
+        VJ_CHECK(r.status == 200);
+        r = chat(srv.port(), chat_body("m", "hi"), "x-api-key: s3cret-key\r\n");
+        VJ_CHECK(r.status == 200);
+        r = chat(srv.port(), chat_body("m", "hi"), "Authorization: bad s3cret-key\r\n");
+        VJ_CHECK(r.status == 401);
+        srv.stop();
+    }
+    {  // no key configured: no authentication, and never a wildcard CORS header
+        ServerOptions opt;
+        opt.port = 0;
+        opt.model_id = "m";
+        OpenAiServer srv(opt, [&](const GenerateRequest& r, const TokenSink& s) { return gen(r, s); });
+        std::string err;
+        VJ_CHECK(srv.start(&err));
+        Resp r = chat(srv.port(), chat_body("m", "hi"));
+        VJ_CHECK(r.status == 200);
+        VJ_CHECK(r.headers.count("access-control-allow-origin") == 0);
+        r = one(srv.port(), "OPTIONS /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+        VJ_CHECK(r.status == 204);
+        VJ_CHECK(r.headers.count("access-control-allow-origin") == 0);
+        srv.stop();
+    }
+    {  // one configured origin: echoed exactly, preflight answered
+        ServerOptions opt;
+        opt.port = 0;
+        opt.model_id = "m";
+        opt.cors_origin = "https://app.example";
+        OpenAiServer srv(opt, [&](const GenerateRequest& r, const TokenSink& s) { return gen(r, s); });
+        std::string err;
+        VJ_CHECK(srv.start(&err));
+        Resp r = chat(srv.port(), chat_body("m", "hi"));
+        VJ_CHECK(r.status == 200);
+        VJ_CHECK(r.headers["access-control-allow-origin"] == "https://app.example");
+        r = one(srv.port(), "OPTIONS /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+        VJ_CHECK(r.status == 204);
+        VJ_CHECK(r.headers["access-control-allow-origin"] == "https://app.example");
+        const std::string body = chat_body("m", "hi", ",\"stream\":true");
+        r = chat(srv.port(), body);
+        VJ_CHECK(r.status == 200);
+        VJ_CHECK(r.headers["access-control-allow-origin"] == "https://app.example");  // SSE head too
+        VJ_CHECK(r.headers["access-control-allow-origin"] != "*");
+        srv.stop();
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -595,10 +667,12 @@ int main() {
     test_m2_cancelled_accounting();
     test_m3_model_field();
     test_m4_token_and_prompt_caps();
+    test_m5_auth_and_cors();
     std::printf("test_serve_reliability: S-B1 bounded JSON parse, S-B2 connection limit 503 + health reserve,\n"
                 "                        S-M1 half-closed client gets the full response, S-M2 cancellation is logged as 499,\n"
                 "                        S-M3 model validated (404/400) and not repeated per chunk,\n"
-                "                        S-M4 max_tokens + prompt capped against the context\n");
+                "                        S-M4 max_tokens + prompt capped against the context,\n"
+                "                        S-M5 optional API key + explicit CORS origin\n");
     std::printf("PASS\n");
     return 0;
 }
