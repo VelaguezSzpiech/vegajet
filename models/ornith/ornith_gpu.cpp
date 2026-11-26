@@ -48,10 +48,8 @@
 
 namespace vegajet::ornith {
 
-// Host planning is ready; never silently run the chain as a tree verifier.
 static constexpr const char* kTreeVerifyUnavailable =
-    "VEGAJET_V12_TREE_VERIFY=1 unavailable: S3 host planning only; "
-    "GPU tree attention, GDN branching and KV commit are not integrated";
+    "VEGAJET_V12_TREE_VERIFY=1 requires GPU execution: VEGAJET_CPU_ONLY=OFF";
 
 #ifdef VEGAJET_CPU_ONLY
 
@@ -323,6 +321,10 @@ struct KernelTable {
     const kfd::LoadedKernel* moe_down_d8_pp = nullptr;
     const kfd::LoadedKernel* spec_gdn_ver = nullptr;
     const kfd::LoadedKernel* spec_gdn_nq = nullptr;
+    const kfd::LoadedKernel* tree_gdn_conv = nullptr;
+    const kfd::LoadedKernel* tree_gdn_ver = nullptr;
+    const kfd::LoadedKernel* tree_attn_prep = nullptr;
+    const kfd::LoadedKernel* tree_flash_part = nullptr;
     const kfd::LoadedKernel* spec_gdn_ver_nq = nullptr;  // v1.2 S5: verify + norm/quant in one launch
     const kfd::LoadedKernel* spec_flash_part = nullptr;
     const kfd::LoadedKernel* spec_flash_merge = nullptr;
@@ -827,9 +829,24 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
     OrnithGpuOptions opt = opt_in;
     const OrnithGpuOptions base_opt = opt_in;
     OrnithBenchMetrics res{};
-    if (spec::tree_verify_requested(std::getenv("VEGAJET_V12_TREE_VERIFY"))) {
-        res.error = kTreeVerifyUnavailable;
-        return res;
+    const bool tree_verify = spec::tree_verify_requested(std::getenv("VEGAJET_V12_TREE_VERIFY"));
+    if (tree_verify) {
+        const char* raw = std::getenv("VEGAJET_RAW_ONLY");
+        if (!opt.spec_gdn || (!opt.use_suffix_spec && opt.draft_gguf.empty()) ||
+            (raw && raw[0] == '1') || opt.interactive || opt.serve_hook ||
+            !opt.sweep_spec.empty() || !opt.dump_hidden_path.empty() ||
+            !opt.dump_logits_path.empty() || !opt.gdn_state_dump.empty() ||
+            !opt.dump_golden_layers_dir.empty() || opt.profile_stages || opt.pp_stages ||
+            opt.ar_timeline || opt.dot8_ab || opt.zero_tax_catchup || opt.prefill_dot8 || opt.ar_wire_int8) {
+            res.error = "VEGAJET_V12_TREE_VERIFY=1 supports raw 2-GPU --spec-gdn with "
+                        "--suffix-decode or DFlash2 only; no RAW_ONLY, MTP, serving, sweeps, dumps, "
+                        "profilers, INT4 activations or INT8 decode wire";
+            return res;
+        }
+        if (!opt.draft_gguf.empty() && !opt.run_bench) {
+            res.error = "VEGAJET_V12_TREE_VERIFY=1 DFlash2 currently requires the bench command";
+            return res;
+        }
     }
     auto t_load0 = std::chrono::steady_clock::now();
     {   // Alpha portability: 2 x 32 GB gfx906 only. Say so before planning, tokenizing or reserving any arena.
@@ -862,6 +879,11 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
     lopt.draft_gguf = opt.draft_gguf;
     const LoadReport lrep = planner.load(f, lopt);
     if (!lrep.ok) { res.error = lrep.error; return res; }
+    if (tree_verify && (f.tensor("blk.48.nextn.eh_proj.weight") != nullptr ||
+        (!opt.draft_gguf.empty() && !planner.draft_hparams().is_dflash2()))) {
+        res.error = "VEGAJET_V12_TREE_VERIFY=1 requires a raw target without blk.48 MTP and a DFlash2 or suffix drafter";
+        return res;
+    }
     const auto& hp = planner.hparams();
     const char* asym_env = std::getenv("VEGAJET_V12_ASYM_EXPERTS");
     const bool asym_experts = asym_env && std::strcmp(asym_env, "1") == 0;
@@ -918,6 +940,8 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
     const std::string super_sfx = variant.suffix;
     const std::string hdir = kfd::resolve_hsaco_dir(opt.hsaco_dir);
     if (!rt.load_hsaco_dir(hdir, &res.error)) return res;
+    if (tree_verify) for (size_t g = 0; g < 2; ++g)
+        if (!rt.load_hsaco(g, hdir + "/vj_tree_gdn.hsaco", &res.error)) return res;
 
     KernelTable K[2];
     auto resolve_kernels = [&](std::string* kerr) -> bool {
@@ -975,6 +999,13 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             K[g].flash_skv_p2 = need_k("vj_flash_splitkv_any_merge_quant_kernel");
             K[g].spec_flash_part  = opt.spec_flash ? need_k("vj_spec_flash_partial_kernel") : rt.get_kernel(g, "vj_spec_flash_partial_kernel");
             K[g].spec_flash_merge = opt.spec_flash ? need_k("vj_spec_flash_merge_quant_kernel") : rt.get_kernel(g, "vj_spec_flash_merge_quant_kernel");
+            if (tree_verify) {
+                K[g].tree_gdn_conv = need_k("vj_tree_gdn_conv_kernel");
+                K[g].tree_gdn_ver = need_k("vj_tree_gdn_verify_kernel");
+                K[g].tree_attn_prep = need_k("ornith_tree_attn_qkv_prep_kernel");
+                K[g].tree_flash_part = need_k("vj_tree_flash_partial_kernel");
+                K[g].spec_flash_merge = need_k("vj_spec_flash_merge_quant_kernel");
+            }
             const bool warm_mode = (opt.interactive || !opt.sweep_spec.empty());
             if (opt.pf_fa2 || warm_mode) {
                 K[g].pf_fa2       = need_k(opt.pf_fa2_fp16 ? "vj_prefill_fa2_quant_kernel" : "vj_prefill_fa2_quant_f32q_kernel");
@@ -1157,6 +1188,10 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
     const bool raw_only_vram = (std::getenv("VEGAJET_RAW_ONLY") != nullptr && std::getenv("VEGAJET_RAW_ONLY")[0] == '1');
     const bool has_mtp_tensor = !raw_only_vram && (f.tensor("blk.48.nextn.eh_proj.weight") != nullptr);
     const bool has_dflash2_opt = (!opt.draft_gguf.empty() && planner.draft_hparams().is_dflash2());
+    if (tree_verify && (has_mtp_tensor || (!opt.draft_gguf.empty() && !has_dflash2_opt))) {
+        res.error = "VEGAJET_V12_TREE_VERIFY=1 supports a raw target (no blk.48 MTP) and DFlash2 or suffix only";
+        return res;
+    }
     const bool use_fr_spec = (has_mtp_tensor || has_dflash2_opt) && opt.fr_spec_rows > 0u && (opt.fr_spec_rows % 512u == 0u) && opt.fr_spec_rows <= vocab;
     uint64_t out_norm_va[2] = {0, 0};
     {   // Validate the embedding table before it is read as 34-byte Q8_0 rows: a qwen35moe file with another
@@ -1859,6 +1894,15 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
     constexpr uint32_t kDownGrpMin = 2u;   // experts with fewer routed tokens stay on the per-token stream
     auto grp_item_cap = [](uint32_t M) { const uint32_t R = M * 8u, U = std::min(R, 256u); return std::min(R, (R + 63u * U + 63u) / 64u); };
     GpuStateDev S[2];
+    uint64_t tree_states_va[2]{}, tree_replay_kv_va[2]{}, tree_replay_dec_va[2]{}, tree_replay_beta_va[2]{};
+    // Disjoint coherent metadata, above faults and below the 4 MiB buffer end.
+    constexpr uint64_t kTreeIoBase = 3801088ULL;
+    static_assert(kTreeIoBase >= kFaultIoBase + 2u * guard::kFaultSlotBytes &&
+                  kTreeIoBase + 512u <= 4ULL * 1024u * 1024u);
+    const uint64_t tree_mask_va = io_buf.va + kTreeIoBase;
+    const uint64_t tree_depth_va = tree_mask_va + 128u;
+    const uint64_t tree_parent_va = tree_depth_va + 128u;
+    const uint64_t tree_conv_va = tree_parent_va + 128u;
     for (size_t g = 0; g < 2; ++g) {
         const uint32_t local_ff = ff_size[g];
         bool alloc_oom = false;
@@ -1867,6 +1911,12 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             if (!v) alloc_oom = true;
             return v;
         };
+        if (tree_verify) {
+            tree_states_va[g] = alloc(spec::kTreeVerifyRows * 32ULL * 128ULL * 128ULL * 4ULL);
+            tree_replay_kv_va[g] = alloc(36ULL * 16ULL * 40ULL * 128ULL * 4ULL);
+            tree_replay_dec_va[g] = alloc(36ULL * 16ULL * 32ULL * 4ULL);
+            tree_replay_beta_va[g] = alloc(36ULL * 16ULL * 32ULL * 4ULL);
+        }
         S[g].tok_ids_va     = io_toks_va;
         S[g].h_va           = alloc(static_cast<uint64_t>(max_batch) * D * 4u);
         S[g].x_norm_va      = alloc(static_cast<uint64_t>(max_batch) * D * 4u);
@@ -2333,13 +2383,30 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
     try {
     auto step_batch = [&](const std::vector<int32_t>& toks, uint32_t pos0,
                           bool use_wy, bool use_ring, bool compute_logits,
-                          bool capture_dflash_taps = false) -> std::vector<int32_t> {
+                          bool capture_dflash_taps = false,
+                          const spec::VerifyTree* tree = nullptr) -> std::vector<int32_t> {
         const uint32_t M = static_cast<uint32_t>(toks.size());
         // v1.2 C1: a funneled fault stops the run instead of re-dispatching onto a poisoned barrier arena.
         // Unwind the driver before callbacks, recurrent commits or drafter catch-up.
         run_state.check();
         if (device_faulted) fail_run(res.error);
         require_kv_span(pos0, M);
+        if (tree) {
+            if (!tree_verify || !opt.spec_gdn || !use_ring || tree->nodes.size() != M)
+                fail_run("invalid tree verify dispatch configuration");
+            (void)spec::plan_tree_commit(*tree, {0}, pos0, opt.max_ctx, 272u, ring_head);
+            auto* meta = io_host_u8 + kTreeIoBase;
+            std::memcpy(meta, tree->ancestor_mask.data(), M * sizeof(uint32_t));
+            std::memcpy(meta + 128u, tree->depth.data(), M * sizeof(uint32_t));
+            std::vector<int32_t> parents;
+            for (uint32_t row = 0; row < M; ++row) {
+                if (tree->nodes[row].token != toks[row]) fail_run("tree token staging mismatch");
+                parents.push_back(tree->nodes[row].parent);
+            }
+            std::memcpy(meta + 256u, parents.data(), M * sizeof(int32_t));
+            static_assert(sizeof(std::array<int32_t, 3>) == 3u * sizeof(int32_t));
+            std::memcpy(meta + 384u, tree->conv_inputs.data(), M * 3u * sizeof(int32_t));
+        }
         if (M > max_batch || M > 1024u) fail_run("token batch exceeds staging capacity");
         // v1.2 C3: never turn an out-of-range token id into an embedding address offset.
         const uint32_t n_vocab = static_cast<uint32_t>(hp.vocab);
@@ -2539,7 +2606,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             }
         };
 
-        const bool use_m1_super = (!asym_experts && ab_enable_super && !golden_cap_on && M == 1u && !ab_w64 && !ab_f2_front && !ab_b2_back &&
+        const bool use_m1_super = (!tree && !asym_experts && ab_enable_super && !golden_cap_on && M == 1u && !ab_w64 && !ab_f2_front && !ab_b2_back &&
                                    opt.fuse_moe_router && opt.fuse_moe_back && opt.gdn_splitv &&
                                    !opt.ab_no_prepush && !opt.ar_wire_int8 && !opt.spec_flash &&
                                    !ar_ts_on && !st_on && !tap_on && !capture_dflash_taps &&
@@ -2681,7 +2748,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             }
             if (layers[0][il].is_gdn) {
                 const uint32_t gi = gdn_idx++;
-                const bool fuse_gdn_m1 = (M == 1u && opt.gdn_splitv && !(opt.spec_gdn && use_ring) && K[0].gdn_conv_recur_sv != nullptr);
+                const bool fuse_gdn_m1 = (!tree && M == 1u && opt.gdn_splitv && !(opt.spec_gdn && use_ring) && K[0].gdn_conv_recur_sv != nullptr);
                 if (fuse_gdn_m1) ++gdn_sense;
                 const uint32_t c_in_slot  = conv_head;
                 const uint32_t c_out_slot = (conv_head + 1u) % kGdnRingSlots;
@@ -2737,7 +2804,13 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                         ConvL2KA clka{S[g].gdn_qkv_gab_va, lw.ssm_conv_w_va, S[g].gdn_conv_ring_va[gi], S[g].gdn_conv_va,
                                       lw.ssm_dt_va, lw.ssm_a_va, S[g].gdn_dec_va, S[g].gdn_bsig_va,
                                       M, 8u, 32u, 6144u, 10304u, 10240u, 10272u, conv_head, use_ring ? 1u : 0u, eps};
-                        VJ_CHECK(rt.enqueue_kernel(g, *K[g].gdn_conv_l2, 49u * 128u, 1, 1, 128, 1, 1, &clka, sizeof(clka), true));
+                        if (tree) {
+                            struct TreeConvKA { ConvL2KA base; uint64_t inputs; };
+                            const TreeConvKA tka{clka, tree_conv_va};
+                            VJ_CHECK(rt.enqueue_kernel(g, *K[g].tree_gdn_conv, 49u * 128u, 1, 1, 128, 1, 1, &tka, sizeof(tka), true));
+                        } else {
+                            VJ_CHECK(rt.enqueue_kernel(g, *K[g].gdn_conv_l2, 49u * 128u, 1, 1, 128, 1, 1, &clka, sizeof(clka), true));
+                        }
                     }
                     st_mark(kStGdnConv, static_cast<int>(g));
 
@@ -2760,7 +2833,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                             dispatch::fused_verify_resident(fused->from_msgpack_note, rt.devices()[g].n_cu,
                                 fused->vgpr_count, fused->sgpr_count, fused->group_segment_fixed_size,
                                 fused->resident_waves_per_simd);
-                        if (v12_fused_nq && fused_resident && S[g].spec_nq_bar_va != 0) {
+                        if (!tree && v12_fused_nq && fused_resident && S[g].spec_nq_bar_va != 0) {
                             // v1.2 S5: verify + norm/quant in one launch (grid barrier inside).
                             struct SpecGdnNqKA {
                                 uint64_t sin, sout, qsrc, ksrc, vsrc, dec, beta, oout, rkv, rdec, rbeta;
@@ -2778,7 +2851,13 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                                 10304u, 6144u, spec_nq_sense, eps, io_fault_va[g]};
                             VJ_CHECK(rt.enqueue_kernel(g, *K[g].spec_gdn_ver_nq, 128u * 256u, 1, 1, 256, 1, 1, &fnka, sizeof(fnka), true));
                         } else {
-                        VJ_CHECK(rt.enqueue_kernel(g, *K[g].spec_gdn_ver, 128u * 256u, 1, 1, 256, 1, 1, &sgka, sizeof(sgka), true));
+                        if (tree) {
+                            struct TreeGdnKA { SpecGdnKA base; uint64_t parents, states; };
+                            const TreeGdnKA tka{sgka, tree_parent_va, tree_states_va[g]};
+                            VJ_CHECK(rt.enqueue_kernel(g, *K[g].tree_gdn_ver, 128u * 256u, 1, 1, 256, 1, 1, &tka, sizeof(tka), true));
+                        } else {
+                            VJ_CHECK(rt.enqueue_kernel(g, *K[g].spec_gdn_ver, 128u * 256u, 1, 1, 256, 1, 1, &sgka, sizeof(sgka), true));
+                        }
                         struct SpecGdnNormKA { uint64_t ob, gab, nw, oq, od; uint32_t M, nv, strd, zoff; float eps; };
                         const SpecGdnNormKA snka{S[g].spec_gdn_o_va, S[g].gdn_qkv_gab_va, lw.ssm_norm_va,
                                                  S[g].mid_q8_va, S[g].mid_ds_va, M, 32u, 10304u, 6144u, eps};
@@ -2854,7 +2933,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                 const uint32_t skv_nc   = std::max<uint32_t>(1u, (skv_span + skv_cl - 1u) / skv_cl);
                 const bool use_auto_splitkv = (!ab_no_splitkv && !opt.spec_flash && skv_nc > 1u &&
                                                (use_ring ? M <= 16u : M < 16u) && K[0].flash_skv_p1 != nullptr);
-                const bool fuse_attn_m1 = (M == 1u && !opt.spec_flash && !use_auto_splitkv &&
+                const bool fuse_attn_m1 = (!tree && M == 1u && !opt.spec_flash && !use_auto_splitkv &&
                                            reps_of(4u) == 1u && reps_of(5u) == 1u && K[0].attn_prep_flash_m1 != nullptr);
                 for (size_t g = 0; g < 2; ++g) {
                     const auto& lw = layers[g][il];
@@ -2881,14 +2960,41 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                     PrepKA pka{S[g].attn_qkv_va, lw.q_norm_va, lw.k_norm_va,
                                S[g].q_buf_va, S[g].gate_buf_va, S[g].attn_k_cache_va[ai], S[g].attn_v_cache_va[ai],
                                M, pos0, 16u, 1u, hp.rope_dims, rope_base, eps};
-                    for (uint32_t r = 0; r < reps_of(4u); ++r)
-                    VJ_CHECK(rt.enqueue_kernel(g, *K[g].attn_prep, 17u * 256u, M, 1, 256, 1, 1, &pka, sizeof(pka), true));
+                    if (tree) {
+                        struct TreePrepKA { PrepKA base; uint64_t depths; };
+                        const TreePrepKA tka{pka, tree_depth_va};
+                        VJ_CHECK(rt.enqueue_kernel(g, *K[g].tree_attn_prep, 17u * 256u, M, 1, 256, 1, 1, &tka, sizeof(tka), true));
+                    } else {
+                        for (uint32_t r = 0; r < reps_of(4u); ++r)
+                        VJ_CHECK(rt.enqueue_kernel(g, *K[g].attn_prep, 17u * 256u, M, 1, 256, 1, 1, &pka, sizeof(pka), true));
+                    }
                     st_mark(kStPrep, static_cast<int>(g));
 
                     struct FlKA { uint64_t qo, go, kc, vc, oq, od; uint32_t M, pos0, nq, nkv; };
                     FlKA fka{S[g].q_buf_va, S[g].gate_buf_va, S[g].attn_k_cache_va[ai], S[g].attn_v_cache_va[ai],
                              S[g].mid_q8_va, S[g].mid_ds_va, M, pos0, n_q_local, n_kv_local};
-                    if (K[g].pf_fa2 && !use_ring && M >= 16u) {
+                    if (tree) {
+                        uint32_t n_chunks = 1u;
+                        for (uint32_t depth : tree->depth) {
+                            const uint32_t span = pos0 + depth + 1u;
+                            const uint32_t cl = span <= 1920u ? 32u : (span <= 3840u ? 64u : (span <= 7680u ? 128u : 256u));
+                            n_chunks = std::max(n_chunks, 1u + (span - 1u) / cl);
+                        }
+                        require_split_scratch(M, n_q_local, n_chunks);
+                        struct TreeFlashKA {
+                            uint64_t qo, kc, vc, po, pml;
+                            uint32_t M, pos0, nq, nkv, nc, cl;
+                            uint64_t masks, depths;
+                        };
+                        struct MergeKA { uint64_t po, pml, go, oq, od; uint32_t M, nq, nc; };
+                        const TreeFlashKA tka{S[g].q_buf_va, S[g].attn_k_cache_va[ai], S[g].attn_v_cache_va[ai],
+                            S[g].spec_fl_part_o_va, S[g].spec_fl_part_ml_va,
+                            M, pos0, n_q_local, n_kv_local, n_chunks, 0u, tree_mask_va, tree_depth_va};
+                        const MergeKA mka{S[g].spec_fl_part_o_va, S[g].spec_fl_part_ml_va, S[g].gate_buf_va,
+                            S[g].mid_q8_va, S[g].mid_ds_va, M, n_q_local, n_chunks};
+                        VJ_CHECK(rt.enqueue_kernel(g, *K[g].tree_flash_part, n_chunks * 512u, M, n_kv_local, 512, 1, 1, &tka, sizeof(tka), true));
+                        VJ_CHECK(rt.enqueue_kernel(g, *K[g].spec_flash_merge, n_q_local * 256u, M, 1, 256, 1, 1, &mka, sizeof(mka), true));
+                    } else if (K[g].pf_fa2 && !use_ring && M >= 16u) {
                         const bool use_codex_fa2 = (std::getenv("VEGAJET_PREFILL_CODEX_FA2") != nullptr &&
                                                     std::strcmp(std::getenv("VEGAJET_PREFILL_CODEX_FA2"), "1") == 0 &&
                                                     K[g].pf_fa2_codex != nullptr && n_q_local == 16u && n_kv_local == 1u);
@@ -3671,6 +3777,58 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         VJ_CHECK(rt.wait_idle(0) && rt.wait_idle(1));
     };
 
+    // Replay only accepted recurrent records from the immutable pre-verify state.
+    auto commit_tree = [&](const spec::VerifyTree& tree, const std::vector<uint32_t>& path, uint32_t pos0) {
+        run_state.check();
+        if (device_fault_check("before tree commit")) fail_run(res.error);
+        const auto plan = spec::plan_tree_commit(tree, path, pos0, opt.max_ctx, 272u, conv_head);
+        const uint32_t count = static_cast<uint32_t>(path.size());
+        const uint64_t sbytes = 32ULL * 128ULL * 128ULL * 4ULL;
+        auto copy_words = [&](size_t g, uint64_t dst, uint64_t src, uint64_t n) {
+            if (dst == src) return;
+            struct CopyKA { uint64_t dst, src, n; };
+            const CopyKA ka{dst, src, n};
+            VJ_CHECK(rt.enqueue_kernel(g, *K[g].memcpy_u32, static_cast<uint32_t>((n + 255u) / 256u) * 256u,
+                1, 1, 256, 1, 1, &ka, sizeof(ka), true));
+        };
+        for (size_t g = 0; g < 2; ++g) {
+            for (uint32_t gi = 0; gi < 36u; ++gi) {
+                for (uint32_t j = 0; j < count; ++j) {
+                    const uint64_t src = static_cast<uint64_t>(gi) * 16u + path[j];
+                    const uint64_t dst = static_cast<uint64_t>(gi) * 16u + j;
+                    copy_words(g, tree_replay_kv_va[g] + dst * 40u * 128u * 4u,
+                        S[g].spec_gdn_rec_kv_va + src * 40u * 128u * 4u, 40u * 128u);
+                    copy_words(g, tree_replay_dec_va[g] + dst * 32u * 4u,
+                        S[g].spec_gdn_rec_dec_va + src * 32u * 4u, 32u);
+                    copy_words(g, tree_replay_beta_va[g] + dst * 32u * 4u,
+                        S[g].spec_gdn_rec_beta_va + src * 32u * 4u, 32u);
+                }
+                const uint32_t src_slot = (conv_head + path.back() + 1u) % kGdnRingSlots;
+                const uint32_t dst_slot = plan.next_ring_head;
+                copy_words(g, S[g].gdn_conv_ring_va[gi] + dst_slot * 3ULL * 6144u * 4u,
+                    S[g].gdn_conv_ring_va[gi] + src_slot * 3ULL * 6144u * 4u, 3u * 6144u);
+            }
+            struct ReplayKA {
+                uint64_t sin, sout, q, k, v, dec, beta, out, rkv, rdec, rbeta;
+                uint32_t M, nk, nv, s_stride, r_stride, lbase, s_layer, src_layer, gate_layer, r_layer, rg_layer;
+            };
+            const uint64_t sin = S[g].spec_gdn_s_slot_va[spec_gdn_active];
+            const uint64_t sout = S[g].spec_gdn_s_slot_va[1u - spec_gdn_active];
+            const ReplayKA ka{sin, sout, 0, tree_replay_kv_va[g], tree_replay_kv_va[g] + 8ULL * 128u * 4u,
+                tree_replay_dec_va[g], tree_replay_beta_va[g], 0, 0, 0, 0,
+                count, 8u, 32u, 40u * 128u, 40u * 128u, 0u, static_cast<uint32_t>(sbytes / 4u),
+                16u * 40u * 128u, 16u * 32u, 0u, 0u};
+            VJ_CHECK(rt.enqueue_kernel(g, *K[g].spec_gdn_ver, 128u * 256u, 36u, 1, 256, 1, 1, &ka, sizeof(ka), true));
+        }
+        VJ_CHECK(rt.submit_batch(0) && rt.submit_batch(1));
+        VJ_CHECK(rt.wait_idle(0) && rt.wait_idle(1));
+        if (device_fault_check("tree commit")) fail_run(res.error);
+        run_state.check();
+        spec_gdn_active = 1u - spec_gdn_active;
+        ring_head = (ring_head + count) % kGdnRingSlots;
+        conv_head = plan.next_ring_head;
+    };
+
     // Speculative decode driver (the bench's `tg128 Suffix` path): draft a suffix-tree chain, verify the whole batch,
     // keep only the tokens that match the greedy argmax, so the emitted sequence is the raw greedy one by
     // construction. Optional `on_tok` sees every committed token (same order, same ids as the returned vector) and can
@@ -3679,7 +3837,8 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
     auto run_greedy_suffix = [&](const std::vector<int32_t>& prompt_ids, int n_gen, double* out_tps,
                                  uint64_t* out_hits = nullptr, uint64_t* out_acc = nullptr, uint64_t* out_dr = nullptr,
                                  const SuffixTokenCb* on_tok = nullptr,
-                                 uint32_t pos_cap = 0xFFFFFFFFu) -> std::vector<int32_t> {
+                                 uint32_t pos_cap = 0xFFFFFFFFu, bool allow_tree = true) -> std::vector<int32_t> {
+        const bool tree_mode = tree_verify && allow_tree;
         reset_state();
         spec::SuffixTree sfx;
         sfx.extend(prompt_ids);
@@ -3709,11 +3868,36 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         if (on_tok && !(*on_tok)(last_pred, 1u, prefill_ms, 0.0)) return gen;
 
         auto td0 = std::chrono::steady_clock::now();
-        while (static_cast<int>(gen.size()) < n_gen && pos < pos_cap) {
+        while (static_cast<int>(gen.size()) < n_gen && pos < pos_cap && (!tree_mode || pos < opt.max_ctx)) {
             const uint32_t rem = static_cast<uint32_t>(n_gen - static_cast<int>(gen.size()));
             const uint32_t room = pos_cap - pos;
             std::vector<int32_t> qctx = ctx;
             qctx.push_back(gen.back());
+            if (tree_mode) {
+                const uint32_t tree_room = std::min(pos_cap, opt.max_ctx) - pos;
+                const uint32_t budget = std::min<uint32_t>(spec::kTreeVerifyRows - 1u, tree_room - 1u);
+                auto drafts = sfx.draft(qctx, budget, 2u, 0.0);
+                const auto tree = spec::make_verify_tree(gen.back(), drafts);
+                std::vector<int32_t> rows;
+                for (const auto& node : tree.nodes) rows.push_back(node.token);
+                const auto preds = step_batch(rows, pos, false, true, true, false, &tree);
+                const auto accepted = spec::accept_tree(tree, preds, opt.spec_force_reject ? 0u : rem - 1u);
+                commit_tree(tree, accepted.rows, pos);
+                ctx.push_back(gen.back());
+                for (size_t j = 1; j < accepted.rows.size(); ++j) {
+                    const int32_t token = rows[accepted.rows[j]];
+                    ctx.push_back(token);
+                    gen.push_back(token);
+                    sfx.push(token);
+                }
+                gen.push_back(accepted.bonus);
+                sfx.push(accepted.bonus);
+                pos += static_cast<uint32_t>(accepted.rows.size());
+                acc_tot += accepted.rows.size() - 1u;
+                dr_tot += rows.size() - 1u;
+                hits += rows.size() > 1u;
+                continue;
+            }
             const uint32_t k_max = std::min<uint32_t>({opt.suffix_max_draft, kGdnRingSlots - 2u, (rem > 1u) ? (rem - 1u) : 0u,
                                                        (room > 1u) ? (room - 1u) : 0u});
             std::vector<int32_t> draft_toks;
@@ -4601,7 +4785,42 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         return true;
     };
 
+    const std::array<const char*, 5> tree_parity_prompts{{
+        "Explain why the sky is blue, then discuss scattering in detail.",
+        "Write a C++ thread-safe bounded queue with tests and explain its invariants.",
+        "Derive the Euclidean algorithm and give several integer examples.",
+        "Describe a mountain journey as a long continuous story.",
+        "Summarize the history of printing and its effects on education."
+    }};
+    auto report_tree_parity = [&](const char* drafter, size_t prompt, const std::vector<int32_t>& raw,
+                                  const std::vector<int32_t>& chain, const std::vector<int32_t>& tree,
+                                  double raw_tps, double chain_tps, double tree_tps) {
+        if (raw.size() != 512u || chain != raw || tree != raw) {
+            size_t mismatch = 0;
+            while (mismatch < raw.size() && mismatch < tree.size() && raw[mismatch] == tree[mismatch]) ++mismatch;
+            fail_run(std::string("TREE PARITY ") + drafter + " prompt=" + std::to_string(prompt) +
+                     " failed: raw/chain/tree lengths=" + std::to_string(raw.size()) + "/" +
+                     std::to_string(chain.size()) + "/" + std::to_string(tree.size()) +
+                     " first tree mismatch=" + std::to_string(mismatch));
+        }
+        std::printf("[TREE PARITY %s %zu/5] 512/512 PASS raw=%.3f chain=%.3f tree=%.3f tok/s tree/chain=%.4f\n",
+            drafter, prompt + 1u, raw_tps, chain_tps, tree_tps, chain_tps > 0 ? tree_tps / chain_tps : 0.0);
+        std::fflush(stdout);
+    };
     auto run_bench_pass = [&](bool do_parity, bool do_bench, const std::string& bench_mode, warm::SweepVariantResult* vout) -> bool {
+        if (do_bench && tree_verify && !df.loaded) {
+            for (size_t i = 0; i < tree_parity_prompts.size(); ++i) {
+                const auto ids = tok.encode(tree_parity_prompts[i]);
+                double raw_tps = 0, chain_tps = 0, tree_tps = 0;
+                const auto raw = run_greedy_raw(ids, 512, &raw_tps);
+                const auto chain = run_greedy_suffix(ids, 512, &chain_tps, nullptr, nullptr, nullptr,
+                    nullptr, opt.max_ctx, false);
+                const auto tree = run_greedy_suffix(ids, 512, &tree_tps, nullptr, nullptr, nullptr,
+                    nullptr, opt.max_ctx, true);
+                report_tree_parity("suffix", i, raw, chain, tree, raw_tps, chain_tps, tree_tps);
+            }
+            return true;
+        }
         if (vout) { vout->ok = false; vout->parity_ok = true; vout->first_diff = -1; }
         const bool run_raw_part     = (bench_mode == "all" || bench_mode == "raw" || bench_mode == "spec");
         const bool run_spec_part    = (bench_mode == "all" || bench_mode == "spec");
@@ -5365,7 +5584,9 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             double df_t_body = 0.0, df_t_lm = 0.0, df_t_sel = 0.0;
             float  df_pmin_cur = opt.dflash_p_min;
             auto df_now_ms = []() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
+            std::vector<std::vector<int32_t>> df_tree_slots;
             auto dflash_draft = [&](int32_t anchor_tok, uint32_t s_pos, uint32_t k_draft) -> std::vector<int32_t> {
+                if (tree_verify) df_tree_slots.clear();
                 require_token(anchor_tok, "DFlash anchor embedding");
                 const double td_a = df_now_ms();
                 const uint32_t B = k_draft + 1u;
@@ -5477,6 +5698,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                         consider(df_io_val_host0[base + j], df_io_id_host0[base + j]);
                         consider(df_io_val_host1[base + j], df_io_id_host1[base + j]);
                     }
+                    if (tree_verify) df_tree_slots.emplace_back(topi, topi + 16u);
                     uint32_t best_k = 0u;
                     float best_sc = topv[0];
                     float scores[16];
@@ -5536,7 +5758,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
 
             auto run_greedy_dflash2 = [&](const std::vector<int32_t>& prompt_ids, int n_gen, uint32_t k_draft,
                                           double* out_tps, uint64_t* out_acc, uint64_t* out_dr,
-                                          bool use_hybrid_suffix = false) -> std::vector<int32_t> {
+                                          bool use_hybrid_suffix = false, bool allow_tree = true) -> std::vector<int32_t> {
                 reset_state();
                 df_t_body = df_t_lm = df_t_sel = 0.0;
                 sfx::CascadeConfig ccfg;
@@ -5594,6 +5816,37 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                 const auto td0 = std::chrono::steady_clock::now();
                 while (static_cast<int>(gen.size()) < n_gen) {
                     const uint32_t rem = static_cast<uint32_t>(n_gen - static_cast<int>(gen.size()));
+                    if (tree_verify && allow_tree) {
+                        if (use_hybrid_suffix) fail_run("tree DFlash2 does not support cascade hybrid mode");
+                        if (pos >= opt.max_ctx) fail_run("tree DFlash2 exhausted KV context");
+                        const double t0 = now_ms();
+                        const uint32_t depth = std::min<uint32_t>({2u, df.block_size - 1u, opt.max_ctx - pos - 1u});
+                        df_tree_slots.clear();
+                        if (depth) (void)dflash_draft(gen.back(), pos, depth);
+                        auto tree = spec::make_topk_verify_tree(gen.back(), df_tree_slots);
+                        if (tree.nodes.size() > opt.max_ctx - pos) {
+                            std::vector<spec::DraftNode> trimmed(tree.nodes.begin() + 1u,
+                                tree.nodes.begin() + (opt.max_ctx - pos));
+                            for (auto& node : trimmed) --node.parent;
+                            tree = spec::make_verify_tree(gen.back(), trimmed);
+                        }
+                        std::vector<int32_t> rows;
+                        for (const auto& node : tree.nodes) rows.push_back(node.token);
+                        const double t1 = now_ms();
+                        const auto preds = step_batch(rows, pos, false, true, true, true, &tree);
+                        const auto accepted = spec::accept_tree(tree, preds, opt.spec_force_reject ? 0u : rem - 1u);
+                        const double t2 = now_ms();
+                        commit_tree(tree, accepted.rows, pos);
+                        // DFlash2 catch-up is installed after accepted taps are compacted.
+                        const uint32_t count = static_cast<uint32_t>(accepted.rows.size());
+                        for (size_t j = 1; j < accepted.rows.size(); ++j) gen.push_back(rows[accepted.rows[j]]);
+                        gen.push_back(accepted.bonus);
+                        acc_tot += count - 1u;
+                        dr_tot += rows.size() - 1u;
+                        t_dr += t1 - t0; t_ver += t2 - t1; t_inj += now_ms() - t2; ++n_cyc;
+                        pos += count;
+                        continue;
+                    }
                     uint32_t k_target = use_evict ? evict_ctl.next_depth() : k_draft;
                     if (v12_spec_gov) {
                         const uint32_t gd = df_gov.next_depth(std::min<uint32_t>(k_draft, df.block_size - 1u));
@@ -5699,6 +5952,17 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                 return gen;
             };
 
+            if (tree_verify) {
+                for (size_t i = 0; i < tree_parity_prompts.size(); ++i) {
+                    const auto ids = tok.encode(tree_parity_prompts[i]);
+                    double raw_tps = 0, chain_tps = 0, tree_tps = 0;
+                    const auto raw = run_greedy_raw(ids, 512, &raw_tps);
+                    const auto chain = run_greedy_dflash2(ids, 512, opt.dflash_k, &chain_tps, nullptr, nullptr, false, false);
+                    const auto tree = run_greedy_dflash2(ids, 512, opt.dflash_k, &tree_tps, nullptr, nullptr, false, true);
+                    report_tree_parity("dflash2", i, raw, chain, tree, raw_tps, chain_tps, tree_tps);
+                }
+                return true;
+            }
             double raw_prose_tps = 0.0, df_prose_tps = 0.0, df_code_tps = 0.0;
             auto raw_prose = run_greedy_raw(p_base, 129, &raw_prose_tps);
             uint64_t pacc = 0, pdr = 0, cacc = 0, cdr = 0;
