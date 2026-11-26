@@ -90,6 +90,16 @@ class FixContracts(unittest.TestCase):
             self.assertIn('const uint32_t ep = ' + stage + '_collective.epoch;', batch)
             self.assertIn('const uint32_t pp = ' + stage + '_collective.parity;', batch)
 
+    def test_verify_barrier_is_fail_closed(self):
+        src = (ROOT / 'ops/kernels/vj_spec_gdn.hip').read_text()
+        self.assertIn('if (!grid_barrier_wbinvl1(nq_bar, gridDim.x, sense, {fault_va, sense})) return;', src)
+        self.assertIn('device_fault::fault_record(fc, vegajet::device_fault::kVjFaultBarrier, 5u, 1u, sense)', src)
+        self.assertIn('return sm_ok != 0u;', src)
+        host = (ROOT / 'models/ornith/ornith_gpu.cpp').read_text()
+        self.assertIn('dispatch::fused_verify_resident(fused->from_msgpack_note, rt.devices()[g].n_cu,', host)
+        self.assertIn('spec_nq_sense, eps, io_fault_va[g]', host)
+        self.assertIn('v12_fused_nq && fused_resident', host)
+
     def test_layer_super_abi(self):
         src = (ROOT / 'tests/vegajet_layer_test.cpp').read_text()
         for kind in ('Gdn', 'Gqa', 'Moe'):

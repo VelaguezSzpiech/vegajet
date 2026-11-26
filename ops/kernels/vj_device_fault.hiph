@@ -1,0 +1,22 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+#pragma once
+#include <stdint.h>
+
+namespace vegajet::device_fault {
+// C1 fault ABI, mirrored by core/vj_device_guard.hpp. Thread zero only.
+constexpr uint32_t kVjFaultTag = 0x56u;
+constexpr uint32_t kVjFaultBarrier = 1u;
+constexpr uint32_t kVjFaultMailbox = 2u;
+struct FaultCtx {
+    uint64_t rec_va;
+    uint32_t epoch;
+};
+__device__ __forceinline__ void fault_record(FaultCtx fc, uint32_t kind, uint32_t bar_id,
+                                            uint32_t stage, uint32_t want) {
+    if (fc.rec_va == 0ULL) return;
+    using Rec = volatile uint32_t __attribute__((address_space(1)))*;
+    const Rec rec = reinterpret_cast<Rec>(fc.rec_va);
+    rec[1] = want;
+    rec[0] = (kVjFaultTag << 24) | (kind << 16) | (bar_id << 8) | stage;
+}
+} // namespace vegajet::device_fault

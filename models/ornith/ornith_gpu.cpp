@@ -2729,21 +2729,29 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                             S[g].spec_gdn_o_va, S[g].spec_gdn_rec_kv_va, S[g].spec_gdn_rec_dec_va, S[g].spec_gdn_rec_beta_va,
                             M, 8u, 32u, 6144u, 40u * 128u, gi, 0u, 0u, 0u, 16u * 40u * 128u, 16u * 32u
                         };
-                        if (v12_fused_nq && K[g].spec_gdn_ver_nq != nullptr && S[g].spec_nq_bar_va != 0) {
+                        if (g == 0 && v12_fused_nq) ++spec_nq_sense;
+                        const auto* fused = K[g].spec_gdn_ver_nq;
+                        const bool fused_resident = v12_fused_nq && fused && fused->wavefront_size == 64u &&
+                            fused->max_flat_workgroup_size >= 256u && fused->private_segment_fixed_size == 0u &&
+                            dispatch::fused_verify_resident(fused->from_msgpack_note, rt.devices()[g].n_cu,
+                                fused->vgpr_count, fused->sgpr_count, fused->group_segment_fixed_size,
+                                fused->resident_waves_per_simd);
+                        if (v12_fused_nq && fused_resident && S[g].spec_nq_bar_va != 0) {
                             // v1.2 S5: verify + norm/quant in one launch (grid barrier inside).
                             struct SpecGdnNqKA {
                                 uint64_t sin, sout, qsrc, ksrc, vsrc, dec, beta, oout, rkv, rdec, rbeta;
                                 uint64_t gab, nw, oq, od, bar;
                                 uint32_t M, nk, nv, s_strd, r_strd, lbase, s_lstrd, src_lstrd, gb_lstrd, r_lstrd, rgb_lstrd;
                                 uint32_t strd_in, zoff, sense; float eps;
+                                uint64_t fault;
                             };
-                            if (g == 0) ++spec_nq_sense;
+                            static_assert(offsetof(SpecGdnNqKA, fault) == 192u && sizeof(SpecGdnNqKA) == 200u);
                             const SpecGdnNqKA fnka{
                                 sgka.sin, sgka.sout, sgka.qsrc, sgka.ksrc, sgka.vsrc, sgka.dec, sgka.beta, sgka.oout,
                                 sgka.rkv, sgka.rdec, sgka.rbeta,
                                 S[g].gdn_qkv_gab_va, lw.ssm_norm_va, S[g].mid_q8_va, S[g].mid_ds_va, S[g].spec_nq_bar_va,
                                 M, 8u, 32u, 6144u, 40u * 128u, gi, 0u, 0u, 0u, 16u * 40u * 128u, 16u * 32u,
-                                10304u, 6144u, spec_nq_sense, eps};
+                                10304u, 6144u, spec_nq_sense, eps, io_fault_va[g]};
                             VJ_CHECK(rt.enqueue_kernel(g, *K[g].spec_gdn_ver_nq, 128u * 256u, 1, 1, 256, 1, 1, &fnka, sizeof(fnka), true));
                         } else {
                         VJ_CHECK(rt.enqueue_kernel(g, *K[g].spec_gdn_ver, 128u * 256u, 1, 1, 256, 1, 1, &sgka, sizeof(sgka), true));

@@ -7,6 +7,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <stdint.h>
+#include "vj_device_fault.hiph"
 
 #include "core/ggml_iq_tables.hpp"
 #include "ops/kernels/vj_moe_dot8.hiph"
@@ -142,23 +143,10 @@ __device__ __forceinline__ uint32_t load_u32_glc(GPtr<const uint32_t> ptr) {
 //   [2] rank: written once by the host at init
 // Mirrored by vegajet::guard in core/vj_device_guard.hpp.
 // ---------------------------------------------------------------------------------------------
-constexpr uint32_t kVjFaultTag     = 0x56u;
-constexpr uint32_t kVjFaultBarrier = 1u;
-constexpr uint32_t kVjFaultMailbox = 2u;
-
-struct FaultCtx {
-    uint64_t rec_va;   // 0 disables recording (one-shot self-tests)
-    uint32_t epoch;    // super_sense of this launch, profiling bit masked off
-};
-
-__device__ __forceinline__ void fault_record(FaultCtx fc, uint32_t kind, uint32_t bar_id,
-                                             uint32_t stage, uint32_t want) {
-    // Thread 0 only: every call site sits inside `if (threadIdx.x == 0u)`.
-    if (fc.rec_va == 0ULL) return;
-    const GPtr<volatile uint32_t> rec = as_gptr<volatile uint32_t>(fc.rec_va);
-    rec[1] = want;                                                              // epoch that was awaited
-    rec[0] = (kVjFaultTag << 24) | (kind << 16) | (bar_id << 8) | stage;         // identity, written last
-}
+using device_fault::FaultCtx;
+using device_fault::fault_record;
+using device_fault::kVjFaultBarrier;
+using device_fault::kVjFaultMailbox;
 
 // Returns false when the expected sense never arrived within the (unchanged) 5M spin budget.
 __device__ __forceinline__ bool grid_barrier_glc_only(GPtr<uint32_t> bar, uint32_t n_wgs, uint32_t sense,

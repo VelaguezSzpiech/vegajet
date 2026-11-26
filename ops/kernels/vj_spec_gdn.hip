@@ -44,6 +44,7 @@
 // The causal-conv state (ornith_gdn_conv_l2_gate_kernel ring, m < 5) needs a matching rollback for M > 5.
 #include <hip/hip_runtime.h>
 #include <stdint.h>
+#include "vj_device_fault.hiph"
 
 #ifndef VJ_SPEC_GDN_MAX_M
 #define VJ_SPEC_GDN_MAX_M 16
@@ -282,10 +283,13 @@ __device__ __forceinline__ uint32_t ld_glc_u32(const uint32_t* p) {
     return v;
 }
 
-__device__ __forceinline__ void grid_barrier_wbinvl1(uint32_t* bar, uint32_t n_wgs, uint32_t sense) {
+__device__ __forceinline__ bool grid_barrier_wbinvl1(uint32_t* bar, uint32_t n_wgs, uint32_t sense,
+                                                    vegajet::device_fault::FaultCtx fc) {
+    __shared__ uint32_t sm_ok;
     asm volatile("s_waitcnt vmcnt(0)\n" ::: "memory");
     __syncthreads();
     if (threadIdx.x == 0u) {
+        bool ok = true;
         const uint32_t arr = __atomic_fetch_add(&bar[0], 1u, __ATOMIC_RELAXED) + 1u;
         if (arr == n_wgs) {
             __atomic_store_n(&bar[0], 0u, __ATOMIC_RELAXED);
@@ -297,10 +301,14 @@ __device__ __forceinline__ void grid_barrier_wbinvl1(uint32_t* bar, uint32_t n_w
                 if (ld_glc_u32(&bar[16]) == sense) break;
                 __builtin_amdgcn_s_sleep(2);
             }
+            ok = (ld_glc_u32(&bar[16]) == sense);
+            if (!ok) vegajet::device_fault::fault_record(fc, vegajet::device_fault::kVjFaultBarrier, 5u, 1u, sense);
         }
+        sm_ok = ok ? 1u : 0u;
         asm volatile("buffer_wbinvl1\n" ::: "memory");
     }
     __syncthreads();
+    return sm_ok != 0u;
 }
 
 extern "C" __global__ __launch_bounds__(256, 3)
@@ -335,7 +343,8 @@ void vj_spec_gdn_verify_fused_nq_kernel(
     uint32_t stride_in,                      // qkv_gab row stride (floats)
     uint32_t z_off,                          // z gate column offset of the head block
     uint32_t sense,
-    float    eps) {
+    float    eps,
+    uint64_t fault_va) {
     using namespace vegajet::spec_gdn_dev;
     if (q_src == nullptr || o_out == nullptr || M == 0u || M > VJ_SPEC_GDN_MAX_M || gridDim.y != 1u) return;
     const uint32_t hv   = blockIdx.x >> 2;
@@ -444,7 +453,7 @@ void vj_spec_gdn_verify_fused_nq_kernel(
     for (uint32_t r = 0u; r < 16u; ++r) S_thr_out[(static_cast<int32_t>(r) - 8) * 128] = s_reg[r];
 
     // ---- one grid barrier over all nv*4 WGs: every WG's raw o is now visible ----
-    grid_barrier_wbinvl1(nq_bar, gridDim.x, sense);
+    if (!grid_barrier_wbinvl1(nq_bar, gridDim.x, sense, {fault_va, sense})) return;
 
     // ---- norm + quant phase: verbatim vj_spec_gdn_norm_quant_kernel (one wave per (token, head)) ----
     {
