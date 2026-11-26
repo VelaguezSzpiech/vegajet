@@ -287,6 +287,7 @@ struct KernelTable {
     const kfd::LoadedKernel* gemm_q4_m8  = nullptr;
     const kfd::LoadedKernel* gemm_q4_m12 = nullptr;
     const kfd::LoadedKernel* gemm_q4_m16 = nullptr;
+    const kfd::LoadedKernel* gemv_q4_mn  = nullptr;   // v1.2 S4: narrow M=2..16 verify GEMV
     const kfd::LoadedKernel* gdn_conv_l2 = nullptr;
     const kfd::LoadedKernel* gdn_recur = nullptr;
     const kfd::LoadedKernel* gdn_recur_sv = nullptr;
@@ -909,6 +910,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             K[g].gemm_q4_m8   = need_k("ornith_gemm_q4a8_m8_kernel");
             K[g].gemm_q4_m12  = need_k("ornith_gemm_q4a8_m12_kernel");
             K[g].gemm_q4_m16  = need_k("ornith_gemm_q4a8_m16_l2_kernel");
+            K[g].gemv_q4_mn   = rt.get_kernel(g, "ornith_gemv_q4a8_mn_kernel");  // v1.2 S4 (optional)
             K[g].gdn_conv_l2  = need_k("ornith_gdn_conv_l2_gate_kernel");
             K[g].gdn_recur    = need_k("ornith_gdn_recur_quant_kernel");
             K[g].gdn_recur_sv = need_k("ornith_gdn_recur_splitv_quant_kernel");
@@ -2289,6 +2291,8 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         const bool ab_f2_front = (std::getenv("VEGAJET_AB_F2_FRONT") != nullptr && std::getenv("VEGAJET_AB_F2_FRONT")[0] == '1');
         const bool ab_b2_back  = (std::getenv("VEGAJET_AB_B2_BACK") != nullptr && std::getenv("VEGAJET_AB_B2_BACK")[0] == '1');
         const bool ab_enable_super = !(std::getenv("VEGAJET_ENABLE_SUPER") != nullptr && std::getenv("VEGAJET_ENABLE_SUPER")[0] == '0');
+        // v1.2 S4 lever, default off (unset or any value other than "1" keeps the m8/m12/m16 path).
+        const bool v12_narrow_verify = (std::getenv("VEGAJET_V12_NARROW_VERIFY") != nullptr && std::getenv("VEGAJET_V12_NARROW_VERIFY")[0] == '1');
 
         auto enq_gemm_q4 = [&](size_t g, const Q4A8WeightDev& w, uint64_t xq, uint64_t xds, uint64_t y, bool barrier = true, uint64_t peer_tx = 0ULL) {
             if (M == 1u) {
@@ -2336,6 +2340,12 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                     }
                 } else if (K[g].pf_gemm && !use_ring && M >= 16u && w.cols % 64u == 0u) {
                     VJ_CHECK(rt.enqueue_kernel(g, *K[g].pf_gemm, ((w.rows + 63u) / 64u) * 256u, (M + 63u) / 64u, 1, 256, 1, 1, &ka, sizeof(ka), barrier));
+                } else if (v12_narrow_verify && M >= 2u && M <= 16u && (w.cols % 32u) == 0u && w.cols != 512u &&
+                           K[g].gemv_q4_mn != nullptr) {
+                    struct GemmPpKA { uint64_t wq, wdm, xq, xds, y; uint32_t rows, cols, M, stride; uint64_t ptx; };
+                    GemmPpKA pka{w.qs_va, w.dm_va, xq, xds, y, w.rows, w.cols, M, w.row_stride_bytes, peer_tx};
+                    const uint32_t gx = ((w.rows + 7u) / 8u) * 256u;
+                    VJ_CHECK(rt.enqueue_kernel(g, *K[g].gemv_q4_mn, gx, 1, 1, 256, 1, 1, &pka, sizeof(pka), barrier));
                 } else if (M <= 8u && K[g].gemm_q4_m8) {
                     struct GemmPpKA { uint64_t wq, wdm, xq, xds, y; uint32_t rows, cols, M, stride; uint64_t ptx; };
                     GemmPpKA pka{w.qs_va, w.dm_va, xq, xds, y, w.rows, w.cols, M, w.row_stride_bytes, peer_tx};
