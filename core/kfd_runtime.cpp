@@ -1003,6 +1003,7 @@ bool Runtime::load_hsaco_dir(const std::string& hsaco_dir, std::string* err) {
         "vj_spec_gdn.hsaco",
         "vj_dflash2.hsaco",
         "vj_ornith_super.hsaco",
+        "vj_ornith_super_vol.hsaco",
     };
     for (const char* f : optional) {
         const fs::path p = fs::path(dir) / f;

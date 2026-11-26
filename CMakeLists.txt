@@ -204,6 +204,9 @@ if(NOT VEGAJET_CPU_ONLY)
         vj_add_hsaco(vj_moe_down_grouped ops/kernels/vj_moe_down_grouped.hip)
         vj_add_hsaco(vj_dflash2        ops/kernels/vj_dflash2.hip)
         vj_add_hsaco(vj_ornith_super   ops/kernels/vj_ornith_super.hip)
+        # v1.2 opt-in variants: same source, own symbol suffix (see VJ_KNAME), own gate lines.
+        # VEGAJET_V12_BARRIER_VOL=1 binds *_vol (buffer_wbinvl1_vol stage barriers).
+        vj_add_hsaco(vj_ornith_super_vol ops/kernels/vj_ornith_super.hip -DVJ_V12_WBINVL1_VOL -DVJ_KERNEL_SUFFIX=_vol)
     endif()
     add_custom_target(vegajet_hsacos DEPENDS ${VEGAJET_HSACO_TARGETS})
 endif()

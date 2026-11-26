@@ -851,6 +851,14 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
     const std::string hdir = kfd::resolve_hsaco_dir(opt.hsaco_dir);
     if (!rt.load_hsaco_dir(hdir, &res.error)) return res;
 
+    // v1.2 opt-in super-kernel variants (default off). Each variant is the same source built into
+    // its own .hsaco with a symbol suffix; the baseline object is untouched when the env var is unset.
+    std::string super_sfx;
+    {
+        const char* v = std::getenv("VEGAJET_V12_BARRIER_VOL");
+        if (v != nullptr && v[0] == '1') super_sfx = "_vol";
+    }
+
     KernelTable K[2];
     auto resolve_kernels = [&](std::string* kerr) -> bool {
         if (kerr) kerr->clear();
@@ -955,10 +963,17 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             K[g].vocab_ilp = v12_vocab_ilp() ? rt.get_kernel(g, "ornith_vocab_argmax_q8_ilp_kernel") : nullptr;
             K[g].vocab_argmax_b6  = need_k("ornith_vocab_argmax_q8_batch6_kernel");
             K[g].vocab_argmax_b12 = need_k("ornith_vocab_argmax_q8_batch12_l2_kernel");
-            K[g].m1_gdn_super     = rt.get_kernel(g, "ornith_m1_gdn_super_kernel");
-            K[g].m1_gqa_super     = rt.get_kernel(g, "ornith_m1_gqa_super_kernel");
-            K[g].m1_moe_super     = rt.get_kernel(g, "ornith_m1_moe_super_kernel");
-            K[g].m1_moe_super_q3  = rt.get_kernel(g, "ornith_m1_moe_super_q3_kernel");
+            K[g].m1_gdn_super     = rt.get_kernel(g, "ornith_m1_gdn_super_kernel" + super_sfx);
+            K[g].m1_gqa_super     = rt.get_kernel(g, "ornith_m1_gqa_super_kernel" + super_sfx);
+            K[g].m1_moe_super     = rt.get_kernel(g, "ornith_m1_moe_super_kernel" + super_sfx);
+            K[g].m1_moe_super_q3  = rt.get_kernel(g, "ornith_m1_moe_super_q3_kernel" + super_sfx);
+            if (!super_sfx.empty() && (!K[g].m1_gdn_super || !K[g].m1_gqa_super ||
+                                       !K[g].m1_moe_super || !K[g].m1_moe_super_q3)) {
+                // Fail closed: a requested variant that is not on disk would otherwise fall through
+                // to the baseline kernels of a stale build and silently measure nothing.
+                if (kerr && kerr->empty()) *kerr = "VEGAJET_V12_BARRIER_VOL=1 needs vj_ornith_super" + super_sfx + ".hsaco in " + hdir;
+                return false;
+            }
             K[g].moe_gu_repack    = rt.get_kernel(g, "vj_repack_iq2s_to_dot8_gu_kernel");
             K[g].moe_gu_lru       = rt.get_kernel(g, "vj_moe_gu_dot8_lru_kernel");
             K[g].vocab_argmax_b16 = need_k("ornith_vocab_argmax_q8_batch16_l2_kernel");

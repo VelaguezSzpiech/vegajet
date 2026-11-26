@@ -3,7 +3,7 @@
 //   - Collapses 291 -> 100 dispatches/token (<=104 target): 2 super-kernels/layer!
 //   - Strictly 0 B private spill, <= 64 VGPRs (4 WGs/CU = 240 resident WGs), < 24,576 B .text, lds_dword = 0.
 //   - Hardware coherency: s_waitcnt vmcnt(0); __threadfence_system(); before exit on P2P prepush paths;
-//     full buffer_wbinvl1 after every grid_barrier_m boundary.
+//     full buffer_wbinvl1 after every grid_barrier_m boundary (VJ_V12_WBINVL1_VOL variant: see grid_barrier_wbinvl1).
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <stdint.h>
@@ -14,6 +14,17 @@
 
 #define VJ_SUPER_RING_SLOTS 17u
 #define VJ_SUPER_AR_SLOT_BYTES (2ULL * 1024ULL * 1024ULL)
+
+// ---- v1.2 build variants --------------------------------------------------------------------
+// The runtime keys kernels by name, so an opt-in variant of this file is compiled into its own
+// .hsaco with -DVJ_KERNEL_SUFFIX=_<variant> plus that variant's -DVJ_V12_* define, and loaded
+// next to the baseline object; the baseline build keeps an empty suffix.
+#ifndef VJ_KERNEL_SUFFIX
+#define VJ_KERNEL_SUFFIX
+#endif
+#define VJ_KNAME_CAT2(a, b) a##b
+#define VJ_KNAME_CAT(a, b) VJ_KNAME_CAT2(a, b)
+#define VJ_KNAME(name) VJ_KNAME_CAT(name, VJ_KERNEL_SUFFIX)
 
 namespace vegajet {
 namespace super_dev {
@@ -177,6 +188,36 @@ __device__ __forceinline__ bool grid_barrier_glc_only(GPtr<uint32_t> bar, uint32
     return sm_ok != 0u;
 }
 
+// v1.2 (D5) opt-in variant of this stage barrier (-DVJ_V12_WBINVL1_VOL): same protocol, but the trailing L1
+// invalidation is the "volatile" fence form. On gfx906 `buffer_wbinvl1_vol` (0xE0FC0000) is exactly
+// what __threadfence() lowers to (s_waitcnt lgkmcnt(0); buffer_wbinvl1_vol ...), i.e. it still
+// invalidates the L1 for subsequent loads but does not order against outstanding non-volatile
+// stores; the s_waitcnt vmcnt(0) at the top and the glc sense-flag load already provide that.
+//
+// Cross-stage read audit (what each barrier publishes -> how the consumer loads it). Every reader
+// below is a *plain cached* global load (or an `ldg_*_stream` = nontemporal/slc load); none of them
+// is a glc/volatile load, so the strict precondition for dropping the invalidate is NOT met. What
+// the audit does show is that at every site the post-barrier read is the first touch of that
+// address by that WG in the dispatch, and no buffer is read before its producing write:
+//
+//   GDN  sbar+0    AR(0) writes x_q8/x_ds -> stage 1 w_gdn_qkv GEMV         plain vector loads
+//        sbar+32   stage 1 writes gdn_qkv_gab -> stage 2 conv/gate/SplitV   plain scalar/vector
+//        sbar+64   stage 2 writes mid_q8/mid_ds(+ssm ring, nontemp. store)  -> stage 3 GEMV plain
+//   GQA  sbar+0    AR(0) writes x_q8/x_ds -> stage 1 w_attn_qkv GEMV        plain vector loads
+//        sbar+32   stage 1 writes attn_qkv -> stage 2a Q/K norm+RoPE       plain scalar loads
+//        sbar+64   stage 2a writes q_buf/k_cache_q8/v_cache_q8 -> stage 2b plain loads
+//        sbar+96   stage 2b writes part_o/part_ml -> stage 2c merge         plain loads
+//        sbar+128  stage 2c writes mid_q8/mid_ds -> stage 3 w_o GEMV        plain vector loads
+//   MoE  sbar+0    AR(0) writes x_q8/x_ds/x_norm -> stage 1 ShGU+router     plain vector loads
+//        sbar+32   stage 1 writes router_logits/sh_gu_out/sh_gate_sc       stage 2/3 plain loads
+//        sbar+96   stage 3 writes mid_q8/mid_d/sh_down_out -> stage 4      plain loads
+//   MoE3 sbar+0/32/96: same stages as the MoE kernel above.
+//
+// So the reason this is safe is per-dispatch first touch, not glc: a WG can only hold a stale line
+// for an address it (or a WG co-resident on the same CU) already read in this dispatch, and the
+// only lines that survive a dispatch boundary are the ones the AR/norm prologue already re-reads
+// plainly at kernel entry (x_partial, h_io), which the baseline already relies on. UNVERIFIED ON
+// HARDWARE - gated off by default, enable with VEGAJET_V12_BARRIER_VOL=1 and diff the tokens.
 __device__ __forceinline__ bool grid_barrier_wbinvl1(GPtr<uint32_t> bar, uint32_t n_wgs, uint32_t sense,
                                                     FaultCtx fc, uint32_t bar_id, uint32_t stage) {
     __shared__ uint32_t sm_ok;
@@ -198,7 +239,11 @@ __device__ __forceinline__ bool grid_barrier_wbinvl1(GPtr<uint32_t> bar, uint32_
             ok = (load_u32_glc(&bar[16]) == sense);
             if (!ok) fault_record(fc, kVjFaultBarrier, bar_id, stage, sense);
         }
+        #if defined(VJ_V12_WBINVL1_VOL)
+        asm volatile("buffer_wbinvl1_vol\n" ::: "memory");
+#else
         asm volatile("buffer_wbinvl1\n" ::: "memory");
+#endif
         sm_ok = ok ? 1u : 0u;
     }
     __syncthreads();
@@ -675,7 +720,7 @@ __device__ __forceinline__ void moe_gu_16r_tile_g32_sm(
 // Grid: 240 WGs x 256 thr (4 WGs/CU x 60 CUs). 36 dispatches/token!
 // ============================================================================
 extern "C" __global__ __launch_bounds__(256, 4)
-void ornith_m1_gdn_super_kernel(
+void VJ_KNAME(ornith_m1_gdn_super_kernel)(
     const vegajet::ornith_super::GdnSuperDesc* __restrict__ desc,
     uint64_t ssm_ring_override,
     uint32_t prev_ar_epoch,
@@ -964,7 +1009,7 @@ void ornith_m1_gdn_super_kernel(
 // Grid: 240 WGs x 256 thr (4 WGs/CU x 60 CUs). 12 dispatches/token!
 // ============================================================================
 extern "C" __global__ __launch_bounds__(256, 4)
-void ornith_m1_gqa_super_kernel(
+void VJ_KNAME(ornith_m1_gqa_super_kernel)(
     const vegajet::ornith_super::GqaSuperDesc* __restrict__ desc,
     uint32_t prev_ar_epoch,
     uint32_t out_ar_epoch,
@@ -1249,7 +1294,7 @@ void ornith_m1_gqa_super_kernel(
 // Grid: 240 WGs x 256 thr (4 WGs/CU x 60 CUs). 48 dispatches/token! Total LDS = 8,928 B!
 // ============================================================================
 extern "C" __global__ __launch_bounds__(256, 4)
-void ornith_m1_moe_super_kernel(
+void VJ_KNAME(ornith_m1_moe_super_kernel)(
     const vegajet::ornith_super::MoeSuperDesc* __restrict__ desc,
     uint32_t ar_epoch,
     uint32_t out_ar_epoch,
@@ -1611,7 +1656,7 @@ void ornith_m1_moe_super_kernel(
 // DEDICATED Q3 SUPER-KERNEL B-MoE (240 WGs, kBatch=3 deep prefetch, balanced 240-WG 16B-BAR0 Down, ~16 KB .text!)
 // ============================================================================
 extern "C" __global__ __launch_bounds__(256, 4)
-void ornith_m1_moe_super_q3_kernel(
+void VJ_KNAME(ornith_m1_moe_super_q3_kernel)(
     const vegajet::ornith_super::MoeSuperDesc* __restrict__ desc,
     uint32_t ar_epoch,
     uint32_t out_ar_epoch,

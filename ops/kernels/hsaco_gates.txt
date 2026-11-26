@@ -133,6 +133,10 @@ ornith_m1_gdn_super_kernel tiled
 ornith_m1_gqa_super_kernel tiled
 ornith_m1_moe_super_kernel tiled
 ornith_m1_moe_super_q3_kernel tiled
+ornith_m1_gdn_super_kernel_vol tiled
+ornith_m1_gqa_super_kernel_vol tiled
+ornith_m1_moe_super_kernel_vol tiled
+ornith_m1_moe_super_q3_kernel_vol tiled
 vj_dflash2_tap_copy_kernel tiled
 vj_dflash2_quant_q8_kernel tiled
 vj_dflash2_embed_block_kernel tiled
