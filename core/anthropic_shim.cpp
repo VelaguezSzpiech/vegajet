@@ -95,7 +95,13 @@ bool parse_request(const Value& root, const Limits& lim, serve::GenerateRequest&
         err = "request body must be a JSON object";
         return false;
     }
-    if (const Value* m = root.get("model"); m && m->is_string()) g.model = m->str;
+    if (const Value* m = root.get("model"); m && m->is_string()) {
+        if (m->str.size() > lim.max_model_len) {
+            err = "'model' must be at most " + std::to_string(lim.max_model_len) + " bytes";
+            return false;
+        }
+        g.model = m->str;
+    }
     if (g.model.empty()) g.model = lim.default_model;
 
     // system

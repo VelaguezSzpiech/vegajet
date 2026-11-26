@@ -448,6 +448,54 @@ void test_m2_cancelled_accounting() {
     VJ_CHECK(expo.find("vegajet_requests_cancelled_total 1") != std::string::npos);
 }
 
+// ------------------------------------------------------------------------------------------------ S-M3
+// "model" was unvalidated and repeated in every SSE chunk (a 4 KB request produced 42 KB of output).
+void test_m3_model_field() {
+    MockGen gen;
+    ServerOptions opt;
+    opt.port = 0;
+    opt.model_id = "vegajet-served";
+    OpenAiServer srv(opt, [&](const GenerateRequest& r, const TokenSink& s) { return gen(r, s); });
+    std::string err;
+    VJ_CHECK(srv.start(&err));
+
+    // Unknown model: 404 with model_not_found, like OpenAI.
+    Resp r = chat(srv.port(), chat_body("some-other-model", "hi"));
+    VJ_CHECK(r.status == 404);
+    VJ_CHECK(r.body.find("model_not_found") != std::string::npos);
+    VJ_CHECK(r.body.find("some-other-model") != std::string::npos);
+
+    // /v1/messages behaves the same.
+    r = one(srv.port(), "POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
+                        "Connection: close\r\nContent-Length: " +
+                            std::to_string(chat_body("nope", "hi", ",\"max_tokens\":8").size()) + "\r\n\r\n" +
+                            chat_body("nope", "hi", ",\"max_tokens\":8"));
+    VJ_CHECK(r.status == 404);
+    VJ_CHECK(r.body.find("not_found_error") != std::string::npos);
+
+    // An over-long model name is refused before it can be echoed anywhere.
+    r = chat(srv.port(), chat_body(std::string(200, 'M'), "hi"));
+    VJ_CHECK(r.status == 400);
+    VJ_CHECK(r.body.find("128 bytes") != std::string::npos);
+
+    // The served model and an absent model are both accepted.
+    r = chat(srv.port(), chat_body("vegajet-served", "hi"));
+    VJ_CHECK(r.status == 200);
+    r = chat(srv.port(), std::string("{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"));
+    VJ_CHECK(r.status == 200);
+
+    // A stream names the model twice (first and final chunk), not once per token.
+    const std::string body = chat_body("vegajet-served", "hi", ",\"stream\":true");
+    r = chat(srv.port(), body);
+    VJ_CHECK(r.status == 200);
+    size_t n = 0;
+    for (size_t p = r.body.find("vegajet-served"); p != std::string::npos; p = r.body.find("vegajet-served", p + 1)) ++n;
+    VJ_CHECK(n == 2);
+    VJ_CHECK(r.body.find("data: [DONE]") != std::string::npos);
+
+    srv.stop();
+}
+
 }  // namespace
 
 int main() {
@@ -456,8 +504,10 @@ int main() {
     test_b2_connection_limit();
     test_m1_half_close();
     test_m2_cancelled_accounting();
+    test_m3_model_field();
     std::printf("test_serve_reliability: S-B1 bounded JSON parse, S-B2 connection limit 503 + health reserve,\n"
-                "                        S-M1 half-closed client gets the full response, S-M2 cancellation is logged as 499\n");
+                "                        S-M1 half-closed client gets the full response, S-M2 cancellation is logged as 499,\n"
+                "                        S-M3 model validated (404/400) and not repeated per chunk\n");
     std::printf("PASS\n");
     return 0;
 }

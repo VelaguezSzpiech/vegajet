@@ -230,14 +230,15 @@ std::string http_response(int status, std::string_view ctype, std::string_view b
     return h;
 }
 
-std::string error_json(std::string_view msg, std::string_view type) {
+std::string error_json(std::string_view msg, std::string_view type, std::string_view code = {}) {
     return "{\"error\":{\"message\":" + json::quote(msg) + ",\"type\":" + json::quote(type) +
-           ",\"param\":null,\"code\":null}}";
+           ",\"param\":null,\"code\":" + (code.empty() ? std::string("null") : json::quote(code)) + "}}";
 }
 
-std::string error_response(int status, std::string_view msg, bool keep_alive, const std::string& extra = {}) {
+std::string error_response(int status, std::string_view msg, bool keep_alive, const std::string& extra = {},
+                           std::string_view code = {}) {
     const char* type = status == 503 ? "server_busy" : status >= 500 ? "server_error" : "invalid_request_error";
-    return http_response(status, "application/json", error_json(msg, type), keep_alive, extra);
+    return http_response(status, "application/json", error_json(msg, type, code), keep_alive, extra);
 }
 
 // Bounded request-body parse. The JSON Value tree costs ~50x the body size, so a hostile body used to reach
@@ -284,7 +285,14 @@ bool get_number(const json::Value& root, const char* key, double& out, std::stri
 bool parse_chat(const json::Value& root, const ServerOptions& opt, GenerateRequest& g, bool& include_usage,
                 std::string& err) {
     if (!root.is_object()) { err = "request body must be a JSON object"; return false; }
-    if (const auto* m = root.get("model"); m && m->is_string()) g.model = m->str;
+    if (const auto* m = root.get("model"); m && !m->is_null()) {
+        if (!m->is_string()) { err = "'model' must be a string"; return false; }
+        if (m->str.size() > opt.max_model_name_len) {
+            err = "'model' must be at most " + std::to_string(opt.max_model_name_len) + " bytes";
+            return false;
+        }
+        g.model = m->str;
+    }
     if (g.model.empty()) g.model = opt.model_id;
     const auto* msgs = root.get("messages");
     if (!msgs || !msgs->is_array() || msgs->arr.empty()) { err = "'messages' must be a non-empty array"; return false; }
@@ -630,11 +638,12 @@ struct OpenAiServer::Impl {
         }
         if (path == "/v1/chat/completions" || path == "/v1/messages") {
             const bool anth = path == "/v1/messages";
-            auto fail = [&](int status, const std::string& msg, const std::string& extra = {}) {
+            auto fail = [&](int status, const std::string& msg, const std::string& extra = {},
+                            std::string_view code = {}) {
                 respond(fd,
                         anth ? http_response(status, "application/json",
                                              anthropic::error_json(anthropic::error_type(status), msg), ka, extra)
-                             : error_response(status, msg, ka, extra),
+                             : error_response(status, msg, ka, extra, code),
                         ka);
             };
             if (req.method != "POST") {
@@ -659,11 +668,19 @@ struct OpenAiServer::Impl {
             }
             Job job;
             const bool ok = anth ? anthropic::parse_request(
-                                       root, anthropic::Limits{opt.model_id, opt.default_max_tokens, opt.max_tokens_cap},
+                                       root,
+                                       anthropic::Limits{opt.model_id, opt.default_max_tokens, opt.max_tokens_cap,
+                                                         opt.max_model_name_len},
                                        job.req, err)
                                  : parse_chat(root, opt, job.req, job.include_usage, err);
             if (!ok) {
                 fail(400, err);
+                return;
+            }
+            // S-M3: an unknown model answers 404 like OpenAI, instead of a 200 with a foreign model name.
+            if (job.req.model != opt.model_id) {
+                fail(404, "model '" + job.req.model + "' does not exist; this server serves '" + opt.model_id + "'", {},
+                     "model_not_found");
                 return;
             }
             {
@@ -943,10 +960,12 @@ struct OpenAiServer::Impl {
         const std::string id = "chatcmpl-" + std::to_string(created) + "-" + std::to_string(next_id++);
         const std::string ts = std::to_string(static_cast<long long>(std::time(nullptr)));
         const std::string model = json::quote(rq.model);
-        auto chunk = [&](const std::string& delta, const char* finish) {
+        // The model name is sent in the first and the final chunk only: repeating it per token multiplied a long
+        // request model into a huge response (S-M3).
+        auto chunk = [&](const std::string& delta, const char* finish, bool with_model) {
             return "data: {\"id\":\"" + id + "\",\"object\":\"chat.completion.chunk\",\"created\":" + ts +
-                   ",\"model\":" + model + ",\"choices\":[{\"index\":0,\"delta\":" + delta + ",\"finish_reason\":" +
-                   (finish ? json::quote(finish) : std::string("null")) + "}]}\n\n";
+                   (with_model ? ",\"model\":" + model : std::string()) + ",\"choices\":[{\"index\":0,\"delta\":" +
+                   delta + ",\"finish_reason\":" + (finish ? json::quote(finish) : std::string("null")) + "}]}\n\n";
         };
 
         const bool anth = job.anthropic;
@@ -957,7 +976,7 @@ struct OpenAiServer::Impl {
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n"
                 "Connection: close\r\nAccess-Control-Allow-Origin: *\r\nX-Accel-Buffering: no\r\n\r\n";
             gone = !pump.push(head + (anth ? enc.start()
-                                           : chunk("{\"role\":\"assistant\",\"content\":\"\"}", nullptr)));
+                                           : chunk("{\"role\":\"assistant\",\"content\":\"\"}", nullptr, true)));
         }
 
         StopMatcher sm(rq.stop);
@@ -987,17 +1006,17 @@ struct OpenAiServer::Impl {
             std::string out;
             for (const auto& e : ev) {
                 if (e.kind == toolcall::Event::Kind::Content) {
-                    out += chunk("{\"content\":" + json::quote(e.text) + "}", nullptr);
+                    out += chunk("{\"content\":" + json::quote(e.text) + "}", nullptr, false);
                 } else if (e.kind == toolcall::Event::Kind::Reasoning) {
-                    out += chunk("{\"reasoning_content\":" + json::quote(e.text) + "}", nullptr);
+                    out += chunk("{\"reasoning_content\":" + json::quote(e.text) + "}", nullptr, false);
                 } else {  // OpenAI streaming shape: header delta (id, type, name), then argument fragments
                     const std::string idx = std::to_string(e.index);
                     out += chunk("{\"tool_calls\":[{\"index\":" + idx + ",\"id\":" + json::quote(e.call.id) +
                                  ",\"type\":\"function\",\"function\":{\"name\":" + json::quote(e.call.name) +
-                                 ",\"arguments\":\"\"}}]}", nullptr);
+                                 ",\"arguments\":\"\"}}]}", nullptr, false);
                     for (const auto& a : utf8_pieces(e.call.arguments, 256))
                         out += chunk("{\"tool_calls\":[{\"index\":" + idx + ",\"function\":{\"arguments\":" +
-                                     json::quote(a) + "}}]}", nullptr);
+                                     json::quote(a) + "}}]}", nullptr, false);
                 }
             }
             ev.clear();
@@ -1089,7 +1108,7 @@ struct OpenAiServer::Impl {
                 if (!pump.push(http_response(200, "application/json", body, keep_alive))) keep_alive = false;
             } else if (stream) {
                 ++n_streamed;
-                std::string tail = chunk("{}", finish_reason_name(fr));
+                std::string tail = chunk("{}", finish_reason_name(fr), true);
                 if (job.include_usage)
                     tail += "data: {\"id\":\"" + id + "\",\"object\":\"chat.completion.chunk\",\"created\":" + ts +
                             ",\"model\":" + model + ",\"choices\":[],\"usage\":" + usage + ",\"timings\":" + timings +
