@@ -103,12 +103,13 @@ public:
     void u64(uint64_t v) { pod(v); }
     void f32(float v) { pod(v); }
     void str(const std::string& s) { u64(s.size()); raw(s.data(), s.size()); }
-    void kv_str(const std::string& k, const std::string& v) { str(k); u32(8); str(v); }
-    void kv_u32(const std::string& k, uint32_t v) { str(k); u32(4); u32(v); }
-    void kv_u64(const std::string& k, uint64_t v) { str(k); u32(10); u64(v); }
-    void kv_f32(const std::string& k, float v) { str(k); u32(6); f32(v); }
+    void kv_str(const std::string& k, const std::string& v) { str(k); u32(8); str(v); ++n_kv_; }
+    void kv_u32(const std::string& k, uint32_t v) { str(k); u32(4); u32(v); ++n_kv_; }
+    void kv_u64(const std::string& k, uint64_t v) { str(k); u32(10); u64(v); ++n_kv_; }
+    void kv_f32(const std::string& k, float v) { str(k); u32(6); f32(v); ++n_kv_; }
     void kv_arr_scalars(const std::string& k, uint32_t elem_type, uint64_t count) {
         str(k); u32(9); u32(elem_type); u64(count);  // header only; caller appends elements
+        ++n_kv_;
     }
     void kv_arr_str(const std::string& k, const std::vector<std::string>& v) {
         kv_arr_scalars(k, 8, v.size());
@@ -123,8 +124,11 @@ public:
         u64(offset);
     }
     // Pads the metadata section to `align`, then appends `payload` zero bytes.
+    // The n_kv header field is rewritten with the number of kv_*() calls actually made (the ctor
+    // value is used only when none were), so a test cannot forget to keep the two in sync.
     std::vector<uint8_t> build(size_t payload = 0, uint64_t align = 32) const {
         std::vector<uint8_t> out = b_;
+        if (n_kv_ > 0) std::memcpy(&out[16], &n_kv_, 8);
         while (out.size() % align) out.push_back(0);
         out.resize(out.size() + payload, 0);
         return out;
@@ -134,6 +138,7 @@ private:
     template <typename T> void pod(const T& v) { raw(&v, sizeof(T)); }
     void raw(const void* p, size_t n) { b_.insert(b_.end(), (const uint8_t*)p, (const uint8_t*)p + n); }
     std::vector<uint8_t> b_;
+    uint64_t n_kv_ = 0;
 };
 
 } // namespace vjtest
