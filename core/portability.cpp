@@ -51,7 +51,8 @@ Verdict power_cap(double cap_w, size_t n_gpus) {
 
 Verdict gpu_count(size_t n_gpus) {
     if (n_gpus >= 2) return {CheckStatus::Pass, std::to_string(n_gpus) + " GPUs: TP and N=1 swarm layouts available"};
-    return {CheckStatus::Warn, "1 GPU: TP=1 models and N=1 serve workers only; the Ornith-122B runner needs 2 GPUs"};
+    if (n_gpus == 0) return {CheckStatus::Warn, "no GPU: plans only"};
+    return {CheckStatus::Warn, "1 GPU: N=1 generic execution available; model weights/state must fit one arena; TP=2 fusion is unavailable"};
 }
 
 Identity current_identity() {

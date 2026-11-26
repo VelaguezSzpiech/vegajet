@@ -34,6 +34,8 @@ ornith_gdn_recur_quant_kernel tiled
 ornith_gdn_wy_prefill_quant_kernel tiled 70
 ornith_attn_qkv_prep_kernel tiled
 ornith_attn_flash_quant_kernel tiled
+ornith_attn_flash_nrank_kernel tiled
+ornith_local_argmax_nrank stream
 ornith_attn_prep_flash_m1_kernel tiled
 ornith_moe_router_fp16_logits_kernel tiled
 ornith_moe_router_top8_kernel tiled

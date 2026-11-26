@@ -95,6 +95,12 @@ int main() {
         serve::EngineHandle h2;
         VJ_CHECK(!reg.create(spec, h2, &err) && err.find("weights missing") != std::string::npos && !h2.engine);
     }
+    for (uint32_t n : {1u, 2u, 3u, 4u, 8u, 256u}) {
+        VJ_CHECK(parse({"m-model", "--tp", std::to_string(n), "--tp-shards", "shards.json", "--tp-plan", "collective.json"}, c) == 0);
+        VJ_CHECK(c.tp == n && c.tp_shards == "shards.json" && c.tp_plan == "collective.json");
+    }
+    VJ_CHECK(parse({"m-model", "--tp", "257"}, c) == 2);
+    VJ_CHECK(parse({"--mock", "--tp-shards", "shards.json"}, c) == 2);
     // ---- MockBatchEngine == MockEngine, through the scheduler (roomy pool and a pool small enough to preempt)
     {
         MockEngine ref;

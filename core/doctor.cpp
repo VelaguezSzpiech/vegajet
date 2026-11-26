@@ -18,6 +18,7 @@
 #include <unordered_map>
 
 #include "core/host_preflight.hpp"
+#include "core/tp_executor.hpp"
 
 namespace vegajet {
 namespace doctor {
@@ -642,6 +643,24 @@ DoctorReport run_doctor() {
         } else {
             add_check("gpu." + g.bdf + ".psu_power_cap", CheckStatus::Warn,
                       g.bdf + " hwmon power1_cap unreadable.");
+        }
+    }
+
+    // TP executor: which rank counts this host can host, and which features stay on the TP=2 fast path.
+    {
+        const auto detected = static_cast<uint32_t>(rep.gpus.size());
+        tp::FeatureFlags fast;
+        fast.super_kernels = fast.asym_experts = fast.mtp_draft = fast.speculative = true;
+        if (detected == 0) {
+            add_check("tp.executor", CheckStatus::Warn,
+                      "no gfx906 GPU detected: TP plans are host-side only (--tp N --dry-run)");
+        } else {
+            const std::string why = tp::admit_features(detected, fast);
+            std::string d = "TP=2 uses the fused fast path; TP=1.." + std::to_string(detected) +
+                            " use generic raw per-op execution (hardware parity unqualified)";
+            if (why.empty()) d += " (fast-path features admitted).";
+            else d += ". " + why;
+            add_check("tp.executor", why.empty() ? CheckStatus::Pass : CheckStatus::Warn, d);
         }
     }
 

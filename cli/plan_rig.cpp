@@ -22,7 +22,7 @@ void print_rig_usage() {
     std::printf("Usage: vegajet plan <model-file> --gpus N --vram 16|32 [--ctx T] [--kv-bits 16|8] [--cu 60|64] [--matrix]\n"
                 "  Rig estimator (GGUF header only, any build): per-GPU VRAM breakdown for TP=N, repacking decisions\n"
                 "  (crossover law bw_new/bw_old > bpw_new/bpw_old), KV/context headroom, host-RAM MoE offload need.\n"
-                "  --gpus N      GPUs, 1..8 (default 1)\n"
+                "  --gpus N      GPUs, 1..256 (default 1)\n"
                 "  --vram G      GiB per GPU, 16 or 32 (default 32)\n"
                 "  --ctx T       context to size the KV cache for (default 8192)\n"
                 "  --kv-bits B   KV cache precision, 16 or 8 (default 16)\n"
@@ -57,7 +57,7 @@ int run_rig_plan(const std::vector<std::string>& args) {
         if (a == "--matrix") { matrix = true; continue; }
         if (a == "--gpus") {
             if (!value("--gpus")) return 2;
-            if (v < 1 || v > 8) { std::fprintf(stderr, "plan: --gpus must be 1..8\n"); return 2; }
+            if (v < 1 || v > 256) { std::fprintf(stderr, "plan: --gpus must be 1..256\n"); return 2; }
             spec.gpus = static_cast<uint32_t>(v);
         } else if (a == "--vram") {
             if (!value("--vram")) return 2;

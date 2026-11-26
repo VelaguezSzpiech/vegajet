@@ -10,8 +10,11 @@
 #include "core/kfd_runtime.hpp"
 #include "core/portability.hpp"
 #include "core/tokenizer.hpp"
+#include "core/gpu_select.hpp"
 #include "core/tp_collective.hpp"
+#include "core/tp_executor.hpp"
 #include "models/ornith/ornith_gpu.hpp"
+#include "models/ornith/ornith_tp_exec.hpp"
 #include "models/registry.hpp"
 
 #include <algorithm>
@@ -32,6 +35,59 @@ namespace vegajet::cli {
 namespace {
 
 constexpr uint64_t GiB = 1ull << 30;
+
+// Device profiles for an executor layout, read-only: --tp-profile wins, then the gfx906 sysfs scan,
+// then the owner-declared --vram-gib/--bw-gbs defaults. Never opens a device node.
+bool executor_profiles(uint32_t tp, const std::string& profile_path, double vram_gib,
+                       const std::vector<double>& bws, std::vector<tp::DeviceProfile>& out, std::string* err) {
+    if (!profile_path.empty()) {
+        std::ifstream in(profile_path);
+        if (!in.is_open()) { if (err) *err = "cannot read " + profile_path; return false; }
+        std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        try {
+            out = tp::profiles_from_json(text);
+        } catch (const std::exception& e) {
+            if (err) *err = e.what();
+            return false;
+        }
+        if (out.size() != tp) {
+            if (err) *err = "--tp-profile has " + std::to_string(out.size()) + " ranks, --tp is " + std::to_string(tp);
+            return false;
+        }
+        return true;
+    }
+    auto found = gpusel::scan_topology(gpusel::sysfs_root());
+    if (!found.empty() && !gpusel::filter_from_env(found, err)) return false;
+    if (!found.empty() && found.size() != tp) {
+        if (err) *err = "selected-device count must equal --tp";
+        return false;
+    }
+    if (found.size() == tp) {
+        for (uint32_t r = 0; r < tp; ++r) {
+            tp::DeviceProfile p;
+            p.bdf = gpusel::bdf(found[r].pci_domain, found[r].location_id);
+            p.unique_id = tp::device_key(p.bdf, gpusel::sysfs_root());
+            if (p.unique_id.rfind("uid:", 0) == 0) p.unique_id = p.unique_id.substr(4);
+            else p.unique_id.clear();
+            p.bw_hbm_gbs = r < bws.size() ? bws[r] : 1.0;
+            p.n_cu = found[r].simd_count ? found[r].simd_count / 4u : 60u;
+            p.mclk = 1000;
+            p.usable_vram_bytes = found[r].vram_bytes > GiB ? found[r].vram_bytes - GiB : 0;
+            out.push_back(std::move(p));
+        }
+        return true;
+    }
+    for (uint32_t r = 0; r < tp; ++r) {
+        tp::DeviceProfile p;
+        p.unique_id = "plan-" + std::to_string(r);  // synthetic: no device was found
+        p.bw_hbm_gbs = r < bws.size() ? bws[r] : 1.0;
+        p.n_cu = 60;
+        p.mclk = 1000;
+        p.usable_vram_bytes = static_cast<uint64_t>(vram_gib) * GiB;
+        out.push_back(std::move(p));
+    }
+    return true;
+}
 
 #ifndef VEGAJET_GIT_COMMIT
 #define VEGAJET_GIT_COMMIT "unknown"
@@ -55,7 +111,7 @@ void usage(const char* cmd) {
                 "                    [--dump-golden-layers DIR]\n"
                 "                    | --bench-ar [--tp N] [--dry-run] [--tp-profile FILE] [--tp-plan FILE]\n"
                 "                    | --bench-gemv [--hsaco-dir DIR]\n"
-                "  AR plans:         FP16 N-rank plan only with --dry-run; execution remains TP2 until M3.\n"
+                "  N-rank raw:       [--tp-shards FILE] [--tp-plan FILE]; FP16 wire, sequential per-op prefill/decode.\n"
                 "  GPU selection:    [--gpu IDX[,IDX|A-B]...|all|list] (CLI-wide; overrides VJ_GPU_DEVICES)\n"
                 "  Dry-run load through the model plugin, per-GPU footprint, decode/prefill graph summary and\n"
                 "  code-object validation (private_segment_fixed_size == 0, every graph kernel symbol exported).\n"
@@ -68,8 +124,9 @@ void usage(const char* cmd) {
 
 int run_bench(const std::string& cmd, const std::vector<std::string>& args) {
     std::string model_path, draft, mask_embd, prompt, hsaco_dir, dump_hidden, dump_logits, json_out, dump_tokens;
-    std::string interactive_fifo, sweep_spec, dump_golden_layers_dir, tp_profile, tp_plan;
+    std::string interactive_fifo, sweep_spec, dump_golden_layers_dir, tp_profile, tp_plan, tp_shards, shard_text, collective_text;
     bool tp_given = false;
+    std::vector<std::string> explicit_flags;
     bool interactive = false;
     std::vector<std::string> hsaco;
     uint32_t tp = 1, ctx = 32768;
@@ -86,6 +143,7 @@ int run_bench(const std::string& cmd, const std::vector<std::string>& args) {
     std::vector<double> bws;
     for (size_t i = 0; i < args.size(); ++i) {
         const std::string& a = args[i];
+        if (a.rfind("--", 0) == 0) explicit_flags.push_back(a);
         auto next = [&]() -> std::string { return i + 1 < args.size() ? args[++i] : std::string(); };
         if (a == "--help" || a == "-h") { usage(cmd.c_str()); return 0; }
         else if (a == "--tp") {
@@ -96,8 +154,8 @@ int run_bench(const std::string& cmd, const std::vector<std::string>& args) {
             }
             tp_given = true;
         }
-        else if (a == "--tp-profile" || a == "--tp-plan") {
-            auto& path = a == "--tp-profile" ? tp_profile : tp_plan;
+        else if (a == "--tp-profile" || a == "--tp-plan" || a == "--tp-shards") {
+            auto& path = a == "--tp-profile" ? tp_profile : (a == "--tp-plan" ? tp_plan : tp_shards);
             path = next();
             if (path.empty() || path[0] == '-') { std::fprintf(stderr, "%s requires a file\n", a.c_str()); return 2; }
         }
@@ -185,9 +243,22 @@ int run_bench(const std::string& cmd, const std::vector<std::string>& args) {
                              "(run one bench --dump-tokens per variant)\n");
         return 2;
     }
-    if (!bench_ar && (!tp_profile.empty() || !tp_plan.empty())) {
-        std::fprintf(stderr, "--tp-profile/--tp-plan currently require --bench-ar\n"); return 2;
+    if (tp > 256) { std::fprintf(stderr, "--tp exceeds the 256-rank runtime bound\n"); return 2; }
+    if (!bench_ar && !tp_profile.empty()) {
+        std::fprintf(stderr, "--tp-profile requires --bench-ar; decode uses selected-device identities and --tp-shards\n"); return 2;
     }
+    if (bench_ar && !tp_shards.empty()) { std::fprintf(stderr, "--tp-shards is for decode, not --bench-ar\n"); return 2; }
+    try {
+        auto read_json = [](const std::string& path) {
+            std::ifstream input(path);
+            if (!input) throw std::runtime_error("cannot read TP JSON: " + path);
+            return std::string(std::istreambuf_iterator<char>(input), {});
+        };
+        if (!tp_shards.empty()) { shard_text = read_json(tp_shards); (void)tp::shard_options_from_json(shard_text); }
+        if (!tp_plan.empty()) { collective_text = read_json(tp_plan); (void)tp::collective_options_from_json(collective_text); }
+        if (!bench_ar && tp == 2 && (!tp_shards.empty() || !tp_plan.empty()))
+            throw std::runtime_error("TP=2 legacy fast path does not support --tp-shards/--tp-plan overrides");
+    } catch (const std::exception& e) { std::fprintf(stderr, "%s\n", e.what()); return 2; }
     if (bench_ar) {
         if (!tp_given) tp = 2; // preserve the legacy standalone benchmark default
         if (tp > 256) { std::fprintf(stderr, "--bench-ar plan CLI admits at most 256 ranks (matrix resource bound)\n"); return 2; }
@@ -230,6 +301,9 @@ int run_bench(const std::string& cmd, const std::vector<std::string>& args) {
     std::string err;
     auto model = ModelRegistry::instance().create_for(f, &err);
     if (!model) { std::fprintf(stderr, "%s\n", err.c_str()); return 1; }
+    // The Ornith GPU runner's live default is its two-rank fast path; --tp overrides it. Other plugins
+    // keep the single-device planning default.
+    if (!tp_given && model->name() == "ornith") tp = 2;
     LoadOptions opt;
     opt.gpus.assign(tp, GpuTarget{60, 800.0, 1.725, static_cast<uint64_t>(vram_gib * GiB)});
     for (size_t i = 0; i < bws.size() && i < tp; ++i) opt.gpus[i].bw_hbm_gbs = bws[i];
@@ -287,6 +361,47 @@ int run_bench(const std::string& cmd, const std::vector<std::string>& args) {
     for (const auto& [k, v] : hist) std::printf("    %-20s %u\n", k.c_str(), v);
 
     int rc = rep.ok ? 0 : 1;
+
+    // v1.3 M4: N-rank executor admission and layout. TP=2 is the fused fast path; every other rank
+    // count plans the generic per-op path and refuses, by name, any feature that path cannot own.
+    if (const auto* om = dynamic_cast<const ornith::OrnithModel*>(model.get())) {
+        ornith::OrnithGpuOptions feat;
+        feat.draft_gguf      = draft;
+        feat.use_suffix_spec = suffix_decode;
+        feat.ar_wire_int8    = ar_int8;
+        feat.prefill_dot8    = prefill_dot8;
+        feat.spec_gdn        = spec_gdn;
+        const std::string why = ornith::ornith_admit(tp, ornith::ornith_feature_flags(feat));
+        if (!why.empty()) { std::fprintf(stderr, "[vegajet] %s\n", why.c_str()); return finish(2); }
+        std::printf("  executor: %s\n", ornith::ornith_executor_mode(tp) == ornith::ExecutorMode::LegacyFast
+                                             ? "TP=2 fused fast path" : "generic N-rank per-op path");
+        std::vector<tp::DeviceProfile> devs;
+        std::string derr;
+        if (!executor_profiles(tp, tp_profile, vram_gib, bws, devs, &derr)) {
+            std::printf("  executor layout: %s\n", derr.c_str());
+            rc = 1;
+        } else {
+            try {
+                if (tp != 2) {
+                    const auto layout = ornith::raw_layout(om->hparams(), ctx, devs,
+                        shard_text.empty() ? tp::ShardOptions{} : tp::shard_options_from_json(shard_text));
+                    for (size_t r = 0; r < layout.ranks.size(); ++r) {
+                        const auto& m = layout.ranks[r];
+                        std::printf("  rank %zu: FF [%llu,%llu), shared [%llu,%llu), vocab [%llu,%llu), Q=%zu KV=%zu GDN=%zu; capacity bound=%llu B\n",
+                            r, (unsigned long long)m.ff.begin, (unsigned long long)m.ff.end,
+                            (unsigned long long)m.shared_ff.begin, (unsigned long long)m.shared_ff.end,
+                            (unsigned long long)m.vocab.begin, (unsigned long long)m.vocab.end,
+                            m.attn.q_heads.size(), m.attn.kv_heads.size(), m.groups.size(),
+                            (unsigned long long)layout.shards.ranks[r].used_bytes);
+                    }
+                }
+            } catch (const std::exception& e) {
+                std::printf("  executor layout: %s\n", e.what());
+                rc = 1;
+            }
+        }
+    }
+
     if (!hsaco.empty()) {
         std::set<std::string> exported;
         for (const auto& path : hsaco) {
@@ -306,18 +421,15 @@ int run_bench(const std::string& cmd, const std::vector<std::string>& args) {
     }
 
     if (kfd::Runtime::compiled_with_gpu() && !dry_only && model->name() == "ornith") {
-        if (tp != 2) {
-            std::fprintf(stderr, "GPU execution supports TP=2 only until milestone 3; TP=%u is plan-only (use --dry-run)\n", tp);
-            return finish(3);
-        }
+        if (ornith::ornith_executor_mode(tp) == ornith::ExecutorMode::Generic)
+            std::fprintf(stderr, "[vegajet] TP=%u: generic N-rank executor (admitted above)\n", tp);
         // Alpha portability: refuse before the runner reserves its per-GPU arenas, with what is needed vs found,
-        // instead of failing late inside the 2 x ~30 GiB allocation on a smaller host.
+        // instead of failing late inside the per-GPU ~30 GiB allocation on a smaller host.
         {
-            constexpr uint32_t kOrnithGpus = 2;                          // run_ornith_gpu requires 2 GPUs
             portability::FitRequest fr;
             const size_t slash = model_path.find_last_of('/');
             fr.model = slash == std::string::npos ? model_path : model_path.substr(slash + 1);
-            fr.gpus_required = kOrnithGpus > tp ? kOrnithGpus : tp;
+            fr.gpus_required = tp;
             fr.arena_bytes_per_gpu = 30ULL * portability::kGiB;          // rt.init(30.5), falling back to 30.0 GiB
             if (rep.weight_bytes_per_gpu.size() == fr.gpus_required)    // the plan describes the runner's layout
                 for (size_t i = 0; i < rep.weight_bytes_per_gpu.size(); ++i)
@@ -336,7 +448,7 @@ int run_bench(const std::string& cmd, const std::vector<std::string>& args) {
         gopt.mask_embedding_path = mask_embd;
         gopt.dflash_k        = dflash_k;
         gopt.dflash_p_min    = dflash_p_min;
-        gopt.max_ctx         = std::min<uint32_t>(ctx, 8192u);
+        gopt.max_ctx        = tp == 2 ? std::min<uint32_t>(ctx, 8192u) : ctx;
         gopt.prefill_chunk   = prefill_chunk;
         gopt.use_suffix_spec = suffix_decode;
         gopt.run_bench       = (cmd == "bench");
@@ -359,6 +471,9 @@ int run_bench(const std::string& cmd, const std::vector<std::string>& args) {
             if (!note.empty()) std::fprintf(stderr, "[fr_spec] %s\n", note.c_str());
         }
         gopt.fr_spec_rows    = fr_spec;
+        gopt.tp              = tp;
+        gopt.tp_shard_json = shard_text; gopt.tp_collective_json = collective_text;
+        gopt.tp_bandwidths = bws;
         gopt.mtp_k           = mtp_k;
         gopt.gu_grp_verify   = gu_grp_verify;
         gopt.dot8_ab = dot8_ab;
@@ -388,12 +503,22 @@ int run_bench(const std::string& cmd, const std::vector<std::string>& args) {
         gopt.dump_golden_layers_dir = dump_golden_layers_dir;
         if (!prompt.empty()) gopt.dump_prompt_ids = prompt_ids;
         gopt.moe_back_wgs    = back_wgs;
+        if (tp != 2) {
+            const std::set<std::string> per_op = {"--tp", "--tp-shards", "--tp-plan", "--tp-profile", "--ctx", "--vram-gib", "--bw-gbs",
+                "--prompt", "--n-predict", "--hsaco-dir", "--hsaco", "--json-out", "--dry-run", "--ar-wire", "--reuse",
+                "--prefill-seq", "--no-fast-prefill", "--no-fuse-router", "--no-fuse-back", "--no-gdn-splitv", "--ab-no-prepush"};
+            for (const auto& flag : explicit_flags) if (!per_op.count(flag)) {
+                std::fprintf(stderr, "generic Ornith: unsupported feature %s (TP=%u)\n", flag.c_str(), tp); return finish(2);
+            }
+        }
+        const std::string raw_error = ornith::ornith_raw_admit(gopt);
+        if (!raw_error.empty()) { std::fprintf(stderr, "%s\n", raw_error.c_str()); return finish(2); }
         benchjson::StdoutTee tee;
         if (!json_out.empty()) {
             rec.gpus_before = benchjson::snapshot("/");  // read-only sysfs: TMem, power cap, 6-block RAS
             tee.begin();
         }
-        auto m = ornith::run_ornith_gpu(model_path, prompt, gopt);
+        const auto m = ornith::run_ornith_gpu(model_path, prompt, gopt);
         if (!json_out.empty()) {
             benchjson::parse_log(tee.end(), rec);
             rec.gpus_after = benchjson::snapshot("/");

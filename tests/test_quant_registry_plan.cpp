@@ -279,6 +279,10 @@ void test_crossover_and_breakdown() {
     // KV: 2 (K,V) x 64 layers x (8 heads / 2 GPUs) x 128 x 2 B.
     VJ_CHECK(p.kv_bytes_per_token == 2ull * 64 * 4 * 128 * 2);
     VJ_CHECK(p.gpus.size() == 2 && p.gpus[0].kv == p.kv_bytes_per_token * 8192);
+    for (uint32_t n : {1u, 2u, 3u, 4u, 8u, 16u, 200u}) {
+        auto ranks = rig; ranks.gpus = n;
+        VJ_CHECK(rig::plan_rig(m, ranks).gpus.size() == n);
+    }
     VJ_CHECK(p.gpus[0].embed_head > p.gpus[1].embed_head);  // embedding lives on GPU 0
     VJ_CHECK(p.max_ctx >= 8192 && p.max_ctx <= m.n_ctx_train);
     // The Q6_K head decision depends on the rig's ridge point: same law, different verdicts for 60 / 64 CU.

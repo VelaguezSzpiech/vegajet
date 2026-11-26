@@ -42,6 +42,7 @@ struct ServeConfig {
     bool enable_thinking = false;
     bool parse_reasoning = true;
     std::string hsaco_dir;
+    std::string tp_shards, tp_plan; // validated JSON text in EngineSpec; file paths in ServeConfig
     std::string request_log;      // --request-log: JSONL record per request (no prompt / completion text)
     bool metrics_hw = false;      // --metrics-hw: GPU sysfs telemetry (read-only) in GET /metrics
     int32_t max_tokens_cap = 0;   // --max-tokens-cap: cap on "max_tokens" (0: the context length, --ctx)

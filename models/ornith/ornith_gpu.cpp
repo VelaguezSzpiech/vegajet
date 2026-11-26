@@ -22,6 +22,7 @@
 #include "core/warm_bench.hpp"
 #include "models/ornith/ornith_golden.hpp"
 #include "models/ornith/ornith_gpu.hpp"
+#include "models/ornith/ornith_tp_exec.hpp"
 
 #include "core/spec_engine.hpp"
 #include "core/spec_tree.hpp"
@@ -822,18 +823,22 @@ static bool v12_serve_spec() {
 
 } // namespace
 
+#include "models/ornith/ornith_nrank.inc"
+
 OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                                   const std::string& prompt_text,
                                   const OrnithGpuOptions& opt_in) {
     OrnithGpuOptions opt = opt_in;
     const OrnithGpuOptions base_opt = opt_in;
     OrnithBenchMetrics res{};
+    res.error = ornith_raw_admit(opt);
+    if (!res.error.empty()) return res;
     if (spec::tree_verify_requested(std::getenv("VEGAJET_V12_TREE_VERIFY"))) {
         res.error = kTreeVerifyUnavailable;
         return res;
     }
     auto t_load0 = std::chrono::steady_clock::now();
-    {   // Alpha portability: 2 x 32 GB gfx906 only. Say so before planning, tokenizing or reserving any arena.
+    if (opt.tp == 2) { // Legacy fast-path preflight; generic ranks use their own capacity plan.
         const auto budget = preflight::check_arena(preflight::gfx906_vram_bytes("/"), preflight::kOrnithArenaGiB,
                                                    preflight::kOrnithGpus, "the Ornith-122B GPU runner");
         if (!budget.ok) { res.error = budget.message; return res; }
@@ -843,6 +848,11 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
     if (!f.open(gguf_path)) { res.error = f.error(); return res; }
     BpeTokenizer tok;
     if (!tok.load_from_gguf(gguf_path, &res.error)) return res;
+
+    if (opt.tp != 2) {
+        const auto ids = opt.dump_prompt_ids.empty() ? tok.encode(prompt_text.empty() ? "Hello" : prompt_text) : opt.dump_prompt_ids;
+        return run_ornith_nrank(f, tok, ids, opt);
+    }
 
     OrnithModel planner;
     quant::HardwareRooflineProfile hw_prof;
@@ -7245,7 +7255,7 @@ public:
             return false;
         }
         const auto budget = preflight::check_arena(preflight::gfx906_vram_bytes("/"), preflight::kOrnithArenaGiB,
-                                                   preflight::kOrnithGpus, "the Ornith-122B GPU server");
+                                                   spec.tp, "the Ornith-122B GPU server");
         if (!budget.ok) {
             if (err) *err = budget.message;
             return false;
@@ -7266,6 +7276,7 @@ public:
         // Default to the qualified fast M=1 super-kernel layout unless the operator overrides via env. With the
         // speculative serving driver on, RAW_ONLY must be off: it sizes the GDN ring to one slot and promotes the expert
         // weights in place for M=1, neither of which the M>=2 verify step can use.
+        if (spec.tp == 2) {
         if (v12_serve_spec())
             setenv("VEGAJET_RAW_ONLY", "0", 1);
         else
@@ -7274,9 +7285,15 @@ public:
         setenv("VEGAJET_VA_CLUSTER", "1", 0);
         setenv("VEGAJET_VOCAB_MUBUF", "1", 0);
         setenv("VEGAJET_SUPER_WGS", "240", 0);
+        } else if (v12_serve_spec()) {
+            if (err) *err = "generic Ornith: speculative serving is unsupported";
+            return false;
+        }
 
         OrnithGpuOptions opt;
         opt.hsaco_dir = spec.hsaco_dir;
+        opt.tp = spec.tp;
+        opt.tp_shard_json = spec.tp_shards; opt.tp_collective_json = spec.tp_plan;
         opt.max_ctx = std::max<uint32_t>(spec.context, 256u);
         opt.run_bench = false;
         opt.run_parity = false;

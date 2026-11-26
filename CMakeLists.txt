@@ -76,6 +76,7 @@ add_library(vegajet_core STATIC
     core/sharder.cpp
     core/tp_sharder.cpp
     core/tp_collective.cpp
+    core/tp_executor.cpp
     core/tp_runtime_topology.cpp
     core/topology_planner.cpp
     core/hw_profile.cpp
@@ -186,6 +187,7 @@ if(NOT VEGAJET_CPU_ONLY)
     endfunction()
 
     vj_add_hsaco(vj_tp_collective      ops/kernels/vj_tp_collective.hip)
+    vj_add_hsaco(vj_ornith_nrank       ops/kernels/vj_ornith_nrank.hip)
     vj_add_hsaco(vj_kfd_base           ops/kernels/vj_kfd_base.hip)
     vj_add_hsaco(vj_quant_ops          ops/kernels/vj_quant_ops.hiph -Wno-pragma-once-outside-header -x hip)
     vj_add_hsaco(vj_kv_flash_ops       ops/kernels/vj_kv_flash_ops.hiph -Wno-pragma-once-outside-header -x hip)
@@ -228,6 +230,7 @@ set(VEGAJET_MODEL_SOURCES
     models/qwen4exp/qwen4exp_model.cpp
     models/ornith/ornith_loader.cpp
     models/ornith/ornith_runner.cpp
+    models/ornith/ornith_tp_exec.cpp
     models/ornith/ornith_gpu.cpp
     models/model_blueprints.cpp
 )
@@ -300,6 +303,8 @@ vj_test(test_ornith_loader)
 vj_test(test_sharder)
 vj_test(test_tp_sharder)
 vj_test(test_tp_collective)
+vj_test(test_tp_executor)
+vj_test(test_ornith_raw_layout)
 vj_test(test_tp_runtime_topology)
 vj_test(test_topology_planner)
 vj_test(test_grid_planner)

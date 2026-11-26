@@ -13,6 +13,9 @@
 #include <csignal>
 #include <cstdlib>
 #include <memory>
+#include <fstream>
+#include "core/tp_sharder.hpp"
+#include "core/tp_collective.hpp"
 
 namespace vegajet::cli {
 
@@ -52,7 +55,7 @@ std::string base_name(const std::string& p) {
 void print_serve_usage(std::FILE* f) {
     std::fprintf(f,
                  "Usage: vegajet serve <model-file>|--model FILE [--gpu IDX[,IDX|A-B]...|all|list] [--tp N] [--ctx T]\n"
-                 "                     [--slots N] [--hsaco-dir DIR] [common options]\n"
+                 "                     [--slots N] [--hsaco-dir DIR] [--tp-shards FILE] [--tp-plan FILE] [common options]\n"
                  "       vegajet serve --mock [--gguf TOKENIZER-FILE] [--slots N] [common options]\n"
                  "  common: [--host 127.0.0.1] [--port 8080] [--model-id NAME] [--max-queue 16]\n"
                  "          [--chat-format auto|chatml|qwen25|qwen3|ornith] [--enable-thinking] [--reasoning-format auto|none]\n"
@@ -89,8 +92,10 @@ int parse_serve_args(const std::vector<std::string>& args, ServeConfig& c, std::
         else if (a == "--model") { if (!value(c.model_path)) return fail("--model needs a file"); }
         else if (a == "--slots") { if (!value(v) || !parse_uint(v, 1, 64, n)) return fail("--slots takes 1..64"); c.slots = static_cast<uint32_t>(n); }
         else if (a == "--max-queue") { if (!value(v) || !parse_uint(v, 1, 4096, n)) return fail("--max-queue takes 1..4096"); c.max_queue = static_cast<uint32_t>(n); }
-        else if (a == "--tp") { if (!value(v) || !parse_uint(v, 1, 8, n)) return fail("--tp takes 1..8"); c.tp = static_cast<uint32_t>(n); }
+        else if (a == "--tp") { if (!value(v) || !parse_uint(v, 1, 256, n)) return fail("--tp takes 1..256"); c.tp = static_cast<uint32_t>(n); }
         else if (a == "--ctx") { if (!value(v) || !parse_uint(v, 256, 1u << 20, n)) return fail("--ctx takes 256..1048576"); c.ctx = static_cast<uint32_t>(n); }
+        else if (a == "--tp-shards") { if (!value(c.tp_shards)) return fail("--tp-shards needs a file"); }
+        else if (a == "--tp-plan") { if (!value(c.tp_plan)) return fail("--tp-plan needs a file"); }
         else if (a == "--hsaco-dir") { if (!value(c.hsaco_dir)) return fail("--hsaco-dir needs a directory"); }
         else if (a == "--request-log") { if (!value(c.request_log) || c.request_log.empty()) return fail("--request-log needs a file"); }
         else if (a == "--metrics-hw") c.metrics_hw = true;
@@ -120,6 +125,7 @@ int parse_serve_args(const std::vector<std::string>& args, ServeConfig& c, std::
     }
     if (c.mock && !c.model_path.empty()) return fail("--mock and a model file are mutually exclusive");
     if (!c.mock && c.model_path.empty()) return fail("serve needs a model file (or --mock)");
+    if (c.mock && (!c.tp_shards.empty() || !c.tp_plan.empty())) return fail("TP JSON requires a model engine");
     if (c.mock && c.tp > 1) return fail("--tp applies to a model file, not --mock");
     return 0;
 }
@@ -226,6 +232,17 @@ int run_serve(const std::vector<std::string>& args, const gpusel::Selection& gpu
         spec.tp = c.tp;
         spec.context = c.ctx;
         spec.hsaco_dir = c.hsaco_dir;
+        try {
+            auto read_json = [](const std::string& path) {
+                std::ifstream input(path);
+                if (!input) throw std::runtime_error("cannot read TP JSON: " + path);
+                return std::string(std::istreambuf_iterator<char>(input), {});
+            };
+            if (!c.tp_shards.empty()) { spec.tp_shards = read_json(c.tp_shards); (void)tp::shard_options_from_json(spec.tp_shards); }
+            if (!c.tp_plan.empty()) { spec.tp_plan = read_json(c.tp_plan); (void)tp::collective_options_from_json(spec.tp_plan); }
+            if (spec.tp == 2 && (!spec.tp_shards.empty() || !spec.tp_plan.empty()))
+                throw std::runtime_error("TP=2 legacy fast path does not support TP JSON overrides");
+        } catch (const std::exception& e) { std::fprintf(stderr, "%s\n", e.what()); return 2; }
         if (!serve::EngineRegistry::instance().create(spec, handle, &err)) {
             std::fprintf(stderr, "[vegajet] %s\n", err.c_str());
             return 3;

@@ -49,7 +49,7 @@ struct ModelSummary {
 bool summarize_gguf(const GgufFile& f, ModelSummary& out, std::string* err = nullptr);
 
 struct RigSpec {
-    uint32_t gpus = 1;            // 1..8, tensor parallel
+    uint32_t gpus = 1;            // 1..256, tensor parallel
     uint32_t vram_gib = 32;       // 16 or 32 per card
     uint32_t n_cu = 60;           // 60 (MI50) or 64 (MI60)
     double bw_gbs = 800.0;        // sustained HBM2 streaming per card

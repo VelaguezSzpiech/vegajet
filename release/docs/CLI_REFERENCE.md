@@ -87,7 +87,7 @@ no device, any build) and estimates a rig: `vegajet plan <model-file> --gpus N -
 only when the crossover law `bw_new / bw_old > bpw_new / bpw_old` holds and the budget allows; lossless re-layouts
 always), the per-GPU VRAM breakdown for TP=N (dense, routed experts, embedding / head, norms, KV, recurrent state,
 2 GiB reserve), the largest context that fits, and whether routed MoE experts must be offloaded to host RAM.
-`--matrix` prints one line per standard rig (1x16, 2x16, 2x32, 3x32, 4x32, 8x32 GiB). Rig options: `--gpus` 1..8
+`--matrix` prints one line per standard rig (1x16, 2x16, 2x32, 3x32, 4x32, 8x32 GiB). Rig options: `--gpus` 1..256
 (default 1), `--vram` 16 or 32 GiB (default 32), `--ctx` tokens (default 8192), `--kv-bits` 16 or 8 (default 16),
 `--cu` 60 or 64 (default 60). Exit codes as below; a plan that fits with MoE offload exits 0.
 
@@ -156,12 +156,13 @@ validation failure, 2 usage error.
 | `--interactive-fifo PATH` | Same, reading commands from a named pipe (`tools/vj_bench_warm.sh` drives it). |
 | `--sweep "A ; B"` | Run several variants in one warm process; each variant is a flag list and/or `VAR=value` settings, separated by `;`. |
 | `--dump-golden-layers DIR` | Capture the golden layer fixture (layer 0 GDN + layer 3 GQA) for `vegajet_layer_test` / `tools/vj_dev.sh` into DIR. |
-| `--bench-ar` | Print an FP16 N-rank collective/topology plan; `--dry-run` is CPU-only and exits 0. Without dry-run GPU execution remains TP2 only until M3 (default TP2 when omitted); other TP degrees fail closed with exit 3. The diagnostic plan CLI admits 1..256 ranks. |
-| `--tp-profile FILE` | With `--bench-ar`, read schema-1 hardware profile `gpus[].p2p` in owner rank order. Missing edges use host bounce; absent profile means unknown P2P. Plan-only until M3. |
-| `--tp-plan FILE` | With `--bench-ar`, load strict schema-1 owner topology overrides (`stages`, `max_tp`, `min_p2p_gbs`, `allow_host_tp`, `host_bounce`); invalid coverage/capability fails. Plan-only until M3. |
+| `--bench-ar` | FP16 N-rank collective/topology benchmark, 1..256 ranks (default TP2 when omitted). `--dry-run` plans without device access. GPU builds verify changing inputs across all selected ranks; CPU-only builds fail execution explicitly. |
+| `--tp-profile FILE` | With `--bench-ar`, read a schema-1 hardware profile for advisory CPU planning. Execution re-reads selected-device topology; a saved profile never authorizes peer access. |
+| `--tp-plan FILE` | Load strict schema-1 collective/topology overrides (`stages`, `max_tp`, `min_p2p_gbs`, `allow_host_tp`, `host_bounce`) for N-rank AR or generic raw decode; invalid coverage/capability fails. TP=2 legacy decode rejects these overrides. |
+| `--tp-shards FILE` | Generic raw Ornith decoder: strict schema-1 owner sharding JSON. Names are `expert_ff`, `shared_ff`, `vocab`, `attn`, `gdn`; 32-row MoE tiles and explicit local Q/KV maps. TP=2 legacy decode rejects this override. |
 | `--bench-gemv` | GEMV A/B micro-bench only (GPU builds). |
 
-Before the Ornith GPU runner reserves its per-GPU arenas (2 GPUs, about 30 GiB each), `bench` and `run` check the
+The TP=2 Ornith fast path uses two arenas; generic raw TP=N uses N selected devices. Before reserving its per-GPU arenas, `bench` and `run` check the
 selected GPUs (`--gpu` / `VJ_GPU_DEVICES`) against the runner's GPU count, its arena and the planned weights + KV +
 state per GPU, and stop with exit 1 and a message stating what is needed and what was found (alpha portability
 patch).
@@ -212,7 +213,7 @@ dispatch or verify failure.
 
 `vegajet serve <model-file> [--gpu SPEC] [--tp N] [--ctx T] [--slots N] [--hsaco-dir DIR] [common]` or
 `vegajet serve --mock [--gguf TOKENIZER-FILE] [--slots N] [common]`. On GPU builds, `serve <model-file>` serves the
-Ornith-122B (`qwen35moe` / `qwen3_5_moe` / `ornith`) backend live on 2× 32 GB gfx906 (single-slot greedy GPU argmax);
+Ornith-122B (`qwen35moe` / `qwen3_5_moe` / `ornith`) backend on selected gfx906 devices (single-slot greedy GPU argmax). TP=2 retains fusion; other rank counts use generic raw per-op execution, bounded by model capacity and context <=8192;
 `--slots > 1` continuous batching is active on `--mock`. Endpoints: `GET /health`, `GET /v1/models`,
 `POST /v1/chat/completions` (JSON or SSE, `tools` / `tool_choice`, `reasoning_content`), `POST /v1/messages`
 (Anthropic Messages API on the same queue and generator: JSON or SSE events, `tool_use` / `tool_result` / `thinking`
@@ -235,7 +236,9 @@ selection and `--tp`, then exits 3 naming the architecture (a CPU-only build say
 | `--model-id NAME` | Model name reported by `/v1/models` and in responses. |
 | `--slots N` | Concurrent sequences, 1..64 (continuous batching; needs an engine with a batch path, e.g. `--mock`). |
 | `--max-queue N` | Queued requests before 503, 1..4096 (default 16). |
-| `--tp N` | Tensor-parallel degree, 1..8; must equal the number of selected GPUs. |
+| `--tp N` | Tensor-parallel degree, 1..256; must equal the number of selected GPUs. |
+| `--tp-shards FILE` | Generic raw engine: the same strict schema-1 owner sharding JSON used by bench/run. |
+| `--tp-plan FILE` | Generic raw engine: the same strict schema-1 collective/topology JSON used by bench/run. |
 | `--ctx T` | Context length, 256..1048576. |
 | `--hsaco-dir DIR` | Code-object directory for the engine. |
 | `--chat-format F` | `auto` (from the GGUF template), `chatml`, `qwen25`, `qwen3` or `ornith`. |
@@ -300,6 +303,7 @@ Exit codes: 0 ok (end of input or `/quit`), 1 server unreachable (`GET /health` 
 | `VJ_GPU_DEVICES` | CLI, KFD runtime | GPU selection, same syntax as `--gpu` (`--gpu` wins). |
 | `VJ_SYSFS_ROOT` | `--gpu list`, GPU selection | Alternative root for the KFD topology scan (tests use a synthetic tree). |
 | `VJ_IO_URING` | table prefetch | `0` forces the thread-pool `preadv` backend instead of io_uring. |
+| `VEGAJET_V13_SUPER_NRANK` | generic Ornith | Reserved experiment switch; a nonzero value fails closed because N-rank super-kernels are not implemented. |
 | `VEGAJET_ENABLE_SUPER` | Ornith GPU bench | Ornith M=1 super-kernels. On by default since `950c137`; `0` turns them off. At `b74f820` and earlier they were opt-in with `1`. |
 | `VEGAJET_V12_GDN_SPLITV` | Ornith GPU bench, `vegajet_layer_test` | `1`: raw M=1 GDN decode runs the column-thread ConvRec kernel (`ornith_gdn_conv_recur_colthread_quant_m1_kernel`) instead of the Split-V one. Same math and FP32 state, same fp32 summation order (bit-identical output); 8 state-row chains of a column live in one wave, so the pred/`o` reductions are 8-lane `__shfl` broadcasts and 4 `__syncthreads` per token disappear. Off by default. |
 | `VEGAJET_HSACO_DIR` | KFD runtime | Code-object directory when `--hsaco-dir` is not given. |

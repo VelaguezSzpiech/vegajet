@@ -26,6 +26,11 @@ struct OrnithGpuOptions {
     float       dflash_p_min    = 0.55f;   // DFlash2 selector confidence cutoff (live sweep optimum; 0 = disabled)
     uint32_t    max_ctx         = 8192;
     uint32_t    prefill_chunk   = 1024;
+    // Tensor-parallel rank count (selected devices, owner order). TP=2 is the fused fast path;
+    // any other count goes through the generic N-rank executor and its admission.
+    uint32_t    tp              = 2;
+    std::string tp_shard_json, tp_collective_json;
+    std::vector<double> tp_bandwidths;
     bool        use_suffix_spec = false;
     bool        use_wy_prefill  = true;
     bool        run_bench       = false;

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 #include "core/rig_planner.hpp"
+#include <stdexcept>
 
 #include <algorithm>
 #include <cinttypes>
@@ -198,7 +199,8 @@ int64_t min_free(const std::vector<GpuBreakdown>& g) {
 
 RigPlan plan_rig(const ModelSummary& m, const RigSpec& rig_in) {
     RigSpec rig = rig_in;
-    rig.gpus = std::max<uint32_t>(1, std::min<uint32_t>(8, rig.gpus));
+    if (rig.gpus > 256) throw std::invalid_argument("rig planner supports at most 256 ranks");
+    rig.gpus = std::max<uint32_t>(1, rig.gpus);
     RigPlan p;
     quant::GpuRooflineInfo g;
     g.n_cu = rig.n_cu;
