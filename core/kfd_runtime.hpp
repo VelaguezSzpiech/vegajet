@@ -280,7 +280,7 @@ public:
     bool init(double vram_arena_gib, size_t host_pinned_mb, std::string* err = nullptr, size_t expected_devices = 0);
     void shutdown();
     // Irreversible fail-closed stop; keep allocations valid for caller cleanup.
-    void abort_dispatches();
+    bool abort_dispatches();
 
     // Loads a single unbundled gfx906 .hsaco onto all open GPUs (hard-asserts private_segment_fixed_size == 0!).
     bool load_code_object(const std::string& path, std::string* err);
@@ -357,7 +357,8 @@ private:
     bool alloc_vram(size_t gpu_idx, uint64_t size, uint32_t extra_flags, KfdBuffer& out, bool map_all_gpus = false);
     bool map_to_gpus(KfdBuffer& buf, const std::vector<uint32_t>& gpu_ids);
     bool create_aql_queue(size_t gpu_idx);
-    void destroy_aql_queue(size_t gpu_idx);
+    bool destroy_aql_queue(size_t gpu_idx);
+    bool stop_queues();
     bool setup_allreduce_mailbox();
     bool load_hsaco_staged(size_t gpu_idx, const std::string& path,
                            KfdBuffer& out_buf,

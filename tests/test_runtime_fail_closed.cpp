@@ -2,6 +2,7 @@
 // Exercise the live host runtime with fake ioctls: no GPU or device files required.
 #include "core/kfd_runtime.hpp"
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <linux/kfd_ioctl.h>
 #include "tests/test_common.hpp"
 #include "tests/live_hsaco_fixture.hpp"
@@ -19,7 +20,8 @@ bool io_ok = false, fake_devices = false;
 std::vector<uint32_t> allocation_owners, mapping_targets;
 uint32_t map_done = 0, unmap_done = 0;
 bool fail_unmap = false, fail_free = false;
-unsigned free_calls = 0;
+unsigned free_calls = 0, ioctl_calls = 0;
+int forced_errno = 0, destroy_error = 0;
 std::vector<uint32_t> unmapped;
 }
 extern "C" int __real_open(const char*, int, ...);
@@ -35,6 +37,9 @@ extern "C" int __wrap_ioctl(int, unsigned long op, ...) {
     va_start(ap, op);
     void* arg = va_arg(ap, void*);
     va_end(ap);
+    ++ioctl_calls;
+    if (forced_errno) { errno = forced_errno; return -1; }
+    if (op == AMDKFD_IOC_DESTROY_QUEUE && destroy_error) { errno = destroy_error; return -1; }
     if (!io_ok) { errno = EIO; return -1; }
     if (op == AMDKFD_IOC_ALLOC_MEMORY_OF_GPU) {
         static uint64_t handle = 1000;
@@ -199,6 +204,52 @@ struct RuntimeTestAccess {
         VJ_CHECK(rt.transport_==AllReduceTransport::HostPinnedUserptr && rt.mailbox_flag_buf_.host_ptr);
         rt.shutdown(); io_ok=false; free_calls=0;
     }
+    static void teardown_failures() {
+        io_ok=true;
+        for (int error : {EIO,EPERM,EBUSY}) {
+            Runtime rt;
+            rt.open_=true; rt.queues_.resize(1);
+            rt.kfd_fd_=::open("/dev/zero",O_RDWR);
+            auto& q=rt.queues_[0];
+            q.queue_active=true; q.queue_id=0; // zero is a valid live queue ID
+            q.doorbell_map=mmap(nullptr,4096,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+            VJ_CHECK(q.doorbell_map!=MAP_FAILED);
+            q.doorbell_map_size=4096; q.doorbell=static_cast<volatile uint64_t*>(q.doorbell_map);
+            q.ring_buf.handle=123; q.ring_buf.size=64; q.ring_buf.is_userptr=true;
+            q.ring_buf.host_ptr=std::malloc(64);
+            KfdBuffer code{}; code.handle=124; code.host_ptr=std::malloc(64); code.size=64; code.is_userptr=true;
+            rt.code_buffers_.push_back(code);
+            const auto frees=free_calls;
+            const void* db=q.doorbell_map;
+            const void* ring=q.ring_buf.host_ptr;
+            destroy_error=error;
+            VJ_CHECK(!rt.abort_dispatches());
+            rt.shutdown();
+            VJ_CHECK(rt.failed_ && !rt.open_ && rt.queues_.size()==1 && rt.queues_[0].queue_active);
+            VJ_CHECK(q.doorbell_map==db && q.ring_buf.host_ptr==ring && free_calls==frees);
+            VJ_CHECK(rt.code_buffers_.size()==1 && rt.kfd_fd_>=0);
+            std::string err;
+            VJ_CHECK(!rt.init(1,1,&err) && err.find("cleanup")!=std::string::npos);
+            destroy_error=0;
+            rt.shutdown();
+            VJ_CHECK(rt.queues_.empty() && rt.code_buffers_.empty() && rt.kfd_fd_==-1);
+            VJ_CHECK(rt.retained_buffers_.empty());
+        }
+        for (int error : {EINTR,EAGAIN}) {
+            Runtime rt;
+            rt.kfd_fd_=::open("/dev/zero",O_RDWR);
+            KfdBuffer b{}; b.handle=77;
+            forced_errno=error; ioctl_calls=0;
+            const auto start=std::chrono::steady_clock::now();
+            VJ_CHECK(!rt.free_buffer(b));
+            VJ_CHECK(ioctl_calls==64 && b.handle==77 && rt.retained_buffers_.count(77)==1 && errno==ETIMEDOUT);
+            VJ_CHECK(std::chrono::steady_clock::now()-start < std::chrono::seconds(2));
+            forced_errno=0;
+            VJ_CHECK(rt.free_buffer(b) && rt.retained_buffers_.empty());
+            rt.shutdown();
+        }
+        io_ok=false; free_calls=0;
+    }
     static void exact_tp_selection() {
         namespace fs = std::filesystem;
         const auto root = fs::path(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : ".") /
@@ -284,5 +335,6 @@ int main() {
     vegajet::kfd::RuntimeTestAccess::kernarg_ownership();
     vegajet::kfd::RuntimeTestAccess::exact_tp_selection();
     vegajet::kfd::RuntimeTestAccess::mailbox_reset();
+    vegajet::kfd::RuntimeTestAccess::teardown_failures();
     std::puts("runtime fail-closed tests PASS");
 }

@@ -223,7 +223,7 @@ bool Runtime::open(std::string* err) {
 }
 bool Runtime::init(double, size_t, std::string* err, size_t) { return open(err); }
 void Runtime::shutdown() { open_ = false; }
-void Runtime::abort_dispatches() {}
+bool Runtime::abort_dispatches() { open_ = false; failed_ = true; return true; }
 bool Runtime::load_code_object(const std::string&, std::string* err) {
     if (err) *err = "code objects cannot be loaded in a CPU-only build";
     return false;
@@ -267,11 +267,18 @@ bool Runtime::download_from_vram(size_t, void*, uint64_t, size_t) { return false
 
 namespace {
 int kfd_ioctl(int fd, unsigned long req, void* arg) {
-    int r;
-    do {
+    int r = ioctl(fd, req, arg);
+    if (r != -1 || (errno != EINTR && errno != EAGAIN)) return r;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+    for (unsigned attempt = 1; attempt < 64; ++attempt) {
+        if (std::chrono::steady_clock::now() >= deadline) break;
+        if (errno == EAGAIN) std::this_thread::sleep_for(std::chrono::microseconds(50));
         r = ioctl(fd, req, arg);
-    } while (r == -1 && (errno == EINTR || errno == EAGAIN));
-    return r;
+        if (r != -1 || (errno != EINTR && errno != EAGAIN)) return r;
+    }
+    std::fprintf(stderr, "[vegajet::kfd] ioctl 0x%lx retry budget exhausted (EINTR/EAGAIN)\n", req);
+    errno = ETIMEDOUT;
+    return -1;
 }
 } // namespace
 
@@ -289,6 +296,10 @@ bool Runtime::open(std::string* err) {
 }
 
 bool Runtime::init(double vram_arena_gib, size_t host_pinned_mb, std::string* err, size_t expected_devices) {
+    if (failed_ || !retained_buffers_.empty() || (!open_ && !queues_.empty())) {
+        if (err) *err = "Runtime is failed or cleanup is incomplete; create a new Runtime after successful shutdown";
+        return false;
+    }
     if (const char* dl = std::getenv("VEGAJET_DISPATCH_LOG"); dl && dl[0] && dlog_fd_ < 0)
         dlog_fd_ = ::open(dl, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
     if (open_) {
@@ -870,34 +881,54 @@ bool Runtime::create_aql_queue(size_t gpu_idx) {
     return true;
 }
 
-void Runtime::destroy_aql_queue(size_t gpu_idx) {
+bool Runtime::destroy_aql_queue(size_t gpu_idx) {
     auto& q = queues_[gpu_idx];
+    // Queue ownership is released by KFD, not by unmapping its host doorbell.
+    if (q.queue_active) {
+        kfd_ioctl_destroy_queue_args dargs{};
+        dargs.queue_id = q.queue_id;
+        if (kfd_fd_ < 0 || kfd_ioctl(kfd_fd_, AMDKFD_IOC_DESTROY_QUEUE, &dargs) != 0) {
+            std::fprintf(stderr, "[vegajet::kfd] DESTROY_QUEUE GPU %zu id=%u failed; retaining queue, doorbell and all backing BOs: %s\n",
+                         gpu_idx, q.queue_id, std::strerror(errno));
+            failed_ = true;
+            open_ = false;
+            return false;
+        }
+        q.queue_id = 0;
+        q.queue_active = false;
+    }
     if (q.doorbell_map) {
         munmap(q.doorbell_map, q.doorbell_map_size);
         q.doorbell_map = nullptr;
-        q.doorbell     = nullptr;
+        q.doorbell = nullptr;
     }
-    if (q.queue_active && kfd_fd_ >= 0) {
-        kfd_ioctl_destroy_queue_args dargs{};
-        dargs.queue_id = q.queue_id;
-        (void) kfd_ioctl(kfd_fd_, AMDKFD_IOC_DESTROY_QUEUE, &dargs);
-        q.queue_id     = 0;
-        q.queue_active = false;
-    }
-    free_buffer(q.kernarg_buf);
-    free_buffer(q.rw_ptr_buf);
-    free_buffer(q.cwsr_buf);
-    free_buffer(q.eop_buf);
-    free_buffer(q.ring_buf);
+    bool ok = true;
+    for (auto* b : {&q.kernarg_buf, &q.rw_ptr_buf, &q.cwsr_buf, &q.eop_buf, &q.ring_buf})
+        if (!free_buffer(*b)) ok = false;
+    if (ok) q = KfdAqlQueue{};
+    return ok;
 }
 
-void Runtime::abort_dispatches() {
-    for (size_t i = 0; i < queues_.size(); ++i) destroy_aql_queue(i);
-    queues_.clear();
+bool Runtime::stop_queues() {
+    bool ok = true;
+    for (size_t i = 0; i < queues_.size(); ++i) if (!destroy_aql_queue(i)) ok = false;
+    if (ok) queues_.clear();
+    return ok;
+}
+
+bool Runtime::abort_dispatches() {
+    failed_ = true;
+    open_ = false;
+    return stop_queues();
 }
 
 void Runtime::shutdown() {
-    abort_dispatches();
+    open_ = false;
+    if (!stop_queues()) {
+        failed_ = true;
+        std::fprintf(stderr, "[vegajet::kfd] shutdown incomplete: queue teardown failed; retaining runtime allocations and fds\n");
+        return;
+    }
     for (auto& m : loaded_modules_) {
         for (auto& cb : m.code_buffers) free_buffer(cb);
     }
@@ -928,6 +959,7 @@ void Runtime::shutdown() {
     if (!retained_buffers_.empty()) {
         std::fprintf(stderr, "[vegajet::kfd] shutdown incomplete: %zu BOs retained; KFD fd kept open\n",
                      retained_buffers_.size());
+        failed_ = true;
         open_ = false;
         return;
     }
@@ -1354,6 +1386,7 @@ bool Runtime::enqueue_kernel(size_t gpu_idx, const LoadedKernel& kernel,
     // Reserve AQL space before touching either live kernargs or the allocation cursor.
     if (!aql_wait_space(q, 2u, 5000000ULL)) {
         std::fprintf(stderr, "[vegajet::kfd] AQL space timeout GPU %zu; runtime stopped\n", gpu_idx);
+        failed_ = true;
         open_ = false;
         return false;
     }
@@ -1420,6 +1453,7 @@ bool Runtime::submit_batch(size_t gpu_idx) {
     if (dlog_fd_ >= 0) dprintf(dlog_fd_, "S rank=%zu upto_seq=%llu\n", gpu_idx, static_cast<unsigned long long>(dlog_seq_));
     if (!aql_wait_space(q, 1u, 5000000ULL)) {
         std::fprintf(stderr, "[vegajet::kfd] AQL fence space timeout GPU %zu; runtime stopped\n", gpu_idx);
+        failed_ = true;
         open_ = false;
         return false;
     }
@@ -1473,6 +1507,7 @@ bool Runtime::wait_idle(size_t gpu_idx, uint64_t timeout_us) {
         if (value < 0) {
             std::fprintf(stderr, "[vegajet::kfd] completion underflow GPU %zu (sig=%lld); runtime stopped\n",
                          gpu_idx, static_cast<long long>(value));
+            failed_ = true;
             open_ = false;
             return false;
         }
@@ -1484,6 +1519,7 @@ bool Runtime::wait_idle(size_t gpu_idx, uint64_t timeout_us) {
                              gpu_idx, static_cast<long long>(q.completion_sig->value),
                              static_cast<unsigned long long>(*q.read_ptr),
                              static_cast<unsigned long long>(*q.write_ptr));
+                failed_ = true;
                 open_ = false;
                 return false;
             }
