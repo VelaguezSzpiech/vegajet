@@ -3792,6 +3792,15 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                 1, 1, 256, 1, 1, &ka, sizeof(ka), true));
         };
         for (size_t g = 0; g < 2; ++g) {
+            // Ascending, non-overlapping row copies preserve every later source.
+            for (uint32_t ai = 0; ai < 12u; ++ai) {
+                for (const auto& copy : plan.kv_copies) {
+                    copy_words(g, S[g].attn_k_cache_va[ai] + copy.dst_byte,
+                        S[g].attn_k_cache_va[ai] + copy.src_byte, copy.bytes / 4u);
+                    copy_words(g, S[g].attn_v_cache_va[ai] + copy.dst_byte,
+                        S[g].attn_v_cache_va[ai] + copy.src_byte, copy.bytes / 4u);
+                }
+            }
             for (uint32_t gi = 0; gi < 36u; ++gi) {
                 for (uint32_t j = 0; j < count; ++j) {
                     const uint64_t src = static_cast<uint64_t>(gi) * 16u + path[j];
