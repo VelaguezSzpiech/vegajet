@@ -1,11 +1,37 @@
 """CPU source contracts for GPU-only orchestration (not GPU runtime proof)."""
 from pathlib import Path
 import unittest
+import os
+import subprocess
+import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class FixContracts(unittest.TestCase):
+    def test_runner_clears_inherited_flags_and_returns_failure(self):
+        # A deliberate mock CLI validates the runner, never serves as inference evidence.
+        with tempfile.TemporaryDirectory(prefix='v12-runner-', dir=ROOT) as td:
+            td = Path(td)
+            mock = td / 'mock'
+            mock.write_text('#!/usr/bin/env python3\nimport os, sys\n'
+                            'assert "VEGAJET_V12_FUTURE_FLAG" not in os.environ\n'
+                            'assert "VEGAJET_V12_IQ2S_REG" not in os.environ\n'
+                            'if "--json-out" in sys.argv: sys.exit(int(os.environ.get("MOCK_EXIT", "0")))\n')
+            mock.chmod(0o755)
+            env = dict(os.environ, MODEL='test-only', BIN=str(mock), RUNS='1', ONLY='VOCAB_ILP',
+                       VEGAJET_V12_FUTURE_FLAG='1', VEGAJET_V12_IQ2S_REG='1')
+            for status in (0, 17):
+                out = td / str(status)
+                env.update(OUT=str(out), MOCK_EXIT=str(status))
+                result = subprocess.run(['bash', str(ROOT / 'bench/v12/run.sh')], cwd=ROOT,
+                                        env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0 if status == 0 else 1, result.stdout + result.stderr)
+                self.assertEqual((out / 'baseline_raw.env').read_text(), '')
+                self.assertEqual((out / 'VOCAB_ILP.env').read_text(), 'VEGAJET_V12_VOCAB_ILP=1\n')
+                if status:
+                    self.assertIn('FAILED (exit 17)', result.stdout)
+
     def test_batched_eh_rows_map_to_x(self):
         src = (ROOT / 'models/ornith/ornith_gpu.cpp').read_text()
         self.assertIn('*K[g].mtp_eh_cat, dispatch::eh_grid_x(M), 1, 1, 256, 1, 1', src)
