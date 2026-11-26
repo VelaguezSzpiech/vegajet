@@ -6,6 +6,11 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class FixContracts(unittest.TestCase):
+    def test_batched_eh_rows_map_to_x(self):
+        src = (ROOT / 'models/ornith/ornith_gpu.cpp').read_text()
+        self.assertIn('*K[g].mtp_eh_cat, dispatch::eh_grid_x(M), 1, 1, 256, 1, 1', src)
+        self.assertNotIn('*K[g].mtp_eh_cat, 256u, M, 1', src)
+
     def test_batched_staging_consumed_before_reuse(self):
         src = (ROOT / 'models/ornith/ornith_gpu.cpp').read_text()
         batch = src[src.index('    auto step_mtp_batch ='):src.index('    auto run_greedy_mtp =')]

@@ -25,6 +25,12 @@ int main() {
         }
         VJ_CHECK(next == start + 8u);
     }
+    for (uint32_t rows : {1u, 2u, 8u, 16u}) {
+        unsigned visits[16] = {};
+        const auto grid_x = vegajet::dispatch::eh_grid_x(rows);
+        for (uint32_t block_x = 0; block_x < grid_x / 256u; ++block_x) ++visits[block_x];
+        for (uint32_t row = 0; row < rows; ++row) VJ_CHECK(visits[row] == 1u);
+    }
     const auto off = vegajet::select_super_variant(false, false);
     VJ_CHECK(off.valid && off.object == nullptr && std::string(off.suffix).empty());
     const auto vol = vegajet::select_super_variant(true, false);

@@ -10,6 +10,7 @@ inline CollectiveEpoch next_collective(uint32_t& next) {
     const uint32_t epoch = next++;
     return {epoch, epoch & 1u};
 }
+inline uint32_t eh_grid_x(uint32_t rows) { return rows * 256u; }
 inline bool kv_span_fits(uint32_t pos, uint32_t rows, uint32_t max_ctx) {
     return rows != 0u && pos < max_ctx && rows <= max_ctx - pos;
 }
