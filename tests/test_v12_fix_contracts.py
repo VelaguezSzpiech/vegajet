@@ -6,6 +6,13 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class FixContracts(unittest.TestCase):
+    def test_batched_staging_consumed_before_reuse(self):
+        src = (ROOT / 'models/ornith/ornith_gpu.cpp').read_text()
+        batch = src[src.index('    auto step_mtp_batch ='):src.index('    auto run_greedy_mtp =')]
+        self.assertNotIn('do_submit', batch)
+        self.assertIn('step_mtp(toks[j], pos0 + j, hs0[j], hs1[j], false, true, 0u)', batch)
+        self.assertIn('VJ_CHECK(rt.wait_idle(0)    && rt.wait_idle(1));\n        return true;', batch)
+
     def test_unused_super_objects_are_isolated(self):
         src = (ROOT / 'core/kfd_runtime.cpp').read_text()
         optional = src[src.index('const char* optional[]'):src.index('for (const char* f : optional)')]

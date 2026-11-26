@@ -3923,28 +3923,16 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
     // Positions must be consecutive (pos0 + j). Falls back to the per-token path when the M-row GEMVs are absent.
     const bool v12_batch_ok = (K[0].gemm_q4_m8 != nullptr) && (K[1].gemm_q4_m8 != nullptr);
     auto step_mtp_batch = [&](const std::vector<int32_t>& toks, uint32_t pos0,
-                              const std::vector<uint64_t>& hs0, const std::vector<uint64_t>& hs1,
-                              bool do_submit) -> bool {
+                              const std::vector<uint64_t>& hs0, const std::vector<uint64_t>& hs1) -> bool {
         run_state.check();
         for (int32_t id : toks) require_token(id, "MTP batch embedding");
         const uint32_t n = static_cast<uint32_t>(toks.size());
         if (n == 0u) return true;
         require_kv_span(pos0, n);
-        if (n == 1u || !v12_batch_ok) {
+        if (hs0.size() != n || hs1.size() != n) fail_run("MTP hidden-row count mismatch");
+        if (n == 1u || n > kMaxSpecBatch || !v12_batch_ok) {
             for (uint32_t j = 0; j < n; ++j)
-                (void) step_mtp(toks[j], pos0 + j, hs0[j], hs1[j], false, false, j);
-            if (!do_submit) return false;
-            VJ_CHECK(rt.submit_batch(0) && rt.submit_batch(1));
-            VJ_CHECK(rt.wait_idle(0)    && rt.wait_idle(1));
-            return true;
-        }
-        if (n > kMaxSpecBatch) {
-            // Defensive: never drop rows, fall back to per-token ingestion.
-            for (uint32_t j = 0; j < n; ++j)
-                (void) step_mtp(toks[j], pos0 + j, hs0[j], hs1[j], false, false, j % kMaxSpecBatch);
-            if (!do_submit) return false;
-            VJ_CHECK(rt.submit_batch(0) && rt.submit_batch(1));
-            VJ_CHECK(rt.wait_idle(0)    && rt.wait_idle(1));
+                (void) step_mtp(toks[j], pos0 + j, hs0[j], hs1[j], false, true, 0u);
             return true;
         }
 
@@ -4093,7 +4081,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             VJ_CHECK(rt.enqueue_kernel(g, *K[g].p2p_ar_rms, M * 256u, 1, 1, 256, 1, 1, &aka, sizeof(aka), true));
         }
 
-        if (!do_submit) return false;
+        // All token/hidden staging is shared: complete consumption before any caller can reuse it.
         VJ_CHECK(rt.submit_batch(0) && rt.submit_batch(1));
         VJ_CHECK(rt.wait_idle(0)    && rt.wait_idle(1));
         return true;
@@ -4151,7 +4139,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                             bh1.push_back((j == 0) ? ((pos == 0) ? S[1].mtp_h_zero_va : S[1].mtp_h_pend_va)
                                                    : (S[1].h_va + (j - 1u) * h_stride));
                         }
-                        (void) step_mtp_batch(bt, pos + static_cast<uint32_t>(b0), bh0, bh1, false);
+                        (void) step_mtp_batch(bt, pos + static_cast<uint32_t>(b0), bh0, bh1);
                     }
                 } else {
                     for (size_t j = j0; j < j_end; ++j) {
@@ -4205,7 +4193,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                 std::vector<uint64_t> b0, b1;
                 bt.reserve(j - i); b0.reserve(j - i); b1.reserve(j - i);
                 for (size_t k = i; k < j; ++k) { bt.push_back(tok_pos[k].first); b0.push_back(hs0[k]); b1.push_back(hs1[k]); }
-                (void) step_mtp_batch(bt, tok_pos[i].second, b0, b1, false);
+                (void) step_mtp_batch(bt, tok_pos[i].second, b0, b1);
                 i = j;
             }
         };
