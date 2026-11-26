@@ -4234,7 +4234,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         auto now_ms = []() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
         // v1.2 C7+S1: depth from the measured per-M verify time and the live accepted length.
         spec_policy::MeasuredDepthGovernor mtp_gov;
-        uint32_t gov_depth_sum = 0u, gov_depth_n = 0u;
+        uint32_t gov_depth_sum = 0u, gov_depth_n = 0u, gov_plain_n = 0u;
         auto mtp_ingest = [&](const std::vector<std::pair<int32_t, uint32_t>>& tok_pos,
                               const std::vector<uint64_t>& hs0, const std::vector<uint64_t>& hs1) {
             // Split into maximal runs of consecutive positions: one M-row forward per run (<= kMaxSpecBatch rows).
@@ -4255,8 +4255,16 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             const uint32_t rem = static_cast<uint32_t>(n_gen - static_cast<int>(gen.size()));
             uint32_t k_cur = std::min<uint32_t>({K_draft, kGdnRingSlots - 2u, (rem > 1u) ? (rem - 1u) : 0u});
             if (v12_spec_gov) {
-                const uint32_t gd = mtp_gov.next_depth(k_cur);
-                if (gd > 0u) { k_cur = std::min(k_cur, gd); gov_depth_sum += k_cur; ++gov_depth_n; }
+                // M2: the complete-cycle cost picks the depth before drafting. choose_depth() may answer 0 (plain
+                // decoding); this loop has no standalone plain cycle with MTP catch-up, so a plain choice floors at
+                // one draft (= verify a single token, the cheapest speculative cycle) and is counted in gov_plain_n.
+                const auto gc = mtp_gov.choose_depth(k_cur);
+                if (gc.warmed) {
+                    k_cur = std::min(k_cur, std::max<uint32_t>(gc.depth, 1u));
+                    gov_depth_sum += k_cur;
+                    ++gov_depth_n;
+                    if (gc.depth == 0u) ++gov_plain_n;
+                }
             }
             // Suffix chains are free to draft and almost always accepted, so they may fill a whole verify batch.
             const uint32_t k_sfx = std::min<uint32_t>({opt.suffix_max_draft, kGdnRingSlots - 2u, (rem > 1u) ? (rem - 1u) : 0u});
@@ -4296,6 +4304,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                 }
             }
             const double tA = now_ms();
+            double t_neural = -1.0;  // start of the neural proposal loop (after any deferred catch-up replay)
             if (!used_suffix) {
                 if (use_hybrid_suffix && opt.zero_tax_catchup && kv_sync.pending() > 0u) {
                     const auto pre = kv_sync.before_neural();
@@ -4310,6 +4319,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                     }
                 }
                 ++n_neural;
+                t_neural = now_ms();
                 int32_t d_in = gen.back();
                 for (uint32_t j = 0; j < k_cur; ++j) {
                     uint64_t h0 = (j == 0) ? S[0].mtp_h_pend_va : S[0].mtp_h_cur_va;
@@ -4323,6 +4333,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             const double tB = now_ms();
             t_draft += tB - tA;
             const uint32_t dk = static_cast<uint32_t>(drafts.size());
+            if (v12_spec_gov && t_neural >= 0.0 && dk > 0u) mtp_gov.observe_draft(dk, tB - t_neural);
             std::vector<int32_t> vtoks;
             vtoks.reserve(1u + dk);
             vtoks.push_back(gen.back());
@@ -4411,7 +4422,11 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                     VJ_CHECK(rt.wait_idle(0)    && rt.wait_idle(1));
                 }
             }
-            t_catch += now_ms() - tC;
+            {
+                const double tD = now_ms();
+                t_catch += tD - tC;
+                if (v12_spec_gov) mtp_gov.observe_catchup(n_commit, tD - tC);
+            }
             pos += n_commit;
         }
         if (n_cyc > 0u) {
@@ -4428,9 +4443,10 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                             static_cast<unsigned long long>(zs.suffix_tokens));
             }
             if (v12_spec_gov && gov_depth_n > 0u)
-                std::printf(" | v12_gov depth %.2f alpha %.3f t_ver(M=4) %.2f ms",
-                            static_cast<double>(gov_depth_sum) / static_cast<double>(gov_depth_n),
-                            mtp_gov.alpha(), mtp_gov.measured_ms(4u));
+                std::printf(" | v12_gov depth %.2f plain %u alpha %.3f t_ver(M=4) %.2f ms draft %.2f us/tok catchup %.2f us/tok",
+                            static_cast<double>(gov_depth_sum) / static_cast<double>(gov_depth_n), gov_plain_n,
+                            mtp_gov.alpha(), mtp_gov.measured_ms(4u),
+                            1000.0 * mtp_gov.draft_ms_per_tok(), 1000.0 * mtp_gov.catchup_ms_per_tok());
             std::printf("\n");
         }
         double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - td0).count();
@@ -5588,7 +5604,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                 const bool v12_spec_gov = (std::getenv("VEGAJET_V12_SPEC_GOV") != nullptr &&
                                            std::getenv("VEGAJET_V12_SPEC_GOV")[0] == '1');
                 spec_policy::MeasuredDepthGovernor df_gov;
-                uint32_t df_gov_depth_sum = 0u, df_gov_depth_n = 0u;
+                uint32_t df_gov_depth_sum = 0u, df_gov_depth_n = 0u, df_gov_plain_n = 0u;
 
                 uint32_t pos = 0u;
                 int32_t last_pred = -1;
@@ -5614,8 +5630,15 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                     const uint32_t rem = static_cast<uint32_t>(n_gen - static_cast<int>(gen.size()));
                     uint32_t k_target = use_evict ? evict_ctl.next_depth() : k_draft;
                     if (v12_spec_gov) {
-                        const uint32_t gd = df_gov.next_depth(std::min<uint32_t>(k_draft, df.block_size - 1u));
-                        if (gd > 0u) { k_target = std::min(k_target, gd); df_gov_depth_sum += gd; ++df_gov_depth_n; }
+                        // M2: choose on the complete-cycle cost. depth 0 = plain decoding and is honoured here: the
+                        // k_cur == 0 branch below steps one token and injects it into the drafter KV.
+                        const auto gc = df_gov.choose_depth(std::min<uint32_t>(k_draft, df.block_size - 1u));
+                        if (gc.warmed) {
+                            k_target = std::min(k_target, gc.depth);
+                            df_gov_depth_sum += gc.depth;
+                            ++df_gov_depth_n;
+                            if (gc.depth == 0u) ++df_gov_plain_n;
+                        }
                     }
                     const uint32_t k_cur = std::min<uint32_t>({k_target, df.block_size - 1u, kGdnRingSlots - 2u, (rem > 1u) ? (rem - 1u) : 0u});
                     const uint32_t k_sfx = std::min<uint32_t>({opt.suffix_max_draft, kGdnRingSlots - 2u, (rem > 1u) ? (rem - 1u) : 0u});
@@ -5665,6 +5688,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                     if (v12_spec_gov) {
                         df_gov.observe_verify(std::min<uint32_t>(dk + 1u, 17u), t2 - t1);
                         df_gov.observe_accept(dk, acc);
+                        if (!used_suffix && dk > 0u) df_gov.observe_draft(dk, t1 - t0);
                     }
                     if (std::getenv("VEGAJET_DFLASH2_DEBUG") && pos < 64u) {
                         std::printf("  [DFVER pos=%u acc=%u/%u] tgt=[%d,%d,%d,%d,%d] dft=[%d,%d,%d,%d,%d]\n",
@@ -5691,6 +5715,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                     conv_head = (conv_head + n_commit) % kGdnRingSlots;
                     dflash_inject_kv(pos, n_commit);
                     const double t3 = now_ms();
+                    if (v12_spec_gov && !used_suffix) df_gov.observe_catchup(n_commit, t3 - t2);
                     t_dr += (t1 - t0); t_ver += (t2 - t1); t_inj += (t3 - t2); ++n_cyc;
                     pos += n_commit;
                 }
@@ -5709,10 +5734,13 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                                 t_ver / n_cyc, t_inj / n_cyc,
                                 static_cast<double>(n_gen - 1) / n_cyc);
                     if (v12_spec_gov && df_gov_depth_n > 0u)
-                        std::printf("[V12 SPEC_GOV gpu=%zu] depth %.2f | alpha %.3f | t_ver(M=4) %.2f ms | inflation(M=8) %.2f\n",
+                        std::printf("[V12 SPEC_GOV gpu=%zu] depth %.2f | plain %u | alpha %.3f | t_ver(M=4) %.2f ms | "
+                                    "draft %.2f us/tok | catchup %.2f us/tok | inflation(M=8) %.2f\n",
                                     df_gpu,
                                     static_cast<double>(df_gov_depth_sum) / static_cast<double>(df_gov_depth_n),
-                                    df_gov.alpha(), df_gov.measured_ms(4u), df_gov.time_inflation(8u));
+                                    df_gov_plain_n, df_gov.alpha(), df_gov.measured_ms(4u),
+                                    1000.0 * df_gov.draft_ms_per_tok(), 1000.0 * df_gov.catchup_ms_per_tok(),
+                                    df_gov.time_inflation(8u));
                 }
                 return gen;
             };

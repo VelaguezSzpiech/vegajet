@@ -130,12 +130,17 @@ EvictDecision plan_evict(const std::vector<double>& cond, const VerifyCostModel&
 // only used once the caller has fed it at least one sample.
 // ---------------------------------------------------------------------------------------------------------
 struct MeasuredDepthConfig {
-    uint32_t k_min = 1;          // shortest proposal the governor may return (0 would mean plain decode)
+    uint32_t k_min = 1;          // shortest proposal next_depth() may return (choose_depth() may answer 0)
     uint32_t min_samples = 2;    // verify samples of one M before that point is trusted on its own
     double   ema = 0.3;          // smoothing of the measured per-M time
     double   alpha_lo = 0.02;    // clamp for the live acceptance
     double   alpha_hi = 0.99;
     uint32_t alpha_window = 32;  // cycles of (proposed, accepted) behind the live acceptance
+    // Complete-cycle cost terms (v1.2 M2): the depth is chosen *before* drafting, so the proposal and the
+    // drafter catch-up are part of the cost. These are the modelled fallbacks; observe_draft/observe_catchup
+    // replace them with measured per-token costs. 0 = not measured yet (keeps the verify-only law).
+    double   draft_ms_per_tok = 0.0;    // neural drafter cost per proposed token
+    double   catchup_ms_per_tok = 0.0;  // drafter KV catch-up cost per committed token
 };
 
 class MeasuredDepthGovernor {
@@ -144,9 +149,27 @@ public:
 
     void observe_verify(uint32_t m, double ms);          // one verify pass over m tokens (m >= 1)
     void observe_accept(uint32_t proposed, uint32_t accepted);
+    void observe_draft(uint32_t drafted, double ms);     // one neural proposal pass over `drafted` tokens
+    void observe_catchup(uint32_t committed, double ms); // drafter KV catch-up for `committed` committed tokens
 
-    // Proposal depth for a batch capped at `cap`; 0 = not warmed up, the caller keeps its own depth.
+    // Proposal depth for a batch capped at `cap`, floored at k_min; 0 = not warmed up, the caller keeps its own
+    // depth. Legacy wrapper around choose_depth(); a warmed plain-decode decision is only visible there.
     uint32_t next_depth(uint32_t cap) const;
+
+    // Complete-cycle model (v1.2 M2): cost(m) = verify(m + 1) + m * draft + expected_tokens(m) * catch-up, and
+    // the depth maximises expected_tokens(m) / cost(m) over [0, cap]. m = 0 (plain decoding) is a legal answer.
+    struct DepthChoice {
+        bool     warmed = false;  // false = no measurement yet, the caller keeps its own depth
+        uint32_t depth = 0;       // warmed && depth == 0 = plain decoding is the cheapest measured cycle
+        double   tokens_per_ms = 0.0;
+    };
+    DepthChoice choose_depth(uint32_t cap) const;
+    bool warmed() const;                             // at least one trusted verify measurement
+    double draft_ms_per_tok() const;                 // measured EWMA, else cfg_.draft_ms_per_tok
+    double catchup_ms_per_tok() const;               // measured EWMA, else cfg_.catchup_ms_per_tok
+    double expected_tokens(uint32_t drafted) const;  // 1 + alpha + ... + alpha^drafted
+    double cycle_ms(uint32_t drafted) const;         // full cost of one cycle that drafts `drafted` tokens
+    double cycle_rate(uint32_t drafted) const;       // expected_tokens / cycle_ms, 0 when the cost is 0
     double alpha() const;
     double measured_ms(uint32_t m) const;   // smoothed measured verify time, 0 when unseen
     double est_ms(uint32_t m) const;        // measured / interpolated verify time, 0 when no sample at all
@@ -158,6 +181,10 @@ private:
     std::vector<double>   ms_;      // EWMA of the measured verify time per M
     std::vector<uint32_t> n_;       // samples per M
     std::deque<std::pair<uint32_t, uint32_t>> win_;  // (proposed, accepted) tail
+    double   draft_ms_ = 0.0;       // EWMA of the measured neural proposal time per drafted token
+    uint32_t draft_n_ = 0;          // proposal samples
+    double   catch_ms_ = 0.0;       // EWMA of the measured catch-up time per committed token
+    uint32_t catch_n_ = 0;          // catch-up samples
 };
 
 // ---------------------------------------------------------------------------------------------------------
