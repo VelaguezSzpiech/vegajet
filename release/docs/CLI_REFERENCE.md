@@ -319,6 +319,7 @@ Exit codes: 0 ok (end of input or `/quit`), 1 server unreachable (`GET /health` 
 | `VEGAJET_RAW_TG512` | Ornith GPU bench | `1`: also measure raw M=1 over 512 tokens after tg128. |
 | `VEGAJET_RAW_ONLY` | Ornith GPU bench | `1`: raw M=1 only; skips the MTP head and uses the smaller raw-only VRAM budget for DOT8 promotion. |
 | `VEGAJET_V12_SERVE_SPEC` | `vegajet serve` (Ornith GPU engine) | `1`: serve through the suffix-tree speculative driver (`tg128 Suffix` verify path, greedy-lossless) and keep `VEGAJET_RAW_ONLY` off; unset or `0`: plain greedy M=1 serving. Default off. |
+| `VEGAJET_V12_ASYNC_OUT` | server worker (all engines) | SSE/JSON token bytes go through a bounded queue drained by a writer thread, so socket writes stay off the generation thread. On by default in v1.2; `0` restores the inline writer. |
 | `VEGAJET_GU_DOT8_LAYERS` | Ornith GPU bench | Number of Gate+Up layers to promote to DOT8 (overrides the automatic choice; `0` = automatic). |
 | `VEGAJET_GU_Q3` | Ornith GPU bench | `1` (any value > 0): routed Gate+Up as lossless 3-bit VJ_Q3_IQ2S in place on all 48 layers. Off by default. |
 | `HOME` | doctor, roofline profile | Location of `~/.config/vegajet/hw_profile.json` (unset: a file under `/tmp`). |

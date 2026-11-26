@@ -310,6 +310,8 @@ vj_test(test_opgraph_multi_arch)
 vj_test(test_sampler)
 vj_test(test_host_preflight)
 vj_test(test_server_sse)
+# v1.2 serving levers: greedy-only 400s, bounded async SSE output queue (byte-identical, ordered, disconnect-safe).
+vj_test(test_serve_v12)
 vj_test(test_declarative_template)
 vj_test(test_hsaco_isa_scan)
 vj_test(test_vram_planner)

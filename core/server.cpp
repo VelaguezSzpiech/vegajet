@@ -21,6 +21,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <deque>
@@ -345,6 +346,12 @@ std::vector<std::string> utf8_pieces(const std::string& s, size_t max) {
         i = cut;
     }
     return out;
+}
+
+// v1.2 lever: bounded SSE output queue (VEGAJET_V12_ASYNC_OUT, default on; "0" restores the inline writer).
+bool async_out_enabled() {
+    const char* v = std::getenv("VEGAJET_V12_ASYNC_OUT");
+    return !(v && std::strcmp(v, "0") == 0);
 }
 
 void set_nonblocking(int fd, bool on) {
@@ -698,6 +705,85 @@ struct OpenAiServer::Impl {
         return (p.revents & (POLLRDHUP | POLLHUP | POLLERR | POLLNVAL)) == 0;
     }
 
+    // v1.2 lever: bounded queue of already-formatted SSE bytes between the generation thread and the socket. The
+    // generation thread only enqueues (FIFO, so the byte stream is the same as writing inline); one writer thread owns
+    // every blocking send and merges whatever is queued into one write, so a slow client costs generation a full queue
+    // and nothing more. A write failure marks the pump aborted: the next push returns false, which cancels generation
+    // exactly like the inline path's send failure did. Disabled: push() writes inline (the pre-v1.2 behaviour).
+    class OutputPump {
+    public:
+        static constexpr size_t kMaxChunks = 32;          // producer blocks beyond this many queued chunks
+        static constexpr size_t kMaxBytes = 256u << 10;   // and beyond this many queued bytes
+        explicit OutputPump(int fd, bool on) : fd_(fd), on_(on) {
+            if (on_) th_ = std::thread([this] { run(); });
+        }
+        ~OutputPump() { finish(); }
+        OutputPump(const OutputPump&) = delete;
+        OutputPump& operator=(const OutputPump&) = delete;
+
+        // False means the client is gone (or the queue was closed): stop generating.
+        bool push(std::string s) {
+            if (!on_) return send_blocking(fd_, s);
+            std::unique_lock<std::mutex> lk(m_);
+            cv_.wait(lk, [&] {
+                // `q_.empty()` lets a single chunk larger than the byte cap through instead of waiting forever.
+                return aborted_ || closing_ ||
+                       (q_.size() < kMaxChunks && (q_.empty() || bytes_ + s.size() <= kMaxBytes));
+            });
+            if (aborted_ || closing_) return false;
+            bytes_ += s.size();
+            q_.push_back(std::move(s));
+            cv_.notify_all();
+            return true;
+        }
+
+        // Flush what is queued and join the writer (idempotent; nothing to do when disabled).
+        void finish() {
+            if (!th_.joinable()) return;
+            {
+                std::lock_guard<std::mutex> lk(m_);
+                closing_ = true;
+            }
+            cv_.notify_all();
+            th_.join();
+        }
+
+    private:
+        void run() {
+            while (true) {
+                std::string batch;
+                {
+                    std::unique_lock<std::mutex> lk(m_);
+                    cv_.wait(lk, [&] { return aborted_ || !q_.empty() || closing_; });
+                    if (aborted_) return;
+                    if (q_.empty()) return;  // closing_ and nothing left to write
+                    for (const auto& s : q_) batch += s;
+                    q_.clear();
+                    bytes_ = 0;
+                    cv_.notify_all();  // room for the producer
+                }
+                if (!send_blocking(fd_, batch)) {
+                    std::lock_guard<std::mutex> lk(m_);
+                    aborted_ = true;
+                    q_.clear();
+                    bytes_ = 0;
+                    cv_.notify_all();
+                    return;
+                }
+            }
+        }
+
+        int fd_;
+        bool on_;
+        std::mutex m_;
+        std::condition_variable cv_;
+        std::deque<std::string> q_;
+        size_t bytes_ = 0;
+        bool closing_ = false;
+        bool aborted_ = false;
+        std::thread th_;
+    };
+
     void run_job(Job& job) {
         const int fd = job.fd;
         set_nonblocking(fd, false);
@@ -706,6 +792,9 @@ struct OpenAiServer::Impl {
 
         const GenerateRequest& rq = job.req;
         const bool stream = rq.stream;
+        // Streaming responses: SSE bytes go through the bounded queue, so blocking socket writes never run on the
+        // generation thread (VEGAJET_V12_ASYNC_OUT=0 restores the inline writer).
+        OutputPump pump(fd, stream && async_out_enabled());
         const std::string id = "chatcmpl-" + std::to_string(created) + "-" + std::to_string(next_id++);
         const std::string ts = std::to_string(static_cast<long long>(std::time(nullptr)));
         const std::string model = json::quote(rq.model);
@@ -722,8 +811,8 @@ struct OpenAiServer::Impl {
             const std::string head =
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n"
                 "Connection: close\r\nAccess-Control-Allow-Origin: *\r\nX-Accel-Buffering: no\r\n\r\n";
-            gone = !send_blocking(fd, head + (anth ? enc.start()
-                                                   : chunk("{\"role\":\"assistant\",\"content\":\"\"}", nullptr)));
+            gone = !pump.push(head + (anth ? enc.start()
+                                           : chunk("{\"role\":\"assistant\",\"content\":\"\"}", nullptr)));
         }
 
         StopMatcher sm(rq.stop);
@@ -745,9 +834,9 @@ struct OpenAiServer::Impl {
             if (gone || ev.empty()) { ev.clear(); return; }
             if (!stream) { toolcall::accumulate(ev, msg); ev.clear(); return; }
             if (anth) {
-                const std::string out = enc.events(ev);
+                const std::string bytes = enc.events(ev);
                 ev.clear();
-                if (!out.empty()) gone = !send_blocking(fd, out);
+                if (!bytes.empty()) gone = !pump.push(bytes);
                 return;
             }
             std::string out;
@@ -767,7 +856,7 @@ struct OpenAiServer::Impl {
                 }
             }
             ev.clear();
-            if (!out.empty()) gone = !send_blocking(fd, out);
+            if (!out.empty()) gone = !pump.push(std::move(out));
         };
         auto emit = [&](const std::string& text) {
             if (text.empty() || gone) return;
@@ -817,13 +906,13 @@ struct OpenAiServer::Impl {
         } else if (!res.error.empty()) {
             ++n_errors;
             if (stream) {
-                send_blocking(fd, anth ? enc.error("api_error", res.error)
-                                       : "data: " + error_json(res.error, "server_error") + "\n\ndata: [DONE]\n\n");
+                pump.push(anth ? enc.error("api_error", res.error)
+                               : "data: " + error_json(res.error, "server_error") + "\n\ndata: [DONE]\n\n");
             } else {
                 keep_alive = job.keep_alive;
-                send_blocking(fd, anth ? http_response(500, "application/json",
-                                                       anthropic::error_json("api_error", res.error), keep_alive)
-                                       : error_response(500, res.error, keep_alive));
+                pump.push(anth ? http_response(500, "application/json",
+                                               anthropic::error_json("api_error", res.error), keep_alive)
+                               : error_response(500, res.error, keep_alive));
             }
         } else {
             FinishReason fr = sm.stopped() ? FinishReason::Stop : hit_length ? FinishReason::Length : res.finish;
@@ -847,11 +936,11 @@ struct OpenAiServer::Impl {
             const std::string aseq = std::string_view(areason) == "stop_sequence" ? sm.matched() : std::string();
             if (anth && stream) {
                 ++n_streamed;
-                send_blocking(fd, enc.finish(areason, aseq, au));
+                pump.push(enc.finish(areason, aseq, au));
             } else if (anth) {
                 keep_alive = job.keep_alive;
                 const std::string body = anthropic::response_json("msg_" + id.substr(9), rq.model, msg, areason, aseq, au);
-                if (!send_blocking(fd, http_response(200, "application/json", body, keep_alive))) keep_alive = false;
+                if (!pump.push(http_response(200, "application/json", body, keep_alive))) keep_alive = false;
             } else if (stream) {
                 ++n_streamed;
                 std::string tail = chunk("{}", finish_reason_name(fr));
@@ -860,7 +949,7 @@ struct OpenAiServer::Impl {
                             ",\"model\":" + model + ",\"choices\":[],\"usage\":" + usage + ",\"timings\":" + timings +
                             "}\n\n";
                 tail += "data: [DONE]\n\n";
-                send_blocking(fd, tail);
+                pump.push(std::move(tail));
             } else {
                 keep_alive = job.keep_alive;
                 std::string message = "{\"role\":\"assistant\",\"content\":" +
@@ -882,9 +971,10 @@ struct OpenAiServer::Impl {
                     ",\"choices\":[{\"index\":0,\"message\":" + message +
                     ",\"finish_reason\":" + json::quote(finish_reason_name(fr)) + "}],\"usage\":" + usage +
                     ",\"timings\":" + timings + "}";
-                if (!send_blocking(fd, http_response(200, "application/json", body, keep_alive))) keep_alive = false;
+                if (!pump.push(http_response(200, "application/json", body, keep_alive))) keep_alive = false;
             }
         }
+        pump.finish();  // flush queued SSE bytes before the socket goes back to the I/O thread
         {
             std::lock_guard<std::mutex> lk(mu);
             done.push_back({fd, keep_alive});
