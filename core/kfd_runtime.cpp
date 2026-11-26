@@ -970,7 +970,13 @@ bool Runtime::reload_all_hsacos(std::string* err) {
     names.reserve(loaded_modules_.size());
     for (const auto& m : loaded_modules_) names.push_back(m.name);
     for (const auto& nm : names) {
-        if (!reload_hsaco(nm, err)) return false;
+        if (!reload_hsaco(nm, err)) {
+            // Earlier modules may already have replaced executable BOs and cached kernel objects.
+            if (err) *err = "reload-all failed at '" + nm + "'; runtime stopped: " + *err;
+            abort_dispatches();
+            open_ = false;
+            return false;
+        }
     }
     return true;
 }
