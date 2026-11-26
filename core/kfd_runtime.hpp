@@ -340,6 +340,7 @@ public:
     bool download_from_vram(size_t gpu_idx, void* dst, uint64_t src_vram_va, size_t bytes);
 
 private:
+    friend struct RuntimeTestAccess;
     struct LoadedModule {
         std::string name;
         std::string path;

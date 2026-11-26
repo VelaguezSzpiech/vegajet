@@ -5997,6 +5997,8 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                             static_cast<unsigned long long>(rt.reload_generation()),
                             warm::json_escape(rerr).c_str());
                 std::fflush(stdout);
+                // A partial reload/rebind invalidates cached K[] pointers. Never accept another command.
+                if (!ok_res) fail_run("Hot-reload failed; runner stopped: " + rerr);
                 return;
             }
             if (cmd.kind == warm::CommandKind::Parity) {
