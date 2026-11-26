@@ -267,6 +267,9 @@ int run_serve(const std::vector<std::string>& args, const gpusel::Selection& gpu
         so.workers = 1;
         gen = have_tok ? serve::make_engine_generate_fn(*engine, tok, fmt, chat_opt) : serve::make_engine_generate_fn(*engine);
     }
+    // v1.2: a greedy engine (the Ornith GPU runner) cannot honor sampling knobs, so serve answers HTTP 400 for them
+    // instead of returning greedy text for a request that asked to sample.
+    if (!loop) so.greedy_only = !engine->supports_sampling();
     // ---- observability: GET /metrics (+ read-only GPU sysfs telemetry) and the JSONL request log
     metrics::Registry registry;
     metrics::JsonlLogger request_log;

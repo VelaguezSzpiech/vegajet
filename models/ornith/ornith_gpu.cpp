@@ -7074,6 +7074,9 @@ public:
     const std::string& description() const { return description_; }
     ModelInfo model_info() const override { return info_; }
     const BpeTokenizer& tokenizer() const override { return legacy_tok_; }
+    // The live runner decodes greedily (temperature/top_p/top_k are not implemented): `vegajet serve` turns that into
+    // HTTP 400 for sampling parameters that differ from the greedy defaults instead of ignoring them.
+    bool supports_sampling() const override { return false; }
 
     std::string format_chat(const std::vector<ChatMessage>& messages) const override {
         std::string out;

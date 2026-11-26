@@ -79,6 +79,9 @@ struct ServerOptions {
     int idle_timeout_ms = 30000;        // idle keep-alive / slow-header connections are closed after this
     int send_timeout_ms = 10000;        // a client that stops reading for this long is dropped
     bool parse_reasoning = true;        // split a leading <think>...</think> into reasoning_content
+    // The generator decodes greedily (no temperature/top-k/top-p/min-p/repeat-penalty): reject such parameters with
+    // HTTP 400 unless they hold the greedy defaults (temperature 0, top_p 1, top_k 0, min_p 0, repeat_penalty 1).
+    bool greedy_only = false;
     size_t workers = 1;                 // concurrent generations (> 1 needs a GenerateFn that is safe to call concurrently)
     std::function<std::string()> metrics_text;  // set: GET /metrics serves it (Prometheus text, core/metrics)
 };

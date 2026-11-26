@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Noncommercial-1.0.0
 // v1.2 serving levers, CPU only:
+//   D3  greedy-only engines answer HTTP 400 for sampling parameters they do not implement (ServerOptions::greedy_only),
+//       and keep accepting requests that hold the greedy defaults on both /v1/chat/completions and /v1/messages.
 //   D2  the bounded SSE output queue (VEGAJET_V12_ASYNC_OUT, default on) must produce the exact same byte stream as the
 //       inline writer, must not lose or reorder chunks for a slow reader, and must still cancel generation when the
 //       client disconnects.
@@ -148,8 +150,18 @@ Resp request(uint16_t port, const std::string& method, const std::string& path, 
     return r;
 }
 
+json::Value parse_json(const std::string& s) {
+    json::Value v;
+    if (!json::parse(s, v)) { std::fprintf(stderr, "bad JSON: %s\n", s.c_str()); VJ_CHECK(false); }
+    return v;
+}
+
 std::string chat_body(const std::string& extra) {
     return "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]" + extra + "}";
+}
+
+std::string anthropic_body(const std::string& extra) {
+    return "{\"model\":\"m\",\"max_tokens\":16,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]" + extra + "}";
 }
 
 int count_of(const std::string& hay, const std::string& needle) {
@@ -204,6 +216,62 @@ int main() {
     std::string err;
     VJ_CHECK(srv->start(&err));
     const uint16_t port = srv->port();
+
+    // ---- D3: greedy-only engine rejects unimplemented sampling parameters (OpenAI endpoint)
+    {
+        ServerOptions g = opt;
+        g.port = 0;
+        g.greedy_only = true;
+        OpenAiServer gsrv(g, [&](const GenerateRequest& r, const TokenSink& s) { return mock(r, s); });
+        VJ_CHECK(gsrv.start(&err));
+        const uint16_t gp = gsrv.port();
+
+        struct Case { const char* extra; const char* field; };
+        const Case rejected[] = {
+            {",\"temperature\":0.7", "temperature"}, {",\"top_k\":40", "top_k"},     {",\"top_p\":0.9", "top_p"},
+            {",\"min_p\":0.05", "min_p"},            {",\"repeat_penalty\":1.1", "repeat_penalty"},
+            {",\"presence_penalty\":0.5", "presence_penalty"},
+            {",\"frequency_penalty\":0.5", "frequency_penalty"},
+            {",\"logprobs\":true", "logprobs"},      {",\"top_logprobs\":3", "top_logprobs"},
+        };
+        for (const auto& c : rejected) {
+            const Resp r = request(gp, "POST", "/v1/chat/completions", chat_body(c.extra));
+            const auto j = parse_json(r.body);
+            VJ_CHECK(r.status == 400);
+            VJ_CHECK(j.get("error")->get("type")->str == "invalid_request_error");
+            const std::string msg = j.get("error")->get("message")->str;
+            if (msg.find(c.field) == std::string::npos) {
+                std::fprintf(stderr, "  missing '%s' in: %s\n", c.field, msg.c_str());
+                VJ_CHECK(false);
+            }
+            if (msg.find("greedily") == std::string::npos) {
+                std::fprintf(stderr, "  no reason in: %s\n", msg.c_str());
+                VJ_CHECK(false);
+            }
+        }
+        // A request that names no knob at all is accepted (the API defaults differ per endpoint; they are not requests).
+        VJ_CHECK(request(gp, "POST", "/v1/chat/completions", chat_body("")).status == 200);
+        VJ_CHECK(request(gp, "POST", "/v1/messages", anthropic_body("")).status == 200);
+        // Explicit greedy defaults (and the non-sampling knobs) stay accepted; seed cannot change a greedy draw.
+        const Resp ok = request(gp, "POST", "/v1/chat/completions",
+                                chat_body(",\"temperature\":0,\"top_p\":1,\"top_k\":0,\"min_p\":0,"
+                                          "\"repeat_penalty\":1,\"presence_penalty\":0,\"frequency_penalty\":0,"
+                                          "\"seed\":1234,\"logprobs\":false,\"max_tokens\":32"));
+        VJ_CHECK(ok.status == 200);
+        VJ_CHECK(parse_json(ok.body).get("choices")->arr[0].get("message")->get("content")->str == kFull);
+        // /v1/messages goes through the shared post-parse check.
+        const Resp anth = request(gp, "POST", "/v1/messages", anthropic_body(",\"temperature\":0.7"));
+        VJ_CHECK(anth.status == 400);
+        VJ_CHECK(parse_json(anth.body).get("error")->get("message")->str.find("temperature") != std::string::npos);
+        VJ_CHECK(request(gp, "POST", "/v1/messages", anthropic_body(",\"temperature\":0,\"top_k\":0")).status == 200);
+        gsrv.stop();
+
+        // A sampling-capable generator (the default) still accepts the same request unchanged.
+        const Resp s = request(port, "POST", "/v1/chat/completions", chat_body(",\"temperature\":0.7,\"top_k\":40"));
+        VJ_CHECK(s.status == 200 && parse_json(s.body).get("choices")->arr[0].get("message")->get("content")->str == kFull);
+        std::printf("  greedy-only: %zu sampling knobs rejected with 400, greedy defaults accepted\n",
+                    sizeof(rejected) / sizeof(rejected[0]));
+    }
 
     // ---- D2: the async writer produces the same bytes as the inline writer
     {
@@ -280,7 +348,7 @@ int main() {
     const auto st = srv->stats();
     VJ_CHECK(st.errors == 0);
     srv->stop();
-    std::printf("test_serve_v12: async SSE equality/order, slow reader, disconnect OK\n");
+    std::printf("test_serve_v12: greedy-only 400s, async SSE equality/order, slow reader, disconnect OK\n");
     std::printf("PASS\n");
     return 0;
 }

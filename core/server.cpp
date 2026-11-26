@@ -348,6 +348,32 @@ std::vector<std::string> utf8_pieces(const std::string& s, size_t max) {
     return out;
 }
 
+// A greedy generator has no sampling knobs, so a request that asks for one cannot be honored. Rejecting it (HTTP 400)
+// is the honest answer: silently returning argmax text for a request that asked for temperature 0.7 makes the client
+// believe it sampled. Only explicitly present fields are checked, so a request that omits them (whatever the API's own
+// default is) and one that sends the greedy defaults are both accepted.
+bool greedy_knobs_supported(const json::Value& root, std::string& err) {
+    struct Knob { const char* name; double greedy; const char* shown; };
+    const Knob numeric[] = {{"temperature", 0.0, "0"},  {"top_p", 1.0, "1"},          {"top_k", 0.0, "0"},
+                            {"min_p", 0.0, "0"},        {"repeat_penalty", 1.0, "1"},   {"presence_penalty", 0.0, "0"},
+                            {"frequency_penalty", 0.0, "0"}, {"top_logprobs", 0.0, "0"}};
+    for (const auto& k : numeric) {
+        const auto* v = root.get(k.name);
+        if (!v || v->is_null()) continue;
+        if (!v->is_number()) { err = std::string("'") + k.name + "' must be a number"; return false; }
+        if (v->num != k.greedy) {
+            err = std::string("this engine decodes greedily: '") + k.name + "' is not implemented (greedy default " +
+                  k.shown + "); remove it or send the greedy default";
+            return false;
+        }
+    }
+    if (const auto* v = root.get("logprobs"); v && !v->is_null() && !(v->is_bool() && !v->b)) {
+        err = "this engine decodes greedily: 'logprobs' is not implemented";
+        return false;
+    }
+    return true;
+}
+
 // v1.2 lever: bounded SSE output queue (VEGAJET_V12_ASYNC_OUT, default on; "0" restores the inline writer).
 bool async_out_enabled() {
     const char* v = std::getenv("VEGAJET_V12_ASYNC_OUT");
@@ -544,8 +570,13 @@ struct OpenAiServer::Impl {
                 fail(400, "request body is not valid JSON");
                 return;
             }
-            Job job;
+            // Greedy-only generators (ServerOptions::greedy_only) answer 400 for sampling knobs they cannot honor.
             std::string err;
+            if (opt.greedy_only && !greedy_knobs_supported(root, err)) {
+                fail(400, err);
+                return;
+            }
+            Job job;
             const bool ok = anth ? anthropic::parse_request(
                                        root, anthropic::Limits{opt.model_id, opt.default_max_tokens, opt.max_tokens_cap},
                                        job.req, err)
