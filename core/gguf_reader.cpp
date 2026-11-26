@@ -102,6 +102,9 @@ bool is_integer(GgufValueType t) {
            t != GgufValueType::ARRAY;
 }
 
+// No real model has a 1 T-element axis; this keeps every later product far from overflow.
+constexpr uint64_t kMaxTensorDim = 1ull << 40;
+
 } // namespace
 
 std::string GgufValue::to_string(size_t max_items) const {
@@ -134,7 +137,21 @@ std::string GgufValue::to_string(size_t max_items) const {
     }
 }
 
-uint64_t GgufTensorInfo::n_bytes() const { return ggml_row_bytes(type, n_elems()); }
+uint64_t GgufTensorInfo::n_elems() const {
+    uint64_t n = 1;
+    for (uint32_t d = 0; d < 4; ++d)
+        if (__builtin_mul_overflow(n, ne[d], &n)) return 0;
+    return n;
+}
+
+uint64_t GgufTensorInfo::n_bytes() const {
+    const GgmlTypeTraits tr = ggml_type_traits(type);
+    const uint64_t n = n_elems();
+    if (tr.block_elems == 0 || n == 0 || n % tr.block_elems != 0) return 0;
+    uint64_t bytes = 0;
+    if (__builtin_mul_overflow(n / tr.block_elems, static_cast<uint64_t>(tr.block_bytes), &bytes)) return 0;
+    return bytes;
+}
 
 GgufFile::~GgufFile() { close(); }
 
@@ -230,9 +247,22 @@ bool GgufFile::open(const std::string& path) {
     }
     data_offset_ = (r.pos() + alignment_ - 1) / alignment_ * alignment_;
     for (const auto& ti : tensors_) {
-        const uint64_t nb = ti.n_bytes();
-        if (nb == 0 && ggml_type_traits(ti.type).name == nullptr)
+        const GgmlTypeTraits tr = ggml_type_traits(ti.type);
+        if (tr.name == nullptr)
             return fail("tensor " + ti.name + " has unknown ggml type " + std::to_string(ti.type));
+        if (ti.n_dims == 0) return fail("tensor " + ti.name + " has no dimensions");
+        for (uint32_t d = 0; d < ti.n_dims; ++d) {
+            if (ti.ne[d] == 0) return fail("tensor " + ti.name + " has a zero-sized dimension");
+            if (ti.ne[d] > kMaxTensorDim)
+                return fail("tensor " + ti.name + " has an implausible dimension " + std::to_string(ti.ne[d]));
+        }
+        const uint64_t n_elems = ti.n_elems();
+        if (n_elems == 0) return fail("tensor " + ti.name + " element count overflows 64 bits");
+        const uint64_t nb = ti.n_bytes();
+        if (nb == 0)
+            return fail("tensor " + ti.name + " has no byte size (" + std::to_string(n_elems) +
+                        " elements is not a whole number of " + tr.name + " blocks of " +
+                        std::to_string(tr.block_elems) + ", or the byte size overflows)");
         // Overflow-safe: `offset` and `nb` are file-controlled, so a plain sum can wrap.
         if (data_offset_ > file_size_ || ti.offset > file_size_ - data_offset_ ||
             nb > file_size_ - data_offset_ - ti.offset)

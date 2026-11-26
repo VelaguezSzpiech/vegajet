@@ -264,6 +264,7 @@ vj_test(test_tokenizer)
 vj_test(test_gguf_reader)
 # v1.2 parser hardening (AUDIT-parsers.md): malformed GGUF / tokenizer / template inputs.
 vj_test(test_parser_gguf_overflow)
+vj_test(test_parser_gguf_ne)
 vj_test(test_quant_repacker)
 # Keep synthetic fixture rounding identical to the golden inputs on FMA-capable hosts.
 target_compile_options(test_quant_repacker PRIVATE -ffp-contract=off)
