@@ -275,6 +275,8 @@ public:
     bool open(std::string* err);
     bool init(double vram_arena_gib, size_t host_pinned_mb, std::string* err = nullptr);
     void shutdown();
+    // Irreversible fail-closed stop; keep allocations valid for caller cleanup.
+    void abort_dispatches();
 
     // Loads a single unbundled gfx906 .hsaco onto all open GPUs (hard-asserts private_segment_fixed_size == 0!).
     bool load_code_object(const std::string& path, std::string* err);

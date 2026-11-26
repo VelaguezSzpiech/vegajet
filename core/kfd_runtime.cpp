@@ -219,6 +219,7 @@ bool Runtime::open(std::string* err) {
 }
 bool Runtime::init(double, size_t, std::string* err) { return open(err); }
 void Runtime::shutdown() { open_ = false; }
+void Runtime::abort_dispatches() {}
 bool Runtime::load_code_object(const std::string&, std::string* err) {
     if (err) *err = "code objects cannot be loaded in a CPU-only build";
     return false;
@@ -802,9 +803,13 @@ void Runtime::destroy_aql_queue(size_t gpu_idx) {
     free_buffer(q.ring_buf);
 }
 
-void Runtime::shutdown() {
+void Runtime::abort_dispatches() {
     for (size_t i = 0; i < queues_.size(); ++i) destroy_aql_queue(i);
     queues_.clear();
+}
+
+void Runtime::shutdown() {
+    abort_dispatches();
     for (auto& m : loaded_modules_) {
         for (auto& cb : m.code_buffers) free_buffer(cb);
     }

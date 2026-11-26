@@ -6,6 +6,22 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class FixContracts(unittest.TestCase):
+    def test_failures_unwind_all_drivers(self):
+        src = (ROOT / 'models/ornith/ornith_gpu.cpp').read_text()
+        self.assertNotIn('return std::vector<int32_t>(M, -1)', src)
+        self.assertLess(src.index('BAD ARGMAX'), src.index('// Update Dynamic LRU MoE'))
+        for where in ('previous dispatch', 'decode step', 'MTP step', 'super profile'):
+            self.assertIn('if (device_fault_check("' + where + '")) fail_run(res.error);', src)
+        self.assertIn('catch (const guard::RunFailure& failure)', src)
+        for where in ('MTP embedding', 'MTP argmax', 'DFlash anchor embedding', 'DFlash draft argmax'):
+            self.assertIn('"' + where + '"', src)
+        self.assertIn('if (!run_state.error().empty() || !res.error.empty() || device_faulted)', src)
+        body = src[src.index('    auto run_full_bench_body'):src.index('    if (opt.serve_hook)')]
+        self.assertNotIn('rt.free_buffer(io_buf)', body)
+        self.assertIn('if (failed_) throw guard::RunFailure(start_err_);', src)
+        self.assertIn('return req_done_ || stop_ || failed_;', src)
+        self.assertIn('Ornith GPU engine stopped unexpectedly', src)
+
     def test_batched_collective_epochs(self):
         src = (ROOT / 'models/ornith/ornith_gpu.cpp').read_text()
         batch = src[src.index('    auto step_mtp_batch ='):src.index('    auto step_mtp_batch =') + 17000]

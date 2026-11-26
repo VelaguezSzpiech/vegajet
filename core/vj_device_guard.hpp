@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <string>
+#include <stdexcept>
 
 namespace vegajet {
 namespace guard {
@@ -68,6 +69,23 @@ inline void fault_clear(uint32_t* slot) {
     slot[kFaultWIdentity] = 0u;
     slot[kFaultWEpoch]    = 0u;
 }
+
+// A run failure unwinds every generation driver before callbacks, commits or catch-up.
+class RunFailure : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
+// Sticky across resets/requests: a failed engine must not resume dispatching.
+class RunState {
+public:
+    void latch(const std::string& error) { if (error_.empty()) error_ = error; }
+    const std::string& error() const { return error_; }
+    void check() const { if (!error_.empty()) throw RunFailure(error_); }
+    [[noreturn]] void fail(const std::string& error) { latch(error); throw RunFailure(error_); }
+private:
+    std::string error_;
+};
 
 // C3: an argmax-derived token id must name an embedding row before it is used as an address offset.
 inline bool token_id_in_range(int32_t id, uint32_t vocab) {

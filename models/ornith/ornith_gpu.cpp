@@ -2276,6 +2276,18 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
     // out and leave a record in io_fault_host. Every step re-arms both slots and, once the queues have drained,
     // any record becomes a sticky host error so no token can ever be produced from a wedged grid.
     bool device_faulted = false;
+    guard::RunState run_state;
+    auto fail_run = [&](const std::string& message) -> void {
+        run_state.latch(message);
+        res.error = run_state.error();
+        rt.abort_dispatches();
+        throw guard::RunFailure(run_state.error());
+    };
+    auto require_token = [&](int32_t id, const char* where) {
+        run_state.check();
+        if (!guard::token_id_in_range(id, static_cast<uint32_t>(hp.vocab)))
+            fail_run(std::string(where) + ": token id " + std::to_string(id) + " is outside the vocabulary");
+    };
     auto device_fault_check = [&](const char* where) -> bool {
         for (size_t g = 0; g < 2; ++g) {
             const uint32_t* slot = io_fault_host + g * guard::kFaultWords;
@@ -2290,14 +2302,20 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         return false;
     };
 
+    double max_pwr = 0.0, max_tmem = 0.0;
+    HwmonSampler telem;
+    size_t parity_code_match = golden::kCodeRef32.size();
+    bool bench_spec_mismatch = false;
+    std::string bench_spec_mismatch_msg;
+    try {
     auto step_batch = [&](const std::vector<int32_t>& toks, uint32_t pos0,
                           bool use_wy, bool use_ring, bool compute_logits,
                           bool capture_dflash_taps = false) -> std::vector<int32_t> {
         const uint32_t M = static_cast<uint32_t>(toks.size());
         // v1.2 C1: a funneled fault stops the run instead of re-dispatching onto a poisoned barrier arena.
-        // Callers still index preds[0]/preds.back(), so hand back inert -1 ids: no GPU work runs and
-        // res.error is already set, which keeps the run on the error path.
-        if (device_faulted) return std::vector<int32_t>(M, -1);
+        // Unwind the driver before callbacks, recurrent commits or drafter catch-up.
+        run_state.check();
+        if (device_faulted) fail_run(res.error);
         // v1.2 C3: never turn an out-of-range token id into an embedding address offset.
         const uint32_t n_vocab = static_cast<uint32_t>(hp.vocab);
         for (const int32_t t : toks) {
@@ -2307,10 +2325,10 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                             std::to_string(n_vocab) + ") before the embedding lookup";
                 std::fprintf(stderr, "[ornith::gpu] BAD TOKEN ID: %s\n", res.error.c_str());
             }
-            return std::vector<int32_t>(M, -1);
+            fail_run(res.error);
         }
         // A fault raised by a dispatch queued outside step_batch (stage-profiler path) is caught here.
-        if (device_fault_check("previous dispatch")) return std::vector<int32_t>(M, -1);
+        if (device_fault_check("previous dispatch")) fail_run(res.error);
         for (size_t g = 0; g < 2; ++g) guard::fault_clear(io_fault_host + g * guard::kFaultWords);
         if (st_on) st_last = std::chrono::steady_clock::now();
         std::memcpy(io_toks_host, toks.data(), M * sizeof(int32_t));
@@ -3286,8 +3304,32 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         VJ_CHECK(rt.submit_batch(0) && rt.submit_batch(1));
         VJ_CHECK(rt.wait_idle(0)    && rt.wait_idle(1));
         // v1.2 C1: both queues drained -> a recorded barrier/mailbox fault invalidates this step's logits.
-        if (device_fault_check("decode step")) return std::vector<int32_t>(M, -1);
+        if (device_fault_check("decode step")) fail_run(res.error);
 
+        std::vector<int32_t> preds(M, -1);
+        if (compute_logits) {
+            __atomic_thread_fence(__ATOMIC_ACQUIRE);
+            for (uint32_t m = 0; m < voc_m; ++m) {
+                float best_v = -1e30f;
+                int32_t best_i = -1;
+                for (uint32_t b = 0; b < kVocabBlocks; ++b) {
+                    const uint32_t idx = m * kVocabBlocks + b;
+                    if (io_arg_val_host0[idx] > best_v) { best_v = io_arg_val_host0[idx]; best_i = io_arg_id_host0[idx]; }
+                    if (io_arg_val_host1[idx] > best_v) { best_v = io_arg_val_host1[idx]; best_i = io_arg_id_host1[idx]; }
+                }
+                // v1.2 C3: a block reduction that never replaced its -1 sentinel (all-NaN / empty
+                // logits) or an id outside the vocabulary must not reach the embedding gather.
+                if (!guard::token_id_in_range(best_i, n_vocab)) {
+                    if (res.error.empty()) {
+                        res.error = "argmax token id " + std::to_string(best_i) + " is outside the vocabulary [0, " +
+                                    std::to_string(n_vocab) + "); refusing to feed it to the embedding lookup";
+                        std::fprintf(stderr, "[ornith::gpu] BAD ARGMAX: %s\n", res.error.c_str());
+                    }
+                    fail_run(res.error);
+                }
+                preds[last_tok_only_vocab ? (M - 1u) : m] = best_i;
+            }
+        }
         // Update Dynamic LRU MoE Gate+Up cache on M >= 4 verify passes (~10.8 us/expert on-GPU repack!).
         const bool lru_active_now = (lru_cache && std::getenv("VEGAJET_MOE_LRU") != nullptr && std::atoi(std::getenv("VEGAJET_MOE_LRU")) > 0);
         if (lru_active_now && M >= 4u && M <= 16u && !use_m1_super && !use_pf_dot8) {
@@ -3321,30 +3363,6 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             }
         }
 
-        std::vector<int32_t> preds(M, -1);
-        if (compute_logits) {
-            __atomic_thread_fence(__ATOMIC_ACQUIRE);
-            for (uint32_t m = 0; m < voc_m; ++m) {
-                float best_v = -1e30f;
-                int32_t best_i = -1;
-                for (uint32_t b = 0; b < kVocabBlocks; ++b) {
-                    const uint32_t idx = m * kVocabBlocks + b;
-                    if (io_arg_val_host0[idx] > best_v) { best_v = io_arg_val_host0[idx]; best_i = io_arg_id_host0[idx]; }
-                    if (io_arg_val_host1[idx] > best_v) { best_v = io_arg_val_host1[idx]; best_i = io_arg_id_host1[idx]; }
-                }
-                // v1.2 C3: a block reduction that never replaced its -1 sentinel (all-NaN / empty
-                // logits) or an id outside the vocabulary must not reach the embedding gather.
-                if (!guard::token_id_in_range(best_i, n_vocab)) {
-                    if (res.error.empty()) {
-                        res.error = "argmax token id " + std::to_string(best_i) + " is outside the vocabulary [0, " +
-                                    std::to_string(n_vocab) + "); refusing to feed it to the embedding lookup";
-                        std::fprintf(stderr, "[ornith::gpu] BAD ARGMAX: %s\n", res.error.c_str());
-                    }
-                    return std::vector<int32_t>(M, -1);
-                }
-                preds[last_tok_only_vocab ? (M - 1u) : m] = best_i;
-            }
-        }
         return preds;
     };
 
@@ -3720,6 +3738,8 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
     // Built-in blk.48 nextn MTP single-token step (1 layer + optional LM head -> ~0.7 ms/draft!)
     auto step_mtp = [&](int32_t tok_id, uint32_t pos, uint64_t h_in0, uint64_t h_in1,
                         bool compute_logits, bool do_submit, uint32_t tok_slot) -> int32_t {
+        require_token(tok_id, "MTP embedding");
+        if (tok_slot >= 1024u) fail_run("MTP token staging capacity exceeded");
         io_toks_host[tok_slot] = tok_id;
         __atomic_thread_fence(__ATOMIC_RELEASE);
         const float eps = static_cast<float>(hp.rms_eps);
@@ -3855,6 +3875,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
 
         VJ_CHECK(rt.submit_batch(0) && rt.submit_batch(1));
         VJ_CHECK(rt.wait_idle(0)    && rt.wait_idle(1));
+        if (device_fault_check("MTP step")) fail_run(res.error);
         if (!compute_logits) return -1;
 
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
@@ -3868,8 +3889,10 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             const uint32_t idx = static_cast<uint32_t>(best_i);
             const size_t g = (idx >= fr_rows_per_gpu) ? 1u : 0u;
             const uint32_t local_r = idx - static_cast<uint32_t>(g) * fr_rows_per_gpu;
-            if (local_r < fr_tok_map[g].size()) best_i = fr_tok_map[g][local_r];
+            if (local_r >= fr_tok_map[g].size()) fail_run("MTP frequency-rank argmax is outside the token map");
+            best_i = fr_tok_map[g][local_r];
         }
+        require_token(best_i, "MTP argmax");
         return best_i;
     };
 
@@ -3894,6 +3917,8 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
     auto step_mtp_batch = [&](const std::vector<int32_t>& toks, uint32_t pos0,
                               const std::vector<uint64_t>& hs0, const std::vector<uint64_t>& hs1,
                               bool do_submit) -> bool {
+        run_state.check();
+        for (int32_t id : toks) require_token(id, "MTP batch embedding");
         const uint32_t n = static_cast<uint32_t>(toks.size());
         if (n == 0u) return true;
         if (n == 1u || !v12_batch_ok) {
@@ -4364,10 +4389,6 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         return gen;
     };
 
-    double max_pwr = 0.0, max_tmem = 0.0;
-    HwmonSampler telem;
-    size_t parity_code_match = golden::kCodeRef32.size();
-
     // ---- Pillar 3: --dump-golden-layers <dir> (1 GDN L0 + 1 GQA L3 fixture for vegajet_layer_test) ----
     if (!opt.dump_golden_layers_dir.empty()) {
         const uint32_t local_ff = ff_size[0];
@@ -4466,6 +4487,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
            << "gqa_rot_dim=64\n"
            << "m_list=1,5,16,128,512\n";
         mf.close();
+        if (device_fault_check("golden dump")) fail_run(res.error);
         rt.free_buffer(tap_buf);
         rt.free_buffer(io_buf);
         telem.stop();
@@ -4708,6 +4730,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                         }
                         VJ_CHECK(rt.submit_batch(0) && rt.submit_batch(1));
                         VJ_CHECK(rt.wait_idle(0) && rt.wait_idle(1));
+                        if (device_fault_check("super profile")) fail_run(res.error);
                         std::vector<uint64_t> t0(tidx), t1(tidx);
                         VJ_CHECK(rt.download_from_vram(0, t0.data(), ts_va[0], tidx * 8u));
                         VJ_CHECK(rt.download_from_vram(1, t1.data(), ts_va[1], tidx * 8u));
@@ -4794,8 +4817,6 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
     // Execute the full benchmark body (including raw, Suffix, MTP, DFlash2+Hyb, pp512/pp2048) as a reusable lambda!
     // v1.2 C5: a speculative/MTP/DFlash driver that disagrees with the raw greedy reference must fail the
     // run (non-zero exit) instead of only printing a lossless= counter next to a tok/s number.
-    bool bench_spec_mismatch = false;
-    std::string bench_spec_mismatch_msg;
 
     auto run_full_bench_body = [&](bool include_prefill, warm::SweepVariantResult* vout) -> bool {
         uint64_t ue0 = 0, de0 = 0, ue1 = 0, de1 = 0;
@@ -4880,8 +4901,6 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                         chunk, n_prompt, n_gdn_layers, opt.pf_gdn, opt.gdn_state_dump.c_str());
             for (int32_t t : cont) std::printf(" %d", t);
             std::printf("\n");
-            rt.free_buffer(tap_buf);
-            rt.free_buffer(io_buf);
             res.ok = true;
             return false;
         }
@@ -4974,7 +4993,6 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             (void) step_batch(p128, 0u, opt.use_wy_prefill, false, false);
             ab(128u, "prefill");
             rt.free_buffer(cmp);
-            rt.free_buffer(io_buf);
             res.ok = true;
             return false;
         }
@@ -4987,8 +5005,6 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             std::vector<int32_t> ids;
             std::ofstream df(opt.dump_hidden_path, std::ios::binary);
             if (!df) {
-                rt.free_buffer(tap_buf);
-                rt.free_buffer(io_buf);
                 res.error = "Cannot open hidden-state dump file " + opt.dump_hidden_path;
                 return false;
             }
@@ -5014,8 +5030,6 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             std::printf("[DUMP] ids:");
             for (int32_t v : ids) std::printf(" %d", v);
             std::printf("\n");
-            rt.free_buffer(tap_buf);
-            rt.free_buffer(io_buf);
             res.ok = df.good();
             if (!res.ok) res.error = "Short write to hidden-state dump file " + opt.dump_hidden_path;
             return false;
@@ -5068,8 +5082,6 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             const uint32_t V_tot = voc_rows[0] + voc_rows[1];
             std::ofstream lf(opt.dump_logits_path, std::ios::binary);
             if (!lf) {
-                rt.free_buffer(tap_buf);
-                rt.free_buffer(io_buf);
                 res.error = "Cannot open logits dump file " + opt.dump_logits_path;
                 return false;
             }
@@ -5098,8 +5110,6 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                             pi + 1u, n_pos, M_pr, opt.prefill_dot8 ? 1 : 0, opt.dot8_clip_alpha,
                             top1, (top1 >= 0 && static_cast<uint32_t>(top1) < V_tot) ? logits[top1] : 0.0f);
             }
-            rt.free_buffer(tap_buf);
-            rt.free_buffer(io_buf);
             res.ok = lf.good();
             if (!res.ok) res.error = "Short write to logits dump file " + opt.dump_logits_path;
             return false;
@@ -5320,6 +5330,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             float  df_pmin_cur = opt.dflash_p_min;
             auto df_now_ms = []() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
             auto dflash_draft = [&](int32_t anchor_tok, uint32_t s_pos, uint32_t k_draft) -> std::vector<int32_t> {
+                require_token(anchor_tok, "DFlash anchor embedding");
                 const double td_a = df_now_ms();
                 const uint32_t B = k_draft + 1u;
                 const uint32_t T = k_draft;
@@ -5475,8 +5486,9 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                     if (pred < 0 || static_cast<uint32_t>(pred) >= vocab) {
                         std::printf("  [DFERR pos=%u t=%u] invalid draft tok=%d (u0=%d:%.2f)\n", s_pos, t, pred, topi[0], topv[0]);
                         std::fflush(stdout);
-                        pred = 0;
+                        fail_run("DFlash draft argmax is outside the vocabulary");
                     }
+                    require_token(pred, "DFlash draft argmax");
                     drafts.push_back(pred);
                 }
                 const double td_d = df_now_ms();
@@ -5823,6 +5835,8 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         read_ecc_totals(ue_base, de_base);
         auto gen_fn = [&](const std::vector<int32_t>& prompt_ids, int32_t max_tokens,
                           const OrnithGpuOptions::ServeTokenCb& on_tok) {
+            run_state.check();
+            if (device_faulted) fail_run(res.error);
             if (max_tokens <= 0) return;
             double cur_pwr = 0.0, cur_tmem = 0.0;
             uint64_t ue_now = 0, de_now = 0;
@@ -5865,7 +5879,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                 pos += static_cast<uint32_t>(cnt);
             }
             const double prefill_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp0).count();
-            if (cur < 0) return;
+            require_token(cur, "serve prefill argmax");
             if (!on_tok(cur, n_prompt, 1u, prefill_ms, 0.0)) return;
             auto td0 = std::chrono::steady_clock::now();
             for (int32_t s = 1; s < max_tokens && pos < opt.max_ctx; ++s) {
@@ -6002,7 +6016,15 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         }
     }
 
+    } catch (const guard::RunFailure& failure) {
+        run_state.latch(failure.what());
+        res.error = run_state.error();
+        rt.abort_dispatches();
+        res.ok = false;
+    }
     device_fault_check("run end");   // latch while io_fault_host is still allocated
+    res.ok = false;
+    rt.free_buffer(tap_buf);
     rt.free_buffer(io_buf);
     telem.stop();
     max_tmem = std::max(max_tmem, telem.max_tmem_c);
@@ -6016,6 +6038,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                 telem.max_avg_w, telem.max_mean_w(), avg_limit, telem.max_avg1s_w, telem.peak_w, max_tmem,
                 static_cast<unsigned long long>(telem.samples), !telem_ran ? "SKIPPED (no samples)" : (telem_ok ? "PASS" : "FAIL"));
     (void)max_pwr;
+    if (!run_state.error().empty() || !res.error.empty() || device_faulted) { res.ok = false; return res; }
     if (parity_code_match != golden::kCodeRef32.size()) {
         res.error = "Tier-1 llama.cpp code parity failed: " + std::to_string(parity_code_match) + "/" +
                     std::to_string(golden::kCodeRef32.size()) + " exact greedy tokens";
@@ -7213,8 +7236,8 @@ public:
         worker_ = std::thread([this, model_path, opt]() mutable {
             const OrnithBenchMetrics m = run_ornith_gpu(model_path, "", opt);
             std::lock_guard<std::mutex> lk(mu_);
-            if (!ready_) {
-                start_err_ = m.error.empty() ? "Ornith GPU engine exited before ready" : m.error;
+            if (!stop_) {
+                start_err_ = m.error.empty() ? "Ornith GPU engine stopped unexpectedly" : m.error;
                 failed_ = true;
                 cv_ready_.notify_all();
             }
@@ -7255,14 +7278,16 @@ public:
                   const GenerationParams& params,
                   const TokenCallback& on_token) override {
         std::unique_lock<std::mutex> lk(mu_);
-        if (stop_ || failed_ || !ready_) return;
+        if (failed_) throw guard::RunFailure(start_err_);
+        if (stop_ || !ready_) throw guard::RunFailure("Ornith GPU engine is not running");
         req_prompt_ = prompt_tokens;
         req_max_tokens_ = params.max_tokens > 0 ? params.max_tokens : 64;
         req_cb_ = on_token;
         req_done_ = false;
         has_req_ = true;
         cv_req_.notify_one();
-        cv_done_.wait(lk, [this] { return req_done_ || stop_; });
+        cv_done_.wait(lk, [this] { return req_done_ || stop_ || failed_; });
+        if (failed_) throw guard::RunFailure(start_err_);
     }
 
 private:
