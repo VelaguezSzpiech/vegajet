@@ -34,7 +34,7 @@ TP=2 requires exactly two selected cards and allocates only on them. Startup pri
 | P-* | Model-file validation: bad GGUF/tokenizer/template data → clear error, no crash. Expert tensor shapes checked before load (P-M3). | Real model loads as before. |
 | PD2 | Serve: bounded async SSE writer (`VEGAJET_V12_ASYNC_OUT=0` = old inline writer). | Slow reader (`curl --limit-rate 8k`): same bytes; client kill stops generation; `/metrics in_flight` → 0. |
 | PD3 | Serve: HTTP 400 for sampling params the greedy engine cannot honor. | `"temperature":0.7` → 400; `"temperature":0` → 200. |
-| S-* | Server hardening (`AUDIT-server.md`, `fix S-*` commits). | Normal API use unchanged. |
+| S-* | Server: 413 for >1 MiB or >65,536-node JSON; 503 + reserved /health /metrics slots at the connection limit; full response to half-closed clients; cancelled = 499; unknown model 404; `--max-tokens-cap`, 400 `context_length_exceeded`; optional `--api-key`/`VEGAJET_API_KEY`; CORS only with `--cors-origin`. | Normal API use unchanged; check the startup banner. |
 
 ## Toggles, default OFF (`=1` turns on)
 | ID | Env | Path | What | Risk / note |
