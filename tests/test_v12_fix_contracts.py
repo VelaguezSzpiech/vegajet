@@ -6,6 +6,12 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class FixContracts(unittest.TestCase):
+    def test_dense_persist_cannot_be_silent_noop(self):
+        src = (ROOT / 'models/ornith/ornith_gpu.cpp').read_text()
+        self.assertIn('if (use_m1_super && v12_dense_persist())', src)
+        self.assertIn('++dense_persist_launches;', src)
+        self.assertIn('D13 requested but no persistent GEMV launched', src)
+
     def test_split_attention_checked_before_launch(self):
         src = (ROOT / 'models/ornith/ornith_gpu.cpp').read_text()
         for dims in ('M, n_q_local', '1u, 16u', 'M, 16u'):
