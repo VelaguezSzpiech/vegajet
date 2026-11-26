@@ -83,6 +83,11 @@ uint32_t v12_dense_wgs() {
     }();
     return wgs;
 }
+// v1.2 D6: column-thread M=1 GDN ConvRec (no LDS partials between pred/o reductions). Default off.
+bool v12_gdn_splitv() {
+    static const bool on = [] { const char* e = std::getenv("VEGAJET_V12_GDN_SPLITV"); return e != nullptr && e[0] == '1'; }();
+    return on;
+}
 
 struct Q8WeightDev {
     uint64_t qs_va = 0;
@@ -286,6 +291,7 @@ struct KernelTable {
     const kfd::LoadedKernel* gdn_recur = nullptr;
     const kfd::LoadedKernel* gdn_recur_sv = nullptr;
     const kfd::LoadedKernel* gdn_conv_recur_sv = nullptr;
+    const kfd::LoadedKernel* gdn_conv_recur_ct = nullptr; // v1.2 D6 column-thread variant (VEGAJET_V12_GDN_SPLITV)
     const kfd::LoadedKernel* gdn_wy = nullptr;
     const kfd::LoadedKernel* attn_prep = nullptr;
     const kfd::LoadedKernel* attn_flash = nullptr;
@@ -907,6 +913,9 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             K[g].gdn_recur    = need_k("ornith_gdn_recur_quant_kernel");
             K[g].gdn_recur_sv = need_k("ornith_gdn_recur_splitv_quant_kernel");
             K[g].gdn_conv_recur_sv = need_k("ornith_gdn_conv_recur_splitv_quant_m1_kernel");
+            if (v12_gdn_splitv()) {
+                K[g].gdn_conv_recur_ct = need_k("ornith_gdn_conv_recur_colthread_quant_m1_kernel");
+            }
             K[g].gdn_wy       = need_k("ornith_gdn_wy_prefill_quant_kernel");
             K[g].attn_prep    = need_k("ornith_attn_qkv_prep_kernel");
             K[g].attn_flash   = need_k("ornith_attn_flash_quant_kernel");
@@ -2571,7 +2580,10 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                             8u, 32u, 6144u, 10304u, 6144u, 10240u, 10272u,
                             c_in_slot, c_out_slot, s_rhead, (!opt.spec_gdn && use_ring) ? 1u : 0u, gdn_sense, eps
                         };
-                        VJ_CHECK(rt.enqueue_kernel(g, *K[g].gdn_conv_recur_sv, 128u * 256u, 1, 1, 256, 1, 1, &crka, sizeof(crka), true));
+                        // v1.2 D6: VEGAJET_V12_GDN_SPLITV=1 swaps in the column-thread variant (same args, same math).
+                        const kfd::LoadedKernel* const cr_k =
+                            (K[g].gdn_conv_recur_ct != nullptr) ? K[g].gdn_conv_recur_ct : K[g].gdn_conv_recur_sv;
+                        VJ_CHECK(rt.enqueue_kernel(g, *cr_k, 128u * 256u, 1, 1, 256, 1, 1, &crka, sizeof(crka), true));
                         st_mark(kStGdnRecur, static_cast<int>(g));
                     } else {
                     struct ConvL2KA {
