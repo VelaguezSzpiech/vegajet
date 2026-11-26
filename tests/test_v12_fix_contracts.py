@@ -6,6 +6,13 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class FixContracts(unittest.TestCase):
+    def test_unused_super_objects_are_isolated(self):
+        src = (ROOT / 'core/kfd_runtime.cpp').read_text()
+        optional = src[src.index('const char* optional[]'):src.index('for (const char* f : optional)')]
+        self.assertNotIn('vj_ornith_super_vol.hsaco', optional)
+        self.assertNotIn('vj_ornith_super_iq2sreg.hsaco', optional)
+        self.assertIn('if (variant.object && !load_code_object(', src)
+
     def test_dense_persist_cannot_be_silent_noop(self):
         src = (ROOT / 'models/ornith/ornith_gpu.cpp').read_text()
         self.assertIn('if (use_m1_super && v12_dense_persist())', src)

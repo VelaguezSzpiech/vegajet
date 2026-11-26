@@ -2,6 +2,7 @@
 #include "core/kfd_runtime.hpp"
 #include "core/gpu_select.hpp"
 #include "core/hsaco_gate.hpp"
+#include "core/v12_modules.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -1008,8 +1009,7 @@ bool Runtime::load_hsaco_dir(const std::string& hsaco_dir, std::string* err) {
         "vj_spec_gdn.hsaco",
         "vj_dflash2.hsaco",
         "vj_ornith_super.hsaco",
-        "vj_ornith_super_vol.hsaco",
-        "vj_ornith_super_iq2sreg.hsaco",
+
     };
     for (const char* f : optional) {
         const fs::path p = fs::path(dir) / f;
@@ -1018,6 +1018,14 @@ bool Runtime::load_hsaco_dir(const std::string& hsaco_dir, std::string* err) {
             if (!load_code_object(p.string(), err)) return false;
         }
     }
+    const char* vol = std::getenv("VEGAJET_V12_BARRIER_VOL");
+    const char* iq2s = std::getenv("VEGAJET_V12_IQ2S_REG");
+    const auto variant = select_super_variant(vol && vol[0] == '1', iq2s && iq2s[0] == '1');
+    if (!variant.valid) {
+        if (err) *err = "BARRIER_VOL and IQ2S_REG are mutually exclusive";
+        return false;
+    }
+    if (variant.object && !load_code_object((fs::path(dir) / variant.object).string(), err)) return false;
     const char* asym = std::getenv("VEGAJET_V12_ASYM_EXPERTS");
     if (asym && std::strcmp(asym, "1") == 0) {
         if (!load_code_object((fs::path(dir) / "vj_moe_asym.hsaco").string(), err)) return false;
