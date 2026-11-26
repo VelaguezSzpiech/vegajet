@@ -7,6 +7,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <limits>
+#include <stdexcept>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -71,6 +72,9 @@ struct GgufReader {
     const uint8_t* p = nullptr;
     const uint8_t* end = nullptr;
     bool ok = true;
+    std::string why;  // set when a count/shape is refused, so the caller can name the problem
+
+    uint64_t remaining() const { return ok ? static_cast<uint64_t>(end - p) : 0; }
 
     template <typename T>
     T read() {
@@ -286,6 +290,31 @@ bool BpeTokenizer::load_from_gguf(const std::string& gguf_path, std::string* err
     int32_t bos = -1, eos = -1, pad = -1, unk = -1;
     bool add_bos = false;
 
+    // Bytes each array element must occupy at minimum; strings carry an 8-byte length prefix.
+    auto elem_min_bytes = [](uint32_t vt) -> uint64_t {
+        switch (vt) {
+            case 0: case 1: case 7: return 1;
+            case 2: case 3: return 2;
+            case 4: case 5: case 6: return 4;
+            case 8: return 8;
+            case 10: case 11: case 12: return 8;
+            default: return 1;
+        }
+    };
+    // A file-declared element count must fit the bytes actually left before it may drive a reserve().
+    constexpr uint64_t kMaxArrayCount = 1ull << 24;
+    auto count_ok = [&](const char* what, uint64_t cnt, uint32_t et) {
+        if (cnt > kMaxArrayCount || cnt > rd.remaining() / elem_min_bytes(et)) {
+            rd.why = std::string("implausible ") + what + " count " + std::to_string(cnt) +
+                     " for " + std::to_string(rd.remaining()) + " metadata bytes left";
+            rd.ok = false;
+            return false;
+        }
+        return true;
+    };
+
+    std::string kv_error;
+    try {
     for (uint64_t k = 0; k < n_kv && rd.ok; ++k) {
         std::string key = rd.read_str();
         uint32_t vt = rd.read<uint32_t>();
@@ -298,6 +327,7 @@ bool BpeTokenizer::load_from_gguf(const std::string& gguf_path, std::string* err
         } else if (key == "tokenizer.ggml.tokens" && vt == 9u) {
             uint32_t et = rd.read<uint32_t>();
             uint64_t cnt = rd.read<uint64_t>();
+            if (!rd.ok || !count_ok("tokenizer.ggml.tokens", cnt, et)) break;
             if (et == 8u) {
                 tokens.reserve(static_cast<size_t>(cnt));
                 for (uint64_t i = 0; i < cnt && rd.ok; ++i) tokens.push_back(rd.read_str());
@@ -307,6 +337,7 @@ bool BpeTokenizer::load_from_gguf(const std::string& gguf_path, std::string* err
         } else if (key == "tokenizer.ggml.merges" && vt == 9u) {
             uint32_t et = rd.read<uint32_t>();
             uint64_t cnt = rd.read<uint64_t>();
+            if (!rd.ok || !count_ok("tokenizer.ggml.merges", cnt, et)) break;
             if (et == 8u) {
                 merges.reserve(static_cast<size_t>(cnt));
                 for (uint64_t i = 0; i < cnt && rd.ok; ++i) merges.push_back(rd.read_str());
@@ -316,6 +347,7 @@ bool BpeTokenizer::load_from_gguf(const std::string& gguf_path, std::string* err
         } else if (key == "tokenizer.ggml.token_type" && vt == 9u) {
             uint32_t et = rd.read<uint32_t>();
             uint64_t cnt = rd.read<uint64_t>();
+            if (!rd.ok || !count_ok("tokenizer.ggml.token_type", cnt, et)) break;
             token_types.reserve(static_cast<size_t>(cnt));
             for (uint64_t i = 0; i < cnt && rd.ok; ++i) {
                 token_types.push_back(static_cast<int32_t>(rd.read_int_scalar(et)));
@@ -334,12 +366,21 @@ bool BpeTokenizer::load_from_gguf(const std::string& gguf_path, std::string* err
             rd.skip_val(vt);
         }
     }
+    } catch (const std::exception& e) {
+        // reserve()/push_back() can still fail on an allocation error: report it, never abort.
+        kv_error = std::string("tokenizer metadata rejected: ") + e.what();
+        rd.ok = false;
+    }
 
     munmap(base, static_cast<size_t>(st.st_size));
     close(fd);
 
     if (!rd.ok) {
-        if (err_out) *err_out = "Truncated or malformed GGUF KV section in " + gguf_path;
+        if (err_out) {
+            if (!kv_error.empty()) *err_out = kv_error;
+            else if (!rd.why.empty()) *err_out = rd.why + " in " + gguf_path;
+            else *err_out = "Truncated or malformed GGUF KV section in " + gguf_path;
+        }
         return false;
     }
     if (tokens.empty()) {
