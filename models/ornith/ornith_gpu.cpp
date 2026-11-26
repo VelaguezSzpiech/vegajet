@@ -4281,6 +4281,11 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
     };
 
     // Execute the full benchmark body (including raw, Suffix, MTP, DFlash2+Hyb, pp512/pp2048) as a reusable lambda!
+    // v1.2 C5: a speculative/MTP/DFlash driver that disagrees with the raw greedy reference must fail the
+    // run (non-zero exit) instead of only printing a lossless= counter next to a tok/s number.
+    bool bench_spec_mismatch = false;
+    std::string bench_spec_mismatch_msg;
+
     auto run_full_bench_body = [&](bool include_prefill, warm::SweepVariantResult* vout) -> bool {
         uint64_t ue0 = 0, de0 = 0, ue1 = 0, de1 = 0;
         read_ecc_totals(ue0, de0);
@@ -4289,6 +4294,18 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         uint32_t spec_eq = 0, spec_tot = 0;
         int spec_fd = -1;
         bool all_lossless = true;
+        // eq = matching prefix tokens, n_ref = raw reference length, n_got = driver output length.
+        auto validate_spec = [&](const char* what, size_t eq, size_t n_ref, size_t n_got, int first_diff) {
+            if (eq == n_ref && n_got == n_ref) return;
+            all_lossless = false;
+            if (bench_spec_mismatch) return;
+            bench_spec_mismatch = true;
+            bench_spec_mismatch_msg = std::string("speculative validation failed: ") + what + " matched " +
+                                      std::to_string(eq) + "/" + std::to_string(n_ref) +
+                                      " greedy tokens vs the raw reference (got " + std::to_string(n_got) +
+                                      " tokens, first_diff=" + std::to_string(first_diff) + ")";
+            std::fprintf(stderr, "[BENCH-VALIDATE] FAIL %s\n", bench_spec_mismatch_msg.c_str());
+        };
         {
         std::printf("\n=== ORNITH-122B LIVE 2x MI50 BENCHMARK SUITE ===\n");
         const std::vector<int32_t> p_base = {760, 6511, 314, 9338, 369};
@@ -4688,6 +4705,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             }
             res.suffix_exact_matches = eq;
             res.suffix_total_tokens  = static_cast<uint32_t>(raw128.size());
+            validate_spec("tg128 suffix-tree draft", eq, raw128.size(), suf128.size(), first_diff);
             std::printf("[BENCH tg128 Suffix ] %.2f tok/s (%.2fx vs raw) | lossless=%u/%u (first_diff=%d) | hits=%llu acc=%llu/%llu | 0 B VRAM\n",
                         res.tg128_suffix_tps, res.tg128_suffix_tps / std::max(res.tg128_raw_tps, 1e-6),
                         eq, res.suffix_total_tokens, first_diff,
@@ -4711,6 +4729,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             for (size_t i = 0; i < raw_prose.size() && i < mtp_prose.size(); ++i) {
                 if (raw_prose[i] == mtp_prose[i]) ++eqp; else if (fdp == -1) fdp = static_cast<int>(i);
             }
+            validate_spec("tg128 MTP (pure nextn) prose", eqp, raw_prose.size(), mtp_prose.size(), fdp);
             std::printf("[BENCH tg128 MTP K=%u] %.2f tok/s (%.2fx vs raw %.2f) | prose lossless=%u/%zu (first_diff=%d) | acc=%llu/%llu (%.1f%%)\n",
                         opt.mtp_k, mtp_prose_tps, mtp_prose_tps / std::max(raw_prose_tps, 1e-6), raw_prose_tps,
                         eqp, raw_prose.size(), fdp,
@@ -4725,6 +4744,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             for (size_t i = 0; i < raw128.size() && i < hyb128.size(); ++i) {
                 if (raw128[i] == hyb128[i]) ++eqh; else if (fdh == -1) fdh = static_cast<int>(i);
             }
+            validate_spec("tg128 MTP+suffix hybrid code", eqh, raw128.size(), hyb128.size(), fdh);
             std::printf("[BENCH tg128 Hybrid ] %.2f tok/s (%.2fx vs raw) | code lossless=%u/%zu (first_diff=%d) | sfx_hits=%llu acc=%llu/%llu (%.1f%%)\n",
                         hyb128_tps, hyb128_tps / std::max(res.tg128_raw_tps, 1e-6),
                         eqh, raw128.size(), fdh,
@@ -5156,7 +5176,9 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                         static_cast<unsigned long long>(hacc), static_cast<unsigned long long>(hdr),
                         hdr ? (100.0 * hacc / hdr) : 0.0);
             if (df_hyb_tps > best_spec_tps) { best_spec_tps = df_hyb_tps; spec_eq = eqh; spec_tot = static_cast<uint32_t>(raw128.size()); spec_fd = fdh; }
-            if (eqp != raw_prose.size() || eqc != raw128.size() || eqh != raw128.size()) all_lossless = false;
+            validate_spec("tg128 DFlash2 code", eqc, raw128.size(), df_code.size(), fdc);
+            validate_spec("tg128 DFlash2+hybrid code", eqh, raw128.size(), df_hyb.size(), fdh);
+            if (eqp != raw_prose.size()) all_lossless = false;
 
             read_hwmon_max(pass_pwr, pass_tmem);
             max_pwr = std::max(max_pwr, pass_pwr); max_tmem = std::max(max_tmem, pass_tmem);
@@ -5454,6 +5476,8 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
     }
     if (!telem_ok) { res.error = "power/thermal telemetry gate failed (see [TELEM])"; return res; }
     device_fault_check("run end");   // catches a fault from a dispatch queued outside step_batch
+    // v1.2 C5: a speculative/MTP mismatch in --bench is a hard failure, not a metric.
+    if (bench_spec_mismatch) { res.error = bench_spec_mismatch_msg; return res; }
     // v1.2 C1: a fail-closed device fault is never reported as a clean run, even if the caller kept going.
     if (device_faulted) return res;
     res.ok = true;
