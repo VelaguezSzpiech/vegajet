@@ -79,6 +79,7 @@ add_library(vegajet_core STATIC
     core/dflash_host.cpp
     core/ssm_state.cpp
     core/spec_engine.cpp
+    core/spec_tree.cpp
     core/grid_planner.cpp
     core/launch_planner.cpp
     core/sampler.cpp
@@ -285,6 +286,8 @@ vj_test(test_tokenizer_samplers)
 # Its 248K-vocabulary latency gate (< 150 us per token) must not share the CPU with other tests.
 set_tests_properties(test_tokenizer_samplers PROPERTIES RUN_SERIAL TRUE)
 vj_test(test_spec_engine)
+vj_test(test_spec_tree)
+target_link_libraries(test_spec_tree PRIVATE vegajet_models)
 vj_test(test_fr_spec)
 vj_test(test_spec_policy)
 vj_test(test_spec_governor)
