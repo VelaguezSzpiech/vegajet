@@ -247,7 +247,7 @@ bool Runtime::execute_plan(const ops::StepPlan&, const OpBinderFn&, bool, Execut
 }
 void Runtime::reset_allreduce_mailboxes() {}
 bool Runtime::alloc_userptr_pinned(uint64_t, KfdBuffer&, bool) { return false; }
-void Runtime::free_buffer(KfdBuffer&) {}
+bool Runtime::free_buffer(KfdBuffer&) { return true; }
 bool Runtime::enqueue_kernel(size_t, const LoadedKernel&, uint32_t, uint32_t, uint32_t,
                              uint32_t, uint32_t, uint32_t, const void*, size_t, bool, uint32_t) { return false; }
 bool Runtime::submit_batch(size_t) { return false; }
@@ -626,25 +626,49 @@ bool Runtime::alloc_userptr_pinned(uint64_t size, KfdBuffer& out, bool map_all_g
     return true;
 }
 
-bool Runtime::map_to_gpus(const KfdBuffer& buf, const std::vector<uint32_t>& gpu_ids) {
-    if (gpu_ids.empty()) return true;
+bool Runtime::map_to_gpus(KfdBuffer& buf, const std::vector<uint32_t>& gpu_ids) {
+    std::vector<uint32_t> targets;
+    for (uint32_t id : gpu_ids) {
+        if (std::find(buf.mapped_gpu_ids.begin(), buf.mapped_gpu_ids.end(), id) == buf.mapped_gpu_ids.end())
+            targets.push_back(id);
+    }
+    if (targets.empty()) return true;
     kfd_ioctl_map_memory_to_gpu_args margs{};
     margs.handle               = buf.handle;
-    margs.device_ids_array_ptr = reinterpret_cast<uint64_t>(gpu_ids.data());
-    margs.n_devices            = static_cast<uint32_t>(gpu_ids.size());
-    return kfd_ioctl(kfd_fd_, AMDKFD_IOC_MAP_MEMORY_TO_GPU, &margs) == 0 && margs.n_success == margs.n_devices;
+    margs.device_ids_array_ptr = reinterpret_cast<uint64_t>(targets.data());
+    margs.n_devices            = static_cast<uint32_t>(targets.size());
+    const int rc = kfd_ioctl(kfd_fd_, AMDKFD_IOC_MAP_MEMORY_TO_GPU, &margs);
+    const size_t done = std::min<size_t>(margs.n_success, targets.size());
+    buf.mapped_gpu_ids.insert(buf.mapped_gpu_ids.end(), targets.begin(), targets.begin() + done);
+    if (rc == 0 && margs.n_success == margs.n_devices) return true;
+    std::fprintf(stderr, "[vegajet::kfd] MAP handle=%llu failed (%u/%u GPUs): %s\n",
+                 static_cast<unsigned long long>(buf.handle), margs.n_success, margs.n_devices, std::strerror(errno));
+    return false;
 }
 
-void Runtime::free_buffer(KfdBuffer& buf) {
-    if (buf.handle != 0 && kfd_fd_ >= 0) {
-        kfd_ioctl_unmap_memory_from_gpu_args uargs{};
-        uargs.handle               = buf.handle;
-        uargs.device_ids_array_ptr = reinterpret_cast<uint64_t>(all_gpu_ids_.data());
-        uargs.n_devices            = static_cast<uint32_t>(all_gpu_ids_.size());
-        (void) kfd_ioctl(kfd_fd_, AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU, &uargs);
+bool Runtime::free_buffer(KfdBuffer& buf) {
+    auto retain = [&](const char* op) {
+        retained_buffers_[buf.handle] = buf;
+        std::fprintf(stderr, "[vegajet::kfd] %s handle=%llu failed; retaining BO and host storage: %s\n",
+                     op, static_cast<unsigned long long>(buf.handle), std::strerror(errno));
+        return false;
+    };
+    if (buf.handle != 0) {
+        if (kfd_fd_ < 0) return retain("cleanup without KFD fd");
+        if (!buf.mapped_gpu_ids.empty()) {
+            kfd_ioctl_unmap_memory_from_gpu_args uargs{};
+            uargs.handle               = buf.handle;
+            uargs.device_ids_array_ptr = reinterpret_cast<uint64_t>(buf.mapped_gpu_ids.data());
+            uargs.n_devices            = static_cast<uint32_t>(buf.mapped_gpu_ids.size());
+            const int rc = kfd_ioctl(kfd_fd_, AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU, &uargs);
+            const size_t done = std::min<size_t>(uargs.n_success, buf.mapped_gpu_ids.size());
+            buf.mapped_gpu_ids.erase(buf.mapped_gpu_ids.begin(), buf.mapped_gpu_ids.begin() + done);
+            if (rc != 0 || uargs.n_success != uargs.n_devices) return retain("UNMAP");
+        }
         kfd_ioctl_free_memory_of_gpu_args fargs{};
         fargs.handle = buf.handle;
-        (void) kfd_ioctl(kfd_fd_, AMDKFD_IOC_FREE_MEMORY_OF_GPU, &fargs);
+        if (kfd_ioctl(kfd_fd_, AMDKFD_IOC_FREE_MEMORY_OF_GPU, &fargs) != 0) return retain("FREE");
+        retained_buffers_.erase(buf.handle);
     }
     if (buf.host_ptr) {
         if (buf.is_hugetlb) munmap(buf.host_ptr, buf.size);
@@ -652,6 +676,7 @@ void Runtime::free_buffer(KfdBuffer& buf) {
         else munmap(buf.host_ptr, buf.size);
     }
     buf = KfdBuffer{};
+    return true;
 }
 
 bool Runtime::create_aql_queue(size_t gpu_idx) {
@@ -833,6 +858,17 @@ void Runtime::shutdown() {
         if (a.slab.handle) free_buffer(a.slab);
     }
     vram_arenas_.clear();
+    const auto retry = retained_buffers_;
+    for (const auto& entry : retry) {
+        KfdBuffer b = entry.second;
+        free_buffer(b);
+    }
+    if (!retained_buffers_.empty()) {
+        std::fprintf(stderr, "[vegajet::kfd] shutdown incomplete: %zu BOs retained; KFD fd kept open\n",
+                     retained_buffers_.size());
+        open_ = false;
+        return;
+    }
     for (auto& g : devices_) {
         if (g.drm_fd >= 0) { ::close(g.drm_fd); g.drm_fd = -1; }
     }
@@ -938,7 +974,13 @@ bool Runtime::reload_hsaco(const std::string& module_name, std::string* err) {
     if (existing) {
         for (size_t g = 0; g < ng; ++g) {
             for (const auto& old_kn : existing->kernel_names) kernels_[g].erase(old_kn);
-            if (g < existing->code_buffers.size()) free_buffer(existing->code_buffers[g]);
+            if (g < existing->code_buffers.size() && !free_buffer(existing->code_buffers[g])) {
+                for (auto& cb : staged_bufs) free_buffer(cb);
+                if (err) *err = "Hot-reload cleanup failed; runtime stopped";
+                abort_dispatches();
+                open_ = false;
+                return false;
+            }
         }
         existing->code_buffers = std::move(staged_bufs);
         existing->kernel_names = std::move(new_names);
