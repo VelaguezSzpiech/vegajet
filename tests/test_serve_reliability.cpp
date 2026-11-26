@@ -317,13 +317,58 @@ void test_b2_connection_limit() {
     srv.stop();
 }
 
+// ------------------------------------------------------------------------------------------------ S-M1
+// A client that half-closes after its request (legal HTTP) used to get 0 bytes for a non-stream request and a
+// truncated SSE stream: POLLRDHUP alone was taken as "gone".
+void test_m1_half_close() {
+    MockGen gen;
+    ServerOptions opt;
+    opt.port = 0;
+    opt.model_id = "m";
+    OpenAiServer srv(opt, [&](const GenerateRequest& r, const TokenSink& s) { return gen(r, s); });
+    std::string err;
+    VJ_CHECK(srv.start(&err));
+
+    {  // non-stream: the full JSON body arrives
+        const std::string body = chat_body("m", "hi");
+        const int fd = connect_local(srv.port());
+        VJ_CHECK(fd >= 0);
+        send_str(fd, chat_head(static_cast<int>(body.size()), true) + body);
+        VJ_CHECK(::shutdown(fd, SHUT_WR) == 0);
+        Resp r;
+        std::string buf;
+        VJ_CHECK(read_resp(fd, r, buf));
+        VJ_CHECK(r.status == 200);
+        VJ_CHECK(r.body.find("Hello world") != std::string::npos);
+        ::close(fd);
+    }
+    {  // stream: every chunk and the terminator arrive
+        const std::string body = chat_body("m", "hi", ",\"stream\":true");
+        const int fd = connect_local(srv.port());
+        VJ_CHECK(fd >= 0);
+        send_str(fd, chat_head(static_cast<int>(body.size()), true) + body);
+        VJ_CHECK(::shutdown(fd, SHUT_WR) == 0);
+        Resp r;
+        std::string buf;
+        VJ_CHECK(read_resp(fd, r, buf));
+        VJ_CHECK(r.status == 200);
+        VJ_CHECK(r.body.find("data: [DONE]") != std::string::npos);
+        for (const auto& p : kPieces) VJ_CHECK(r.body.find(p) != std::string::npos);
+        ::close(fd);
+    }
+    srv.stop();
+    VJ_CHECK(srv.stats().cancelled == 0);  // a half-close is not a cancellation
+}
+
 }  // namespace
 
 int main() {
     test_b1_json_limits();
     test_b1_server_survives();
     test_b2_connection_limit();
-    std::printf("test_serve_reliability: S-B1 bounded JSON parse, S-B2 connection limit 503 + health reserve\n");
+    test_m1_half_close();
+    std::printf("test_serve_reliability: S-B1 bounded JSON parse, S-B2 connection limit 503 + health reserve,\n"
+                "                        S-M1 half-closed client gets the full response\n");
     std::printf("PASS\n");
     return 0;
 }
