@@ -270,6 +270,7 @@ vj_test(test_parser_ornith_nextn)
 vj_test(test_parser_ornith_div0)
 vj_test(test_parser_tok_count)
 vj_test(test_parser_tok_nested)
+vj_test(test_parser_tpl_depth)
 vj_test(test_quant_repacker)
 # Keep synthetic fixture rounding identical to the golden inputs on FMA-capable hosts.
 target_compile_options(test_quant_repacker PRIVATE -ffp-contract=off)
