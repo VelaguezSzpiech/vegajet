@@ -16,6 +16,8 @@ std::vector<int> dispatch_cpus(const std::vector<std::string>& bdfs, const std::
                                std::string* why, const std::string& sysfs_root = "/sys");
 // Parse a Linux cpulist ("0-3,8,10-11"); empty on malformed input.
 std::vector<int> parse_cpulist(const std::string& s);
+// Clock values (MHz) of the lines marked active ('*') in pp_dpm_sclk / pp_dpm_mclk text ("1: 1725Mhz *").
+std::vector<double> parse_active_dpm_mhz(const std::string& text);
 // Applies dispatch_cpus() to the calling thread (sched_setaffinity, unprivileged). Returns the pinned set.
 std::vector<int> pin_dispatch_thread(const std::vector<std::string>& bdfs);
 }

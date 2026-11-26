@@ -59,6 +59,9 @@ int main() {
     VJ_CHECK(!has(w, "relaxed_ordering") && !has(w, "max_payload"));
     // Dispatch placement: cpulist parsing, UMA no-op, shared node, mixed nodes, explicit override.
     VJ_CHECK((vegajet::hw_preflight::parse_cpulist("0-2,5, 7") == std::vector<int>{0, 1, 2, 5, 7}));
+    VJ_CHECK((vegajet::hw_preflight::parse_active_dpm_mhz("0: 925Mhz\n1: 1725Mhz *\n0: 350Mhz *\n2: 800MHz\n") ==
+              std::vector<double>{1725.0, 350.0}));
+    VJ_CHECK(vegajet::hw_preflight::parse_active_dpm_mhz("S: 19Mhz\nno star here\n").empty());
     VJ_CHECK(vegajet::hw_preflight::parse_cpulist("3-1").empty() && vegajet::hw_preflight::parse_cpulist("x").empty());
     std::string why;
     fs::create_directories(r / "devices/system/node/node1");

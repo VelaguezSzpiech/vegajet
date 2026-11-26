@@ -10,11 +10,11 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
-#include <regex>
 #include <set>
 #include <sstream>
 #include <sched.h>
 
+#include <cctype>
 namespace fs = std::filesystem;
 namespace vegajet::hw_preflight {
 namespace {
@@ -99,10 +99,10 @@ std::vector<Warning> run(const std::vector<std::string>& bdfs, const std::string
         const std::string force = read_text(real / "power_dpm_force_performance_level");
         const std::string dpm = read_text(real / "pp_dpm_sclk") + read_text(real / "pp_dpm_mclk");
         if (force.find("high") != std::string::npos && !dpm.empty()) {
-            const std::regex active(R"(([0-9]+(?:\.[0-9]+)?)\s*MHz[^\n]*\*)");
-            for (std::sregex_iterator i(dpm.begin(), dpm.end(), active), e; i != e; ++i)
-                if (number((*i)[1].str()) <= 859.0) {
-                    warn(b, "dpm_clock", "performance level 'high' but an active DPM clock is " + (*i)[1].str() + " MHz");
+            for (const double mhz : parse_active_dpm_mhz(dpm))
+                if (mhz <= 859.0) {
+                    std::ostringstream v; v << mhz;
+                    warn(b, "dpm_clock", "performance level 'high' but an active DPM clock is " + v.str() + " MHz");
                     break;
                 }
         }
@@ -122,6 +122,28 @@ std::vector<Warning> run(const std::vector<std::string>& bdfs, const std::string
         }
         if (dies.size() > 1)
             warn("host", "numa", "single NUMA node exposed but " + std::to_string(dies.size()) + " CPU dies / L3 domains (UMA interleave)");
+    }
+    return out;
+}
+
+std::vector<double> parse_active_dpm_mhz(const std::string& text) {
+    // Manual parse (no <regex>: GCC 13 -O3 + sanitizers report -Wmaybe-uninitialized inside libstdc++ regex).
+    // amdgpu prints "Mhz"; accept any case of "mhz".
+    std::vector<double> out;
+    std::istringstream in(text);
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.find('*') == std::string::npos) continue;
+        std::string low(line);
+        for (char& c : low) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        const size_t m = low.find("mhz");
+        if (m == std::string::npos) continue;
+        size_t end = m;
+        while (end > 0 && line[end - 1] == ' ') --end;
+        size_t beg = end;
+        while (beg > 0 && (std::isdigit(static_cast<unsigned char>(line[beg - 1])) || line[beg - 1] == '.')) --beg;
+        if (beg == end) continue;
+        out.push_back(std::strtod(line.substr(beg, end - beg).c_str(), nullptr));
     }
     return out;
 }
