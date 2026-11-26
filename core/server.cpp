@@ -267,6 +267,15 @@ int parse_body_bounded(std::string_view body, size_t max_nodes, json::Value& out
     return 400;
 }
 
+// Rough prompt size in tokens from the message bytes (>= 4 bytes per token for English and code, so this is a lower
+// bound). It rejects a prompt that cannot fit before any encoding work; the engine adapter repeats the check with the
+// exact token count once the prompt is encoded (S-M4).
+uint32_t estimate_prompt_tokens(const GenerateRequest& r) {
+    size_t bytes = 0;
+    for (const auto& m : r.messages) bytes += m.content.size() + m.role.size() + 8;
+    return static_cast<uint32_t>(bytes / 4 + 8);
+}
+
 std::string fmt_num(double v) {
     char b[64];
     std::snprintf(b, sizeof(b), "%.3f", v);
@@ -683,6 +692,19 @@ struct OpenAiServer::Impl {
                      "model_not_found");
                 return;
             }
+            // S-M4: bound the request to the context before any encoding work. A prompt that cannot fit is a clear
+            // 400; max_tokens is then capped to what is left, so one request cannot hold a queue slot indefinitely.
+            if (opt.context_length) {
+                const uint32_t est = estimate_prompt_tokens(job.req);
+                if (est >= opt.context_length) {
+                    fail(400, "prompt is about " + std::to_string(est) + " tokens, longer than the context length of " +
+                                  std::to_string(opt.context_length) + " (code: context_length_exceeded)",
+                         {}, "context_length_exceeded");
+                    return;
+                }
+                const int32_t room = static_cast<int32_t>(opt.context_length - est);
+                if (job.req.max_tokens > room) job.req.max_tokens = room;
+            }
             {
                 std::lock_guard<std::mutex> lk(mu);
                 if (in_flight >= opt.max_queue || stopping) {
@@ -1069,15 +1091,20 @@ struct OpenAiServer::Impl {
         if (gone || stopping) {
             ++n_cancelled;
         } else if (!res.error.empty()) {
-            ++n_errors;
+            // A 400 (e.g. context_length_exceeded, S-M4) is a client error, not a server failure.
+            const int status = res.http_status ? res.http_status : 500;
+            if (status < 500) ++n_rejected; else ++n_errors;
             if (stream) {
-                pump.push(anth ? enc.error("api_error", res.error)
-                               : "data: " + error_json(res.error, "server_error") + "\n\ndata: [DONE]\n\n");
+                pump.push(anth ? enc.error(anthropic::error_type(status), res.error)
+                               : "data: " + error_json(res.error, status < 500 ? "invalid_request_error" : "server_error") +
+                                     "\n\ndata: [DONE]\n\n");
             } else {
                 keep_alive = job.keep_alive;
-                pump.push(anth ? http_response(500, "application/json",
-                                               anthropic::error_json("api_error", res.error), keep_alive)
-                               : error_response(500, res.error, keep_alive));
+                pump.push(anth ? http_response(status, "application/json",
+                                               anthropic::error_json(anthropic::error_type(status), res.error), keep_alive)
+                               : (status == 503 ? error_response(503, res.error, keep_alive, "Retry-After: 1\r\n")
+                                                : error_response(status, res.error, keep_alive,
+                                                                 {}, status == 400 ? "context_length_exceeded" : "")));
             }
         } else {
             FinishReason fr = sm.stopped() ? FinishReason::Stop : hit_length ? FinishReason::Length : res.finish;

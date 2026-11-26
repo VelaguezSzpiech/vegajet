@@ -239,6 +239,7 @@ selection and `--tp`, then exits 3 naming the architecture (a CPU-only build say
 | `--reasoning-format F` | `auto` (split `<think>` into `reasoning_content`) or `none`. |
 | `--request-log FILE` | Append one JSON line per request (`ts`, `id`, `status`, `finish`, token counts, `ttft_ms`, `tpot_ms`, `e2e_ms`, `cancelled`); never prompt or reply text. File created 0600. |
 | `--metrics-hw` | Add read-only GPU sysfs telemetry to `GET /metrics`: edge / junction / memory temperature, power, RAS UE / CE counts of umc, sdma, gfx, mmhub, pcie_bif, hdp. |
+| `--max-tokens-cap N` | Cap a request's `max_tokens`, 1..1048576 (default: the `--ctx` context length). `max_tokens` is further capped to what the prompt leaves free, and a prompt that does not fit the context answers 400 `context_length_exceeded` (the tokenizer gives the exact count; a request body above 1 MiB answers 413). |
 
 `GET /metrics` (always on) serves the Prometheus text format: request / failure / cancellation and token counters,
 TTFT, TPOT and end-to-end histograms, active batch and queue gauges, prefix-cache and MoE LRU hit rates,

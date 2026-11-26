@@ -44,6 +44,9 @@ struct ServeConfig {
     std::string hsaco_dir;
     std::string request_log;      // --request-log: JSONL record per request (no prompt / completion text)
     bool metrics_hw = false;      // --metrics-hw: GPU sysfs telemetry (read-only) in GET /metrics
+    int32_t max_tokens_cap = 0;   // --max-tokens-cap: cap on "max_tokens" (0: the context length, --ctx)
+    std::string api_key;          // --api-key / VEGAJET_API_KEY: bearer key required for /v1/* when set
+    std::string cors_origin;      // --cors-origin: the one origin allowed by CORS (empty: no CORS headers)
     bool help = false;
 };
 
