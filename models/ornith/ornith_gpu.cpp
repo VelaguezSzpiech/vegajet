@@ -3975,7 +3975,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             struct EhCatKA { uint64_t eqs, eds, toks, hin, wen, whn, cq, cds; uint32_t M, D; float eps; };
             EhCatKA ecka{emb_w[g].qs_va, emb_w[g].ds_va, io_toks_va, S[g].mtp_h_cur_va, ml.enorm_va, ml.hnorm_va,
                          S[g].mtp_cat_q8_va, S[g].mtp_cat_ds_va, M, D, eps};
-            VJ_CHECK(rt.enqueue_kernel(g, *K[g].mtp_eh_cat, 256u, M, 1, 256, 1, 1, &ecka, sizeof(ecka), true));
+            VJ_CHECK(rt.enqueue_kernel(g, *K[g].mtp_eh_cat, dispatch::eh_grid_x(M), 1, 1, 256, 1, 1, &ecka, sizeof(ecka), true));
             enq_q4_mN(g, ml.w_eh_proj, S[g].mtp_cat_q8_va, S[g].mtp_cat_ds_va, S[g].mtp_h_cur_va, true);
 
             struct RmsKA { uint64_t h, xa, w, xn, xq, xd; uint32_t M, D; float eps; };
