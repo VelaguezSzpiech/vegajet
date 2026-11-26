@@ -57,9 +57,12 @@ void print_serve_usage(std::FILE* f) {
                  "  common: [--host 127.0.0.1] [--port 8080] [--model-id NAME] [--max-queue 16]\n"
                  "          [--chat-format auto|chatml|qwen25|qwen3|ornith] [--enable-thinking] [--reasoning-format auto|none]\n"
                  "          [--request-log FILE] [--metrics-hw] [--max-tokens-cap N]\n"
+                 "          [--api-key KEY] [--cors-origin ORIGIN]\n"
                  "  --gpu       GPUs this process may use (positions in `vegajet serve --gpu list`); overrides VJ_GPU_DEVICES\n"
                  "  --slots     concurrent sequences (continuous batching; needs an engine with a batch path, e.g. --mock)\n"
                  "  --max-tokens-cap  cap on a request's max_tokens (default: the --ctx context length)\n"
+                 "  --api-key   require this bearer key on every endpoint except /health and /metrics (also VEGAJET_API_KEY)\n"
+                 "  --cors-origin  the one origin allowed by CORS (default: no CORS headers at all)\n"
                  "  --request-log  append one JSON line per request (timings, token counts; never prompt text)\n"
                  "  --metrics-hw   add read-only GPU sysfs telemetry (temperatures, power, RAS ECC) to GET /metrics\n"
                  "  Exit codes: 0 ok, 1 model/tokenizer/request-log unreadable, 2 usage error, 3 engine unavailable or bind failure.\n");
@@ -91,6 +94,11 @@ int parse_serve_args(const std::vector<std::string>& args, ServeConfig& c, std::
         else if (a == "--hsaco-dir") { if (!value(c.hsaco_dir)) return fail("--hsaco-dir needs a directory"); }
         else if (a == "--request-log") { if (!value(c.request_log) || c.request_log.empty()) return fail("--request-log needs a file"); }
         else if (a == "--metrics-hw") c.metrics_hw = true;
+        else if (a == "--api-key") { if (!value(c.api_key) || c.api_key.empty()) return fail("--api-key needs a key"); }
+        else if (a == "--cors-origin") {
+            if (!value(c.cors_origin) || c.cors_origin.empty() || c.cors_origin == "*")
+                return fail("--cors-origin needs one origin (never *)");
+        }
         else if (a == "--max-tokens-cap") {
             if (!value(v) || !parse_uint(v, 1, 1u << 20, n)) return fail("--max-tokens-cap takes 1..1048576");
             c.max_tokens_cap = static_cast<int32_t>(n);
@@ -242,6 +250,13 @@ int run_serve(const std::vector<std::string>& args, const gpusel::Selection& gpu
     // S-M4: bound a single request's max_tokens. Default: the context length, so one stream cannot hold a queue slot
     // far beyond what the model can produce; --max-tokens-cap lowers it further.
     so.max_tokens_cap = c.max_tokens_cap > 0 ? c.max_tokens_cap : static_cast<int32_t>(c.ctx);
+    // S-M5: an API key is optional; --api-key wins over VEGAJET_API_KEY. When set it must actually be checked, and the
+    // startup banner says so (before, it printed a key that nothing enforced).
+    if (c.api_key.empty()) {
+        if (const char* k = std::getenv("VEGAJET_API_KEY"); k && *k) c.api_key = k;
+    }
+    so.api_key = c.api_key;
+    so.cors_origin = c.cors_origin;
     so.parse_reasoning = c.parse_reasoning;
     so.workers = c.slots;
     std::unique_ptr<sched::ServeLoop> loop;
@@ -307,11 +322,17 @@ int run_serve(const std::vector<std::string>& args, const gpusel::Selection& gpu
                 static_cast<unsigned>(srv.port()), so.model_id.c_str(),
                 c.mock ? (loop ? "mock+scheduler" : "mock") : handle.description.c_str(), static_cast<unsigned>(so.workers),
                 gpusel::canonical(gpus).c_str());
-    std::printf("[vegajet]   OpenAI API:    BASE_URL=http://%s:%u/v1  MODEL=%s  API_KEY=vegajet-local\n"
+    // The banner names the key only when one is enforced, and the secret itself is never printed (S-M5).
+    const std::string auth = so.api_key.empty() ? "none (no key required; local bind only)"
+                                                : "API key required (Authorization header)";
+    const std::string cors = so.cors_origin.empty() ? "disabled" : so.cors_origin;
+    std::printf("[vegajet]   OpenAI API:    BASE_URL=http://%s:%u/v1  MODEL=%s\n"
                 "[vegajet]   Anthropic API: ANTHROPIC_BASE_URL=http://%s:%u  MODEL=%s\n"
+                "[vegajet]   Auth:          %s\n"
+                "[vegajet]   CORS:          %s\n"
                 "[vegajet]   Endpoints:     GET /health  GET /v1/models  POST /v1/chat/completions  POST /v1/messages  GET /metrics\n",
                 so.host.c_str(), static_cast<unsigned>(srv.port()), so.model_id.c_str(),
-                so.host.c_str(), static_cast<unsigned>(srv.port()), so.model_id.c_str());
+                so.host.c_str(), static_cast<unsigned>(srv.port()), so.model_id.c_str(), auth.c_str(), cors.c_str());
     std::fflush(stdout);
     srv.wait();
     g_server = nullptr;

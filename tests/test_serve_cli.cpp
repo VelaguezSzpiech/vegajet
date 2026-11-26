@@ -51,6 +51,9 @@ int main() {
     // S-M4: the max_tokens cap is a real flag (0 or a bad value is a usage error).
     VJ_CHECK(parse({"--mock", "--max-tokens-cap", "512"}, c) == 0 && c.max_tokens_cap == 512);
     VJ_CHECK(parse({"--mock", "--max-tokens-cap", "1048576"}, c) == 0 && c.max_tokens_cap == 1048576);
+    // S-M5: an optional API key and one explicit CORS origin (a wildcard is refused).
+    VJ_CHECK(parse({"--mock", "--api-key", "k-123", "--cors-origin", "https://app.example"}, c) == 0 &&
+             c.api_key == "k-123" && c.cors_origin == "https://app.example");
     const std::vector<std::vector<std::string>> bad = {
         {},                              // neither a model nor --mock
         {"--mock", "m-model"},            // both
@@ -60,6 +63,7 @@ int main() {
         {"m", "--tp", "0"}, {"m", "--ctx", "10"}, {"m", "--chat-format", "llama"}, {"m", "--reasoning-format", "raw"},
         {"m", "--max-queue", "0"}, {"m", "--bogus"}, {"m", "--host"},
         {"m", "--max-tokens-cap", "0"}, {"m", "--max-tokens-cap", "x"}, {"m", "--max-tokens-cap"},
+        {"m", "--api-key"}, {"m", "--cors-origin"}, {"m", "--cors-origin", "*"},
     };
     for (const auto& b : bad) VJ_CHECK(parse(b, c) == 2);
     // ---- engine registry

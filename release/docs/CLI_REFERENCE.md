@@ -240,6 +240,8 @@ selection and `--tp`, then exits 3 naming the architecture (a CPU-only build say
 | `--request-log FILE` | Append one JSON line per request (`ts`, `id`, `status`, `finish`, token counts, `ttft_ms`, `tpot_ms`, `e2e_ms`, `cancelled`); never prompt or reply text. File created 0600. |
 | `--metrics-hw` | Add read-only GPU sysfs telemetry to `GET /metrics`: edge / junction / memory temperature, power, RAS UE / CE counts of umc, sdma, gfx, mmhub, pcie_bif, hdp. |
 | `--max-tokens-cap N` | Cap a request's `max_tokens`, 1..1048576 (default: the `--ctx` context length). `max_tokens` is further capped to what the prompt leaves free, and a prompt that does not fit the context answers 400 `context_length_exceeded` (the tokenizer gives the exact count; a request body above 1 MiB answers 413). |
+| `--api-key` VALUE | Require this value on every endpoint except `GET /health` and `GET /metrics`: the `Authorization` header (`Bearer` scheme) or `x-api-key`, compared in constant time. Default: no authentication (also `VEGAJET_API_KEY`; the flag wins). The startup banner states which of the two is in effect. |
+| `--cors-origin ORIGIN` | Send `Access-Control-Allow-Origin: ORIGIN` (one origin, never `*`) and answer `OPTIONS` preflights. Default: no CORS headers (an unconfigured server allows no cross-origin caller). |
 
 `GET /metrics` (always on) serves the Prometheus text format: request / failure / cancellation and token counters,
 TTFT, TPOT and end-to-end histograms, active batch and queue gauges, prefix-cache and MoE LRU hit rates,
@@ -337,6 +339,7 @@ Exit codes: 0 ok (end of input or `/quit`), 1 server unreachable (`GET /health` 
 | `VEGAJET_RAW_ONLY` | Ornith GPU bench | `1`: raw M=1 only; skips the MTP head and uses the smaller raw-only VRAM budget for DOT8 promotion. |
 | `VEGAJET_V12_SERVE_SPEC` | `vegajet serve` (Ornith GPU engine) | `1`: serve through the suffix-tree speculative driver (`tg128 Suffix` verify path, greedy-lossless) and keep `VEGAJET_RAW_ONLY` off; unset or `0`: plain greedy M=1 serving. Default off. |
 | `VEGAJET_V12_ASYNC_OUT` | server worker (all engines) | SSE/JSON token bytes go through a bounded queue drained by a writer thread, so socket writes stay off the generation thread. On by default in v1.2; `0` restores the inline writer. |
+| `VEGAJET_API_KEY` | `vegajet serve` | Bearer key required on every endpoint except `GET /health` and `GET /metrics` (same as `--api-key`, which wins). Unset: no authentication, which is why the default bind is 127.0.0.1. |
 | `VEGAJET_GU_DOT8_LAYERS` | Ornith GPU bench | Number of Gate+Up layers to promote to DOT8 (overrides the automatic choice; `0` = automatic). |
 | `VEGAJET_GU_Q3` | Ornith GPU bench | `1` (any value > 0): routed Gate+Up as lossless 3-bit VJ_Q3_IQ2S in place on all 48 layers. Off by default. |
 | `VEGAJET_V12_NARROW_VERIFY` | Ornith GPU bench | `1`: v1.2 S4, the M=2..16 verify batches use the narrow multi-column Q4A8 GEMV (`ornith_gemv_q4a8_mn_kernel`, one weight pass for all draft rows) instead of the m8/m12/m16 GEMMs. Off by default. |

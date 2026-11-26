@@ -98,6 +98,11 @@ struct ServerOptions {
     size_t max_json_nodes = 65536;      // JSON values accepted per request body; beyond this 413
     size_t max_queue = 16;              // queued + running generations
     size_t max_connections = 256;
+    // S-M5: optional bearer / x-api-key for every endpoint except /health and /metrics. Empty: no authentication
+    // (the default is a loopback bind, which is why the default is off).
+    std::string api_key;
+    // S-M5: the single origin sent in Access-Control-Allow-Origin. Empty: no CORS headers at all, never "*".
+    std::string cors_origin;
     // Sockets kept open above max_connections for /health and /metrics only (so monitoring stays reachable when the
     // connection pool is full), plus a few that only receive the 503 for their request instead of a bare RST.
     size_t reserve_connections = 2;

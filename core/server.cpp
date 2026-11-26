@@ -120,6 +120,19 @@ std::string lower(std::string s) {
     return s;
 }
 
+// Compares two tokens without exiting early on a mismatch, so the response time does not reveal how much of the API
+// key matched (S-M5). Different lengths are handled by comparing against zero padding, not by an early return.
+bool constant_time_eq(std::string_view a, std::string_view b) {
+    const size_t n = a.size() > b.size() ? a.size() : b.size();
+    unsigned char diff = a.size() == b.size() ? 0 : 1;
+    for (size_t i = 0; i < n; ++i) {
+        const unsigned char x = i < a.size() ? static_cast<unsigned char>(a[i]) : 0;
+        const unsigned char y = i < b.size() ? static_cast<unsigned char>(b[i]) : 0;
+        diff |= static_cast<unsigned char>(x ^ y);
+    }
+    return diff == 0;
+}
+
 std::string trim(const std::string& s) {
     const size_t b = s.find_first_not_of(" \t");
     if (b == std::string::npos) return {};
@@ -223,8 +236,7 @@ std::string http_response(int status, std::string_view ctype, std::string_view b
     if (!ctype.empty()) h += "Content-Type: " + std::string(ctype) + "\r\n";
     h += "Content-Length: " + std::to_string(body.size()) + "\r\n";
     h += keep_alive ? "Connection: keep-alive\r\n" : "Connection: close\r\n";
-    h += "Access-Control-Allow-Origin: *\r\n";
-    h += extra;
+    h += extra;  // the caller adds the CORS header only when ServerOptions::cors_origin is set (S-M5)
     h += "\r\n";
     h.append(body.data(), body.size());
     return h;
@@ -566,7 +578,7 @@ struct OpenAiServer::Impl {
             }
             if (p.status == Parse::Error) {
                 c.in.clear();
-                respond(fd, error_response(p.err_status, p.err_msg, false), false);
+                respond(fd, reply_err(p.err_status, p.err_msg, false), false);
                 return;
             }
             c.in.erase(0, p.consumed);
@@ -576,13 +588,41 @@ struct OpenAiServer::Impl {
             try {
                 route(fd, req, c.lane);
             } catch (const std::bad_alloc&) {
-                respond_if_idle(fd, error_response(503, "server out of memory while building the response", false), false);
+                respond_if_idle(fd, reply_err(503, "server out of memory while building the response", false), false);
             } catch (const std::exception& e) {
-                respond_if_idle(fd, error_response(500, e.what(), false), false);
+                respond_if_idle(fd, reply_err(500, e.what(), false), false);
             } catch (...) {
-                respond_if_idle(fd, error_response(500, "internal server error", false), false);
+                respond_if_idle(fd, reply_err(500, "internal server error", false), false);
             }
         }
+    }
+
+    // "Authorization: Bearer <key>" or "x-api-key: <key>", compared in constant time (S-M5).
+    bool authorized(const HttpRequest& req) const {
+        std::string given;
+        for (const auto& h : req.headers) {
+            if (h.first == "authorization") {
+                if (h.second.size() > 7 && lower(h.second.substr(0, 7)) == "bearer ") given = h.second.substr(7);
+                else if (!h.second.empty() && h.second.rfind("Bearer", 0) != 0) given = h.second;  // bare key
+            } else if (h.first == "x-api-key") {
+                given = h.second;
+            }
+        }
+        return !given.empty() && constant_time_eq(given, opt.api_key);
+    }
+
+    // CORS headers are sent only for the one origin the operator configured (S-M5); the default is none at all.
+    std::string cors_extra(const std::string& extra = {}) const {
+        if (opt.cors_origin.empty()) return extra;
+        return "Access-Control-Allow-Origin: " + opt.cors_origin + "\r\nVary: Origin\r\n" + extra;
+    }
+    std::string reply(int status, std::string_view ctype, std::string_view body, bool ka,
+                      const std::string& extra = {}) const {
+        return http_response(status, ctype, body, ka, cors_extra(extra));
+    }
+    std::string reply_err(int status, std::string_view msg, bool ka, const std::string& extra = {},
+                          std::string_view code = {}) const {
+        return error_response(status, msg, ka, cors_extra(extra), code);
     }
 
     // A route() that already handed the socket to a worker must not also write to it.
@@ -597,35 +637,49 @@ struct OpenAiServer::Impl {
         if (lane == Lane::Reject) {
             // The pool is full: say so instead of dropping the socket (S-B2).
             ++n_rejected;
-            respond(fd, error_response(503, "server busy: connection limit reached", false, "Retry-After: 1\r\n"), false);
+            respond(fd, reply_err(503, "server busy: connection limit reached", false, "Retry-After: 1\r\n"), false);
             return;
         }
         if (lane == Lane::Reserve && path != "/health" && path != "/metrics") {
             ++n_rejected;
-            respond(fd, error_response(503, "server busy: connection limit reached", false, "Retry-After: 1\r\n"), false);
+            respond(fd, reply_err(503, "server busy: connection limit reached", false, "Retry-After: 1\r\n"), false);
             return;
         }
         if (req.method == "OPTIONS") {
-            respond(fd, http_response(204, "", "", ka,
-                                      "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-                                      "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"),
-                    ka);
+            // Always answer the method query; the Access-Control-* headers only when an origin is configured, so an
+            // unconfigured server allows no cross-origin caller at all (S-M5).
+            const std::string allow = opt.cors_origin.empty()
+                                          ? std::string("Allow: GET, POST, OPTIONS\r\n")
+                                          : std::string("Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+                                                        "Access-Control-Allow-Headers: Content-Type, Authorization, x-api-key\r\n");
+            respond(fd, reply(204, "", "", ka, allow), ka);
             return;
+        }
+        // S-M5: with ServerOptions::api_key set, every endpoint except /health and /metrics needs it (monitoring and
+        // the load balancer stay unauthenticated, as with the OpenAI API's own /health).
+        if (!opt.api_key.empty() && path != "/health" && path != "/metrics") {
+            if (!authorized(req)) {
+                ++n_rejected;
+                respond(fd, reply_err(401, "invalid or missing API key", false, "WWW-Authenticate: Bearer\r\n",
+                                      "invalid_api_key"),
+                        false);
+                return;
+            }
         }
         if (path == "/metrics" && opt.metrics_text) {
             if (req.method != "GET" && req.method != "HEAD") {
-                respond(fd, error_response(405, "method not allowed", ka, "Allow: GET\r\n"), ka);
+                respond(fd, reply_err(405, "method not allowed", ka, "Allow: GET\r\n"), ka);
                 return;
             }
             const std::string body = opt.metrics_text();
-            std::string resp = http_response(200, "text/plain; version=0.0.4; charset=utf-8", body, ka);
+            std::string resp = reply(200, "text/plain; version=0.0.4; charset=utf-8", body, ka);
             if (req.method == "HEAD") resp.resize(resp.size() - body.size());
             respond(fd, std::move(resp), ka);
             return;
         }
         if (path == "/health" || path == "/v1/models") {
             if (req.method != "GET" && req.method != "HEAD") {
-                respond(fd, error_response(405, "method not allowed", ka, "Allow: GET\r\n"), ka);
+                respond(fd, reply_err(405, "method not allowed", ka, "Allow: GET\r\n"), ka);
                 return;
             }
             std::string body;
@@ -640,7 +694,7 @@ struct OpenAiServer::Impl {
                 if (opt.context_length) body += ",\"context_length\":" + std::to_string(opt.context_length);
                 body += "}]}";
             }
-            std::string resp = http_response(200, "application/json", body, ka);
+            std::string resp = reply(200, "application/json", body, ka);
             if (req.method == "HEAD") resp.resize(resp.size() - body.size());
             respond(fd, std::move(resp), ka);
             return;
@@ -650,9 +704,9 @@ struct OpenAiServer::Impl {
             auto fail = [&](int status, const std::string& msg, const std::string& extra = {},
                             std::string_view code = {}) {
                 respond(fd,
-                        anth ? http_response(status, "application/json",
+                        anth ? reply(status, "application/json",
                                              anthropic::error_json(anthropic::error_type(status), msg), ka, extra)
-                             : error_response(status, msg, ka, extra, code),
+                             : reply_err(status, msg, ka, extra, code),
                         ka);
             };
             if (req.method != "POST") {
@@ -724,7 +778,7 @@ struct OpenAiServer::Impl {
             cv.notify_one();
             return;
         }
-        respond(fd, error_response(404, "not found", ka), ka);
+        respond(fd, reply_err(404, "not found", ka), ka);
     }
 
     void on_readable(int fd) {
@@ -959,7 +1013,7 @@ struct OpenAiServer::Impl {
     // stall (S-B1). Answer 500 only if nothing was written yet.
     void job_failed(const Job& job, bool released, bool posted, const char* msg) {
         if (!posted) {
-            if (!released) send_blocking(job.fd, error_response(500, msg, false));
+            if (!released) send_blocking(job.fd, reply_err(500, msg, false));
             std::lock_guard<std::mutex> lk(mu);
             if (!released) --in_flight;
             done.push_back({job.fd, false});
@@ -996,7 +1050,7 @@ struct OpenAiServer::Impl {
         if (stream) {
             const std::string head =
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n"
-                "Connection: close\r\nAccess-Control-Allow-Origin: *\r\nX-Accel-Buffering: no\r\n\r\n";
+                "Connection: close\r\n" + cors_extra("X-Accel-Buffering: no\r\n") + "\r\n";
             gone = !pump.push(head + (anth ? enc.start()
                                            : chunk("{\"role\":\"assistant\",\"content\":\"\"}", nullptr, true)));
         }
@@ -1100,10 +1154,10 @@ struct OpenAiServer::Impl {
                                      "\n\ndata: [DONE]\n\n");
             } else {
                 keep_alive = job.keep_alive;
-                pump.push(anth ? http_response(status, "application/json",
+                pump.push(anth ? reply(status, "application/json",
                                                anthropic::error_json(anthropic::error_type(status), res.error), keep_alive)
-                               : (status == 503 ? error_response(503, res.error, keep_alive, "Retry-After: 1\r\n")
-                                                : error_response(status, res.error, keep_alive,
+                               : (status == 503 ? reply_err(503, res.error, keep_alive, "Retry-After: 1\r\n")
+                                                : reply_err(status, res.error, keep_alive,
                                                                  {}, status == 400 ? "context_length_exceeded" : "")));
             }
         } else {
@@ -1132,7 +1186,7 @@ struct OpenAiServer::Impl {
             } else if (anth) {
                 keep_alive = job.keep_alive;
                 const std::string body = anthropic::response_json("msg_" + id.substr(9), rq.model, msg, areason, aseq, au);
-                if (!pump.push(http_response(200, "application/json", body, keep_alive))) keep_alive = false;
+                if (!pump.push(reply(200, "application/json", body, keep_alive))) keep_alive = false;
             } else if (stream) {
                 ++n_streamed;
                 std::string tail = chunk("{}", finish_reason_name(fr), true);
@@ -1163,7 +1217,7 @@ struct OpenAiServer::Impl {
                     ",\"choices\":[{\"index\":0,\"message\":" + message +
                     ",\"finish_reason\":" + json::quote(finish_reason_name(fr)) + "}],\"usage\":" + usage +
                     ",\"timings\":" + timings + "}";
-                if (!pump.push(http_response(200, "application/json", body, keep_alive))) keep_alive = false;
+                if (!pump.push(reply(200, "application/json", body, keep_alive))) keep_alive = false;
             }
         }
         pump.finish();  // flush queued SSE bytes before the socket goes back to the I/O thread
