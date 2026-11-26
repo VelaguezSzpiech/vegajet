@@ -6,6 +6,8 @@
 #include "tests/test_common.hpp"
 #include "tests/live_hsaco_fixture.hpp"
 #include <fcntl.h>
+#include <filesystem>
+#include <fstream>
 #include <cerrno>
 #include <cstdarg>
 #include <cstdio>
@@ -137,6 +139,29 @@ struct RuntimeTestAccess {
         VJ_CHECK(q.kernarg_slot == 0 && args == before_fail && !rt.open_);
         q = KfdAqlQueue{};
     }
+    static void exact_tp_selection() {
+        namespace fs = std::filesystem;
+        const auto root = fs::path(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : ".") /
+                          ("runtime-topology-" + std::to_string(getpid()));
+        for (unsigned i=0; i<3; ++i) {
+            const auto dir = root / "sys/class/kfd/kfd/topology/nodes" / std::to_string(i);
+            fs::create_directories(dir);
+            std::ofstream(dir / "properties") << "gfx_target_version 90006\ndomain 0\nlocation_id " << ((3+64*i)<<8) << "\n";
+            std::ofstream(dir / "gpu_id") << i+1;
+        }
+        setenv("VJ_SYSFS_ROOT",root.c_str(),1);
+        unsetenv("VJ_GPU_DEVICES");
+        Runtime rt;
+        std::string err;
+        VJ_CHECK(!rt.init(0,0,&err,2) && err.find("exactly 2") != std::string::npos);
+        VJ_CHECK(rt.kfd_fd_ == -1 && rt.queues_.empty() && rt.vram_arenas_.empty() && rt.all_gpu_ids_.empty());
+        VJ_CHECK(rt.devices_.size() == 3);
+        setenv("VJ_GPU_DEVICES","0000:03:00.0",1);
+        VJ_CHECK(!rt.init(0,0,&err,2) && err.find("found 1") != std::string::npos);
+        VJ_CHECK(rt.kfd_fd_ == -1 && rt.devices_.size() == 1 && rt.devices_[0].gpu_id == 1);
+        unsetenv("VJ_SYSFS_ROOT"); unsetenv("VJ_GPU_DEVICES");
+        fs::remove_all(root);
+    }
     static void reload_failure() {
         Runtime rt;
         rt.open_ = true;
@@ -182,5 +207,6 @@ int main() {
     vegajet::kfd::RuntimeTestAccess::mapping_ownership();
     vegajet::kfd::RuntimeTestAccess::completion_lifecycle();
     vegajet::kfd::RuntimeTestAccess::kernarg_ownership();
+    vegajet::kfd::RuntimeTestAccess::exact_tp_selection();
     std::puts("runtime fail-closed tests PASS");
 }

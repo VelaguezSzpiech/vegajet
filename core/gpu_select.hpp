@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 // Per-process GPU selection: `--gpu <spec>` on the command line or VJ_GPU_DEVICES in the environment.
 //
-// A spec is "all" (or empty), one index "1", a list "0,2", a range "1-2", or a mix "0,2-3". Indices are positions
-// in the gfx906 enumeration: KFD topology nodes with gfx_target_version 90006, ordered by PCI location_id. That is
+// A spec is "all", ordinals/ranges ("0,2-3"), or full PCI BDFs ("0000:03:00.0,0000:43:00.0"). Indices are positions
+// in the gfx906 enumeration: KFD topology nodes with gfx_target_version 90006, ordered by PCI domain then location_id. That is
 // exactly the order of kfd::Runtime::scan_gfx906_topology(), so index 0 is the same card in `vegajet --gpu list`,
 // `vegajet doctor` and the runtime. --gpu wins over VJ_GPU_DEVICES, which wins over "all".
 //
@@ -26,10 +26,13 @@ constexpr uint32_t kMaxIndex = 63;
 
 struct Selection {
     bool all = true;
-    std::vector<uint32_t> indices;  // ascending, unique; empty when `all`
+    std::vector<uint32_t> indices;  // ascending, unique; empty for BDFs/all
+    std::vector<std::string> bdfs;  // full canonical identities, in requested TP-rank order
     std::string source = "default"; // "default", "--gpu" or "VJ_GPU_DEVICES"
 };
 
+std::string bdf(uint32_t pci_domain, uint32_t location_id);
+bool parse_bdf(const std::string& text, std::string& canonical_bdf);
 bool parse(const std::string& spec, Selection& out, std::string* err);
 // flag: the --gpu value (nullptr when the flag was not given); env_value: getenv(kEnvVar) (may be nullptr).
 bool resolve(const std::string* flag, const char* env_value, Selection& out, std::string* err);
@@ -37,10 +40,18 @@ std::string canonical(const Selection& s);  // "all" or "0,2,3"
 // Positions picked out of n devices. False (err set) when an index is >= n.
 bool pick(const Selection& s, size_t n, std::vector<size_t>& out, std::string* err);
 
+bool pick_bdfs(const Selection& s, const std::vector<std::string>& identities, std::vector<size_t>& out, std::string* err);
+template <class T>
+bool pick_devices(const Selection& s, const std::vector<T>& devs, std::vector<size_t>& out, std::string* err) {
+    if (s.bdfs.empty()) return pick(s, devs.size(), out, err);
+    std::vector<std::string> ids;
+    for (const auto& d : devs) ids.push_back(bdf(d.pci_domain, d.location_id));
+    return pick_bdfs(s, ids, out, err);
+}
 template <class T>
 bool filter(std::vector<T>& devs, const Selection& s, std::string* err) {
     std::vector<size_t> idx;
-    if (!pick(s, devs.size(), idx, err)) return false;
+    if (!pick_devices(s, devs, idx, err)) return false;
     std::vector<T> out;
     out.reserve(idx.size());
     for (size_t i : idx) out.push_back(devs[i]);
@@ -66,6 +77,7 @@ struct Device {
     uint32_t index = 0;  // position in the enumeration
     uint32_t node_id = 0, gpu_id = 0, location_id = 0, drm_render_minor = 0, simd_count = 0;
     uint64_t vram_bytes = 0;
+    uint32_t pci_domain = 0;
 };
 
 // Read-only scan of <root>/sys/class/kfd/kfd/topology/nodes, same filter and order as the KFD runtime.

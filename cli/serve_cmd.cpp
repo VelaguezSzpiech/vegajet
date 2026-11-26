@@ -195,11 +195,11 @@ int run_serve(const std::vector<std::string>& args, const gpusel::Selection& gpu
     } else {
         const std::vector<gpusel::Device> devs = gpusel::scan_topology(gpusel::sysfs_root());
         std::vector<size_t> picked;
-        if (!devs.empty() && !gpusel::pick(gpus, devs.size(), picked, &err)) {
+        if (!devs.empty() && !gpusel::pick_devices(gpus, devs, picked, &err)) {
             std::fprintf(stderr, "[vegajet] %s\n", err.c_str());
             return 2;
         }
-        const uint32_t n_sel = devs.empty() ? static_cast<uint32_t>(gpus.all ? 0 : gpus.indices.size())
+        const uint32_t n_sel = devs.empty() ? static_cast<uint32_t>(gpus.all ? 0 : gpus.indices.size() + gpus.bdfs.size())
                                             : static_cast<uint32_t>(picked.size());
         if (c.tp == 0) c.tp = std::max<uint32_t>(1, n_sel);
         if (n_sel && c.tp != n_sel) {
