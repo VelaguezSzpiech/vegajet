@@ -17,25 +17,31 @@ ornith_embed_q8_kernel tiled
 ornith_rms_quant_q8_kernel tiled
 ornith_p2p_ar_res_rms_quant_kernel tiled
 ornith_p2p_ar_res_rms_quant_prepush_kernel tiled
+ornith_p2p_ar_n_fp16_kernel tiled
 ornith_gemv_q4a8_m1_w32_kernel stream
+ornith_gemv_q4a8_m1_w32_stag_kernel stream
 ornith_gemv_q4a8_m1_w16_kernel stream
-ornith_gemm_q4a8_tcc_kernel tiled 73
+ornith_gemm_q4a8_tcc_kernel tiled
 ornith_gemm_q4a8_m8_kernel tiled
 ornith_gemm_q4a8_m12_kernel tiled
 ornith_gemm_q4a8_m16_l2_kernel tiled
 ornith_gdn_conv_l2_gate_kernel tiled
 ornith_gdn_recur_quant_kernel tiled
-ornith_gdn_wy_prefill_quant_kernel tiled 70
+ornith_gdn_wy_prefill_quant_kernel tiled 65
 ornith_attn_qkv_prep_kernel tiled
 ornith_attn_flash_quant_kernel tiled
 ornith_attn_prep_flash_m1_kernel tiled
 ornith_moe_router_fp16_logits_kernel tiled
 ornith_moe_router_top8_kernel tiled
+vj_moe_top8_acceptmoe_kernel tiled
+vj_moe_top8_acceptmoe_plain_kernel tiled
+ornith_ring_router_super_order_kernel stream
+ornith_ring_top8_super_order_kernel tiled
 ornith_swiglu_quant_q8_kernel tiled
 ornith_moe_gu_iq2s_merged_kernel stream 55
 ornith_moe_down_iq3xxs_split_kernel stream
 ornith_moe_group_sort_kernel tiled
-ornith_moe_gu_iq2s_grouped_kernel tiled 81
+ornith_moe_gu_iq2s_grouped_kernel tiled
 ornith_moe_down_iq3xxs_grouped_kernel tiled
 ornith_vocab_argmax_q8_kernel stream
 ornith_vocab_logits_q8_kernel stream
@@ -54,7 +60,7 @@ vj_gemm_q8_dp4a_tiled_kernel tiled
 vj_gemm_q4_dot8_tiled_kernel tiled
 vj_vocab_q8_dp4a_argmax_kernel stream 63
 vj_vocab_q8_dp4a_argmax_batch_kernel stream 63
-vj_gemm_q8_dp4a_tiled_64x32_kernel tiled 77
+vj_gemm_q8_dp4a_tiled_64x32_kernel tiled
 vj_gemm_q8_dp4a_tiled_32x32x128_splitk_kernel tiled
 vj_gemm_f16_fdot2_tiled_kernel tiled
 vj_gemv_q8_dp4a_splitk_p1_kernel stream
@@ -73,9 +79,16 @@ ornith_moe_m1_router_shared_kernel tiled
 ornith_p2p_ar_moe_m1_front_kernel tiled
 ornith_p2p_ar_moe_m1_front_s240_kernel tiled
 ornith_moe_m1_rtr_shgu_kernel stream
+ornith_moe_router_shgu_s240_kernel stream
+ornith_moe_router_shgu_s240_reduce_kernel tiled
 ornith_moe_m1_top8_swiglu_kernel tiled
 ornith_gdn_recur_splitv_quant_kernel stream
 ornith_gdn_conv_recur_splitv_quant_m1_kernel tiled
+# A2 Split-V=8 GDN ConvRec: two ordered dispatches (recurrence -> publish, then RMS/quant from
+# sq_scratch). No inter-WG sync remains, so no co-residency requirement exists; `stream` (<=48)
+# is kept as an occupancy/latency gate, not as a correctness condition.
+ornith_gdn_conv_recur_splitv8_recur_m1_kernel stream
+ornith_gdn_conv_recur_splitv8_quant_m1_kernel stream
 ornith_moe_m1_back_kernel tiled
 ornith_moe_m1_back_s224_kernel tiled
 ornith_moe_m1_back_s240_kernel tiled
@@ -92,13 +105,27 @@ vj_flash_splitkv_any_partial_kernel stream
 vj_flash_splitkv_any_merge_quant_kernel stream
 vj_spec_gdn_verify_kernel stream
 vj_spec_gdn_norm_quant_kernel stream
+# Sealed GDN tree-WY verify/commit pair (ops/kernels/vj_gdn_treewy_verify.hiph, built with
+# -fno-unroll-loops; 26/18 VGPR, 0 B private under TheRock 7.12). No waiver.
+vj_gdn_treewy_verify_kernel tiled
+vj_gdn_treewy_commit_kernel stream
+# Sealed GDN production-input packer (ops/kernels/vj_gdn_wire_pack.hip): a value-preserving
+# strided copy, no arithmetic. No waiver.
+vj_gdn_wire_pack_kernel tiled
 vj_moe_down_dot8_kernel stream
+vj_moe_down_dot8_sub32_kernel stream
 vj_moe_down_dot8_prepush_kernel stream
 vj_moe_gu_dot8_kernel stream
 vj_moe_gu_dot8_cached_kernel stream
 vj_moe_gu_q3_kernel stream
 vj_repack_iq2s_to_dot8_gu_kernel stream
 vj_moe_gu_dot8_lru_kernel tiled
+# Sealed hot-expert cache refill + hit set (ops/kernels/vj_moe_lru_refill_dot8.hiph), a separate cache
+# payload from vj_moe_dot8.hip. One-layer parity against the pristine IQ decode for both hit kinds:
+# tests/test_moe_lru_sealed_hit_parity.cpp. No waiver: 23/31/33 VGPR, 0 B private under TheRock 7.12.
+vj_moe_lru_refill_dot8 stream
+vj_moe_lru_hit_dot4 stream
+vj_moe_lru_hit_dot8 stream
 ornith_p2p_ar_res_rms_quant_ts_kernel tiled
 ornith_p2p_ar_res_rms_quant_ref_kernel tiled
 vj_moe_route_group_kernel tiled
@@ -112,6 +139,7 @@ vj_prefill_gqa_fa2 tiled
 vj_prefill_gemm_q4a8_64x128_kernel tiled
 vj_prefill_gemm_q4a8_64x64_kernel tiled
 vj_prefill_moe_gu_iq2s_tiled_kernel tiled
+vj_prefill_moe_gu_dot8_tiled_kernel tiled
 vj_prefill_gdn_splitv_batch_kernel tiled
 vj_prefill_gdn_conv_l2_gate_kernel tiled
 vj_prefill_gdn_normq_kernel tiled
@@ -119,10 +147,15 @@ vj_prefill_gdn_wy_split_kernel tiled
 vj_prefill_gdn_128wg tiled
 vj_prefill_gdn_128wg_normq tiled
 vj_prefill_moe_down_iq3_tiled_kernel tiled
+vj_prefill_moe_gu_iq2s_lds32x64_kernel tiled
+vj_prefill_moe_down_iq3_lds32x64_kernel tiled
+vj_prefill_moe_gu_iq2s_lds64x64_kernel tiled
+vj_prefill_moe_down_iq3_lds64x64_kernel tiled
 vj_moe_down_combine_all_f32_kernel stream
 vj_prefill_router_fp16_tiled_kernel tiled
 ornith_vocab_argmax_q8_mubuf_kernel stream
 vj_prefill_q8_to_q4_kernel stream
+vj_prefill_q8_to_q4_fwht64_kernel stream
 vj_prefill_gemm_q4a4_64x128_dot8_kernel tiled
 vj_prefill_gemm_q4a4_64x64_dot8_kernel tiled
 vj_prefill_moe_gu_iq2s_dot8_kernel tiled
@@ -131,6 +164,11 @@ ornith_m1_gdn_super_kernel tiled
 ornith_m1_gqa_super_kernel tiled
 ornith_m1_moe_super_kernel tiled
 ornith_m1_moe_super_q3_kernel tiled
+# vj_ornith_super_x.hsaco: opt-in AR tile tags / DN_K4 build of the same super-kernels (-DVJ_SUPER_EXT=1)
+ornith_m1_gdn_super_kernel_x tiled
+ornith_m1_gqa_super_kernel_x tiled
+ornith_m1_moe_super_kernel_x tiled
+ornith_m1_moe_super_q3_kernel_x tiled
 vj_dflash2_tap_copy_kernel tiled
 vj_dflash2_quant_q8_kernel tiled
 vj_dflash2_embed_block_kernel tiled
@@ -142,3 +180,45 @@ vj_dflash2_vocab_topk16_kernel tiled
 vj_vm_attn_block tiled
 vj_vm_ffn_block tiled
 vj_vm_aux_block tiled
+
+# Sealed Q8_0/Q4_0 Split-KV FlashDecoding pair (ops/kernels/vj_flash_decode_splitkv.hiph;
+# host contract: ops/flash_decode_splitkv_launch.hpp).
+vj_flash_decode_q8_partition stream
+vj_flash_decode_q4_partition stream
+vj_flash_decode_merge stream
+
+# Normal-engine Q/KV wire producers + attention epilogue for the sealed Q8/Q4 Split-KV pair
+# (ops/wire_normal_launch.hpp). One-pass streaming conversions; no LDS, no scratch.
+vj_wire_q8_q_kernel stream
+vj_wire_q4_q_kernel stream
+vj_wire_q8_kv_kernel stream
+vj_wire_q4_kv_kernel stream
+vj_wire_attn_epilogue_kernel stream
+ornith_vocab_argmax_q4a8_w75_kernel stream
+ornith_vocab_logits_q4a8_w75_kernel stream
+ornith_vocab_argmax_q4a8_batch16_kernel tiled
+
+vj_sub4_q2_gemv stream
+vj_sub4_q3_gemv stream
+vj_sub4_q2_gemm tiled
+vj_sub4_q3_gemm tiled
+vj_kvq_append_kernel tiled
+vj_kvq_grouped_partial_kernel tiled
+
+vj_l4_prep_kernel stream
+vj_l4_wire_kv_kernel stream
+vj_l4_wire_q_kernel stream
+vj_l4_epilogue_kernel stream
+# Agent E: physical TCC permutation and low-rank INT3 residual kernels.
+ornith_gemv_q4a8_m1_w32_xor_kernel stream
+vj_sub4_q2_gemv_xor stream
+vj_sub4_q3_gemv_xor stream
+vj_sub4_q2_gemm_xor tiled
+vj_sub4_q3_gemm_xor tiled
+vj_milo_vx stream
+vj_milo_apply stream
+
+ornith_m1_gdn_moe_loop_q3_kernel tiled
+ornith_m1_gqa_moe_q3_kernel tiled
+ornith_m1_gqa_super_kvq_kernel tiled
+vj_verify_gu_q3_pair_kernel tiled

@@ -2,6 +2,7 @@
 #include "core/request_scheduler.hpp"
 
 #include <algorithm>
+#include <exception>
 
 namespace vegajet::sched {
 
@@ -94,6 +95,10 @@ void RequestScheduler::preempt(Req& r, StepPlan& plan) {
 
 bool RequestScheduler::reserve(Req& r, const int32_t* toks, uint32_t n, StepPlan& plan, std::vector<Delivery>& out,
                                bool allow_preempt) {
+    if (cfg_.sequence_context && uint64_t(kv_.length(r.seq)) + n > cfg_.sequence_context) {
+        finish(r, EndReason::ContextFull, out);
+        return false;
+    }
     for (;;) {
         if (kv_.append(r.seq, toks, n)) return true;
         if (!allow_preempt) return false;
@@ -122,7 +127,7 @@ StepPlan RequestScheduler::schedule(const Drafter& drafter, std::vector<Delivery
         if (it != reqs_.end()) finish(it->second, EndReason::Cancelled, out);
     }
     // 2. admission, FCFS
-    const uint64_t capacity = uint64_t(cfg_.kv_blocks) * cfg_.block_tokens;
+    const uint64_t capacity = cfg_.sequence_context ? cfg_.sequence_context : uint64_t(cfg_.kv_blocks) * cfg_.block_tokens;
     while (running_.size() < cfg_.max_slots && !waiting_.empty()) {
         Req& r = reqs_.at(waiting_.front());
         if (r.ctx_len() > capacity) {
@@ -143,7 +148,7 @@ StepPlan RequestScheduler::schedule(const Drafter& drafter, std::vector<Delivery
         r.has_seq = true;
         running_.insert(r.id);
         const std::vector<int32_t> ctx = ctx_of(r);
-        const uint32_t covered = kv_.attach_prefix(r.seq, ctx.data(), static_cast<uint32_t>(ctx.size()));
+        const uint32_t covered = cfg_.prefix_reuse ? kv_.attach_prefix(r.seq, ctx.data(), static_cast<uint32_t>(ctx.size())) : 0;
         if (covered == ctx.size() && covered > 0) kv_.truncate(r.seq, covered - 1);  // the last token must be recomputed
         st_.prefix_hit_tokens += kv_.length(r.seq);
     }
@@ -209,6 +214,7 @@ StepPlan RequestScheduler::schedule(const Drafter& drafter, std::vector<Delivery
         plan.items.push_back(std::move(w));
         scheduled.insert(id);
     }
+    for (uint64_t id : running_) plan.resident.push_back(reqs_.at(id).seq);
     for (const auto& w : plan.items) plan.tokens += static_cast<uint32_t>(w.tokens.size());
     plan.copies = kv_.take_copies();
     in_step_ = !plan.items.empty();
@@ -218,6 +224,14 @@ StepPlan RequestScheduler::schedule(const Drafter& drafter, std::vector<Delivery
     for (const auto& w : plan.items) decode_batch += w.decode;
     st_.max_decode_batch = std::max(st_.max_decode_batch, decode_batch);
     return plan;
+}
+
+void RequestScheduler::fail(const StepPlan& plan, const std::string& error, std::vector<Delivery>& out) {
+    in_step_=false;
+    for (const auto& w:plan.items) {
+        auto it=reqs_.find(w.req);
+        if (it!=reqs_.end()) finish(it->second,EndReason::Failed,out,error);
+    }
 }
 
 void RequestScheduler::commit(const StepPlan& plan, const std::vector<StepOutput>& results, std::vector<Delivery>& out) {
@@ -321,9 +335,14 @@ void ServeLoop::loop() {
         post(d);
         if (plan.items.empty()) { work_cv_.wait_for(lk, std::chrono::milliseconds(1)); continue; }
         lk.unlock();
-        std::vector<StepOutput> res = engine_.step(plan);
+        std::vector<StepOutput> res;
+        std::string failure;
+        try { res=engine_.step(plan); }
+        catch (const std::exception& e) { failure=e.what(); }
+        catch (...) { failure="batch engine failed"; }
         lk.lock();
-        sched_.commit(plan, res, d);
+        if (failure.empty()) sched_.commit(plan,res,d);
+        else sched_.fail(plan,failure,d);
         post(d);
     }
     for (auto& m : mail_)

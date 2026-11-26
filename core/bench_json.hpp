@@ -23,7 +23,7 @@
 //     "ras": {gpuN: {block: {ue, de, ce}}} }
 // Writing to an existing file of the same schema, model and commit merges: measured values of this run replace
 // the stored ones, the rest is kept (so a W4A8 run and a --prefill-dot8 run fill one scorecard), telemetry keeps
-// the worst case and RAS deltas add up.
+// the worst case and RAS deltas add up. telemetry.cards retains each run's timestamped per-card observations.
 #pragma once
 
 #include <cstdint>
@@ -59,9 +59,17 @@ struct GpuState {
     std::vector<RasBlock> ras;
 };
 
+struct TelemetryCard {
+    // One row per DRM card per run; merging retains rows, not fictitious combined means.
+    std::string id, timestamp_utc, window_kind, hold, verdict;
+    std::optional<double> cap_w, cap_min_w, cap_max_w, mean_w, avg_w, window_s;
+    std::optional<double> avg1s_w, window1s_s, peak_w, tmem_max_c, observed_s;
+    std::optional<uint64_t> samples, missing;
+};
+
 struct Record {
     // meta
-    std::string vegajet_version = "0.1.0", commit = "unknown", command = "bench", model, architecture, flags;
+    std::string vegajet_version = "0.1.1", commit = "unknown", command = "bench", model, architecture, flags;
     std::string gpu_selection = "all", prefill_path = "w4a8", plan_status, error, timestamp_utc;
     uint32_t tp = 1;
     bool executed = false;
@@ -76,6 +84,9 @@ struct Record {
     std::optional<uint32_t> parity_match, parity_total;
     std::string parity_verdict;
     std::optional<double> power_avg_w, power_avg_limit_w, power_peak_w, tmem_max_c;
+    std::optional<double> power_mean_w, power_window_s, power_avg1s_w;
+    std::string power_window_kind, power_hold;
+    std::vector<TelemetryCard> telemetry_cards;
     std::string telem_verdict;
     std::optional<uint64_t> spill_bytes_max;
     std::vector<GpuState> gpus_before, gpus_after;

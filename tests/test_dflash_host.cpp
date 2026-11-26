@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdio>
 #include <random>
+#include <string>
 #include <vector>
 
 using namespace vegajet::dflash_host;
@@ -133,6 +134,196 @@ void test_masks() {
     std::printf("  masks: SWA window edge at p=4100 (key 4 vs 5), causal-vs-bidirectional block, variants named\n");
 }
 
+// The kernel's visibility for ONE layer (`vj_dflash2_attn_kernel`): context j in [lo, s_pos) with
+// lo = (qpos >= kw) ? qpos + 1 - kw : 0 (the kernel window clamp of THIS layer), then block jb in
+// [0, blk_end) with blk_end = causal ? slot + 1 : B. Everything the plan does not name is the shipped
+// behaviour. kw is the layer's kernel window: the SWA window for a sliding_attention layer, the full layer's
+// own ring size for the full layer -- never the global short-context boundary.
+std::vector<uint8_t> engine_mask(int s_pos, int B, int kw, bool causal_layer) {
+    const int n_keys = s_pos + B;
+    std::vector<uint8_t> m(static_cast<size_t>(B) * n_keys, 0);
+    for (int i = 0; i < B; ++i) {
+        const int qpos = s_pos + i;
+        const int lo = (kw > 0 && qpos >= kw) ? qpos - kw + 1 : 0;
+        uint8_t* row = &m[static_cast<size_t>(i) * n_keys];
+        for (int j = lo; j < s_pos; ++j) row[j] = 1;
+        const int blk_end = causal_layer ? i + 1 : B;
+        for (int jb = 0; jb < blk_end; ++jb) row[s_pos + jb] = 1;
+    }
+    return m;
+}
+
+// Every layer's engine mask must equal the CPU reference (build_mask) with the mode the plan selected, and the
+// selected mode must be the expected one for the layer type (z-lab: causal on SWA, bidirectional on the full one).
+constexpr int kFullRingWindow = 32768;  // spec_replay::plan_draft_kv: the full layer's ring after #5
+
+void check_cycle(const DraftBlockMaskPlan& p, int s_pos, int B, int W, uint32_t swa_mask, int n_layer,
+                 BlockMaskMode arm_mode) {
+    for (int l = 0; l < n_layer; ++l) {
+        const bool swa = ((swa_mask >> l) & 1u) != 0u;
+        const bool causal = ((p.causal_mask >> l) & 1u) != 0u;
+        const bool want_causal = p.arm && arm_mode != BlockMaskMode::Bidir &&
+                                 (arm_mode == BlockMaskMode::Causal || swa);
+        VJ_CHECK(causal == want_causal);
+        MaskSpec want;
+        want.block_start = s_pos;
+        want.block_len = B;
+        want.swa_layer = swa;
+        want.window = W;
+        // The arm's selected per-layer mode; outside the arm the shipped bidirectional block on every layer.
+        want.mode = causal ? BlockMask::Causal : BlockMask::Bidirectional;
+        const int kw = swa ? W : kFullRingWindow;  // the launch's own kernel window, per layer
+        const MaskDiff d = diff_mask(want, engine_mask(s_pos, B, kw, causal));
+        VJ_CHECK(d.mismatches == 0);
+        if (causal && swa) {
+            // ... and that per-layer mode is exactly the z-lab/SWA rule of the reference, not merely "some causal".
+            MaskSpec zlab = want;
+            zlab.mode = BlockMask::ZLab;
+            VJ_CHECK(build_mask(zlab) == engine_mask(s_pos, B, kw, true));
+        }
+    }
+}
+
+void test_block_mask_plan() {
+    BlockMaskMode m = BlockMaskMode::Causal;
+    VJ_CHECK(parse_block_mask_mode(nullptr, &m) && m == BlockMaskMode::Bidir);
+    VJ_CHECK(parse_block_mask_mode("", &m) && m == BlockMaskMode::Bidir);
+    VJ_CHECK(parse_block_mask_mode("bidir", &m) && m == BlockMaskMode::Bidir);
+    VJ_CHECK(parse_block_mask_mode("zlab", &m) && m == BlockMaskMode::ZLab);
+    VJ_CHECK(parse_block_mask_mode("causal", &m) && m == BlockMaskMode::Causal);
+    VJ_CHECK(!parse_block_mask_mode("ZLab", &m) && !parse_block_mask_mode("all", &m) &&
+             !parse_block_mask_mode("1", &m) && !parse_block_mask_mode(nullptr, nullptr));
+    VJ_CHECK(std::string(block_mask_mode_name(BlockMaskMode::ZLab)) == "zlab");
+
+    // Mixed-layout reference fixture, not deployed metadata: 5 SWA layers + 1 full layer, B=8, W=4096.
+    // The deployed six-SWA W=2048/B=16 case is covered separately below.
+    const int n_layer = 6, W = 4096, B = 8;
+    const uint32_t swa = 0x1Fu;
+    DraftBlockMaskConfig base{};
+    base.swa_layer_mask = swa;
+    base.n_layer = static_cast<uint32_t>(n_layer);
+    base.block_len = static_cast<uint32_t>(B);
+    base.swa_window = static_cast<uint32_t>(W);
+
+    // Default: the shipped bidirectional block on every layer, pattern not even read.
+    DraftBlockMaskConfig c = base;
+    c.mode = BlockMaskMode::Bidir;
+    DraftBlockMaskPlan p = plan_draft_block_mask(c);
+    VJ_CHECK(p.ok && !p.arm && p.causal_mask == 0u && p.summary.find("bidir") != std::string::npos);
+    check_cycle(p, 100, B, W, swa, n_layer, BlockMaskMode::Bidir);
+
+    // A masked mode without the per-layer pattern fails closed (no "every layer is SWA" guess).
+    for (BlockMaskMode mode : {BlockMaskMode::ZLab, BlockMaskMode::Causal}) {
+        c = base;
+        c.mode = mode;
+        c.pattern_known = false;
+        p = plan_draft_block_mask(c);
+        VJ_CHECK(!p.ok && p.error.find("fail closed") != std::string::npos &&
+                 p.error.find("dflash.attention.sliding_window_pattern") != std::string::npos);
+    }
+
+    // z-lab inside the short-context region: causal block on the 5 SWA layers, bidirectional on the full layer.
+    c = base;
+    c.mode = BlockMaskMode::ZLab;
+    c.pattern_known = true;
+    c.block_start = 200;
+    p = plan_draft_block_mask(c);
+    VJ_CHECK(p.ok && p.arm && p.causal_mask == swa);
+    VJ_CHECK(p.summary.find("5 swa") != std::string::npos && p.summary.find("1 full") != std::string::npos);
+    check_cycle(p, 200, B, W, swa, n_layer, BlockMaskMode::ZLab);
+    // The boundary is the GLOBAL SWA window: the last anchor whose whole block still fits it is W - B ...
+    c.block_start = W - B;
+    p = plan_draft_block_mask(c);
+    VJ_CHECK(p.ok && p.arm && p.causal_mask == swa);
+    check_cycle(p, W - B, B, W, swa, n_layer, BlockMaskMode::ZLab);
+    // ... one token later the arm is off for every layer, and W + 1 (past the window) is still unmasked.
+    for (int s_pos : {W - B + 1, W + 1}) {
+        c.block_start = static_cast<uint32_t>(s_pos);
+        p = plan_draft_block_mask(c);
+        VJ_CHECK(p.ok && !p.arm && p.causal_mask == 0u);
+        VJ_CHECK(((p.causal_mask >> 5) & 1u) == 0u);  // the full layer is never causal
+        check_cycle(p, s_pos, B, W, swa, n_layer, BlockMaskMode::ZLab);
+        // At W + 1 the full layer attends block slot 7 from slot 0: no masking at all, explicitly.
+        MaskSpec full;
+        full.block_start = s_pos;
+        full.block_len = B;
+        full.swa_layer = false;
+        full.window = W;
+        full.mode = BlockMask::ZLab;  // z-lab is bidirectional on a full layer
+        VJ_CHECK(mask_allowed(full, 0, s_pos + B - 1));
+    }
+
+    // The all-causal control mode: every layer causal inside the arm, none outside it.
+    c = base;
+    c.mode = BlockMaskMode::Causal;
+    c.pattern_known = true;
+    c.block_start = 200;
+    p = plan_draft_block_mask(c);
+    VJ_CHECK(p.ok && p.arm && p.causal_mask == 0x3Fu);
+    check_cycle(p, 200, B, W, swa, n_layer, BlockMaskMode::Causal);
+    c.block_start = W + 1;
+    p = plan_draft_block_mask(c);
+    VJ_CHECK(p.ok && !p.arm && p.causal_mask == 0u);
+    check_cycle(p, W + 1, B, W, swa, n_layer, BlockMaskMode::Causal);
+
+    // Deployed all-SWA geometry: every layer is causal only inside the explicit short-context arm.
+    c = base;
+    c.pattern_known = true;
+    c.swa_layer_mask = 0x3Fu;
+    c.swa_window = 2048u;
+    c.block_len = 16u;
+    for (BlockMaskMode mode : {BlockMaskMode::Bidir, BlockMaskMode::ZLab, BlockMaskMode::Causal}) {
+        c.mode = mode;
+        for (uint32_t pos : {200u, 2032u, 2033u, 2049u}) {
+            c.block_start = pos;
+            p = plan_draft_block_mask(c);
+            const bool active = mode != BlockMaskMode::Bidir && pos <= 2032u;
+            VJ_CHECK(p.ok && p.arm == active && p.causal_mask == (active ? 0x3Fu : 0u));
+            check_cycle(p, static_cast<int>(pos), 16, 2048, 0x3Fu, 6, mode);
+        }
+    }
+
+    // Invalid or degenerate configurations are refused, never silently coerced.
+    c = base;
+    c.mode = BlockMaskMode::ZLab;
+    c.pattern_known = true;
+    c.swa_window = 0u;
+    VJ_CHECK(!plan_draft_block_mask(c).ok);
+    c = base;
+    c.mode = BlockMaskMode::ZLab;
+    c.pattern_known = true;
+    for (uint32_t bad : {0u, 33u}) {
+        c.block_len = bad;
+        VJ_CHECK(!plan_draft_block_mask(c).ok);
+    }
+    c.block_len = static_cast<uint32_t>(B);
+    for (uint32_t bad : {0u, 33u}) {
+        c.n_layer = bad;
+        VJ_CHECK(!plan_draft_block_mask(c).ok);
+    }
+    c.n_layer = static_cast<uint32_t>(n_layer);
+    c.swa_layer_mask = 0x40u;  // a pattern bit for a layer that does not exist
+    VJ_CHECK(!plan_draft_block_mask(c).ok);
+    c.swa_layer_mask = swa;
+    // A drafter without an SWA layer under z-lab is a no-op arm, not an error.
+    c.swa_layer_mask = 0u;
+    p = plan_draft_block_mask(c);
+    VJ_CHECK(p.ok && p.arm && p.causal_mask == 0u && p.summary.find("0 swa") != std::string::npos);
+    // 32 layers: the known-layer mask covers the top bit without shifting into undefined behaviour.
+    c.n_layer = 32u;
+    c.swa_layer_mask = 0xFFFFFFFFu;
+    p = plan_draft_block_mask(c);
+    VJ_CHECK(p.ok && p.arm && p.causal_mask == 0xFFFFFFFFu);
+    // Bidir stays the shipped mask even with an unknown pattern and a zero window.
+    c = base;
+    c.mode = BlockMaskMode::Bidir;
+    c.pattern_known = false;
+    c.swa_window = 0u;
+    p = plan_draft_block_mask(c);
+    VJ_CHECK(p.ok && !p.arm && p.causal_mask == 0u);
+    std::printf("  block mask: 5 SWA + 1 full, arm inside W - B only, full layer bidirectional, unknown pattern refused\n");
+}
+
 void test_masked_attention() {
     const int B = 4, P = 6, NK = P + B, HD = 8;
     const auto q = randv(static_cast<size_t>(B) * HD, 5);
@@ -232,6 +423,7 @@ int main() {
     test_taps();
     test_norm_orders();
     test_masks();
+    test_block_mask_plan();
     test_masked_attention();
     test_acceptance();
     test_layer_divergence();

@@ -5,6 +5,7 @@ Run from the sidecar root:  python3 -m unittest discover -s tests -p 'test_tools
 """
 import contextlib
 import io
+import json
 import math
 import os
 import random
@@ -181,6 +182,44 @@ class ScorecardTest(unittest.TestCase):
         self.assertAlmostEqual(r["gpu0"]["kernels_ms"]["gqa_qkv+o"], 0.60)
         # MTP is fastest but not lossless (127/128): the scorecard must pick the fastest LOSSLESS mode.
         self.assertEqual(sc.best_spec(r)["name"].strip(), "Hybrid")
+
+    def test_short_and_missing_telemetry(self):
+        lines = [
+            "[TELEM card=card1] cap=150 W cap_min=150 W cap_max=150 W mean=220 W "
+            "rolling avg=220 W window=0.125 s window_kind=short_observed hold=previous "
+            "avg1s=220 W window1s=0.125 s peak=220 W max_TMem=51 C observed=0.125 s samples=2 missing=0 -> FAIL",
+            "[TELEM card=card2] cap=nan W cap_min=nan W cap_max=nan W mean=nan W "
+            "rolling avg=nan W window=0 s window_kind=missing hold=previous "
+            "avg1s=nan W window1s=0 s peak=nan W max_TMem=nan C observed=0 s samples=0 missing=1 -> INCOMPLETE",
+            "[TELEM] power1_input: short observed rolling avg=220 W (mean=220 W, <=205 W) | "
+            "window=0.125 s window_kind=short_observed hold=previous | worst 1 s avg=220 W (info) | "
+            "instantaneous peak=220 W (<270 W) | max_TMem=51 C (<65 C) | 2 samples -> FAIL",
+        ]
+        parsed = sc.parse(lines)
+        t = parsed["telem"]
+        self.assertEqual((t["rolling_avg_w"], t["mean_w"], t["window_s"], t["avg_limit_w"]), (220, 220, 0.125, 205))
+        self.assertEqual((t["window_kind"], t["hold"], t["verdict"]), ("short_observed", "previous", "FAIL"))
+        self.assertEqual(t["cards"][0]["power_cap_w"], 150)
+        self.assertIsNone(t["cards"][1]["power_mean_w"])
+        self.assertIsNone(t["cards"][1]["power_cap_w"])
+        self.assertEqual(t["cards"][1]["verdict"], "INCOMPLETE")
+        # Strict JSON serialization must not leak the textual nan sentinels.
+        json.dumps(parsed, allow_nan=False)
+        text = sc.format_text(parsed)
+        for expected in ("short_observed", "0.125 s", "cap 150 W", "mean 220 W", "peak 220 W", "INCOMPLETE", "unavailable"):
+            self.assertIn(expected, text)
+        missing = sc.from_bench_json({"schema": sc.BENCH_SCHEMA, "telemetry": {
+            "power_rolling_avg_w": None, "power_peak_w": None, "tmem_max_c": None, "verdict": "INCOMPLETE"}})
+        self.assertIsNone(missing["telem"]["rolling_avg_w"])
+        self.assertIn("INCOMPLETE", sc.format_text(missing))
+        self.assertIn("unavailable", sc.format_text(missing))
+
+    def test_zero_power_is_observed_not_missing(self):
+        r = sc.parse(["[TELEM] power1_input: short observed rolling avg=0 W (mean=0 W, <=205 W) | "
+                      "window=0.25 s window_kind=short_observed hold=previous | instantaneous peak=0 W (<270 W) | "
+                      "max_TMem=40 C (<65 C) | 2 samples -> PASS"])
+        self.assertEqual(r["telem"]["rolling_avg_w"], 0)
+        self.assertIn("avg 0 W", sc.format_text(r))
 
     def test_kstamp_accounting(self):
         # 100 MHz -> 0.01 us per tick. Token 0: wall 1000 ticks, kernels 300 + 400 (overlapping by 100).

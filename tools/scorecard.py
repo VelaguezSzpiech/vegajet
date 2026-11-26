@@ -35,6 +35,7 @@ Cells whose metric is missing in the log are left as placeholders and listed; --
 """
 import argparse
 import json
+import math
 import re
 import statistics
 import sys
@@ -49,7 +50,8 @@ RE_SPEC = re.compile(r"\[BENCH tg(\d+) (Suffix|MTP K=\d+|Hybrid|DFlash2 K=\d+ \w
                      r"(?:\s+\(([\d.]+)x vs raw)?")
 RE_LOSSLESS = re.compile(r"lossless=(\d+)/(\d+)")
 RE_PARITY = re.compile(r"\[PARITY code\s+vs Tier-1 llama\.cpp\]\s+(\d+)/(\d+) exact greedy tokens(?: -> (\w+))?")
-RE_TELEM = re.compile(r"\[TELEM\].*?rolling avg=([\d.]+) W.*?peak=([\d.]+) W.*?max_TMem=([\d.]+) C.*?-> (\w+)")
+RE_TELEM = re.compile(r"\[TELEM\].*?rolling avg=.*?-> (\w+)")
+RE_TELEM_CARD = re.compile(r"\[TELEM card=(\w+)\]")
 RE_INSITU = re.compile(r"\[PROFILE in-situ M=1\] base ([\d.]+) ms/tok \|(.*?)\| sum=([\d.]+) ms")
 RE_GPU0 = re.compile(r"\[PROFILE M=1 GPU0 48L\](.*?)\| sum=([\d.]+)ms")
 RE_KV = re.compile(r"(\w[\w+]*)=([\d.]+)(?:ms)?")
@@ -81,6 +83,20 @@ def _union(intervals):
     return total
 
 
+def _telem_number(line, key):
+    m = re.search(re.escape(key) + r"([^\s]+)", line)
+    try:
+        value = float(m.group(1)) if m else None
+        return value if value is not None and math.isfinite(value) and value >= 0 else None
+    except ValueError:
+        return None
+
+
+def _telem_word(line, key):
+    m = re.search(re.escape(key) + r"\s*(\w+)", line)
+    return m.group(1) if m else None
+
+
 def parse(lines, rtc_mhz=100.0):
     r = {"raw": None, "prefill": {}, "spec": [], "parity": None, "telem": None, "insitu": None, "gpu0": None,
          "kstamp": None, "warnings": []}
@@ -110,10 +126,28 @@ def parse(lines, rtc_mhz=100.0):
         if m:
             r["parity"] = {"match": int(m.group(1)), "total": int(m.group(2)), "verdict": m.group(3)}
             continue
+        m = RE_TELEM_CARD.search(ln)
+        if m:
+            card = {key: _telem_number(ln, field) for key, field in (
+                ("power_cap_w", "cap="), ("power_cap_min_w", "cap_min="), ("power_cap_max_w", "cap_max="),
+                ("power_mean_w", "mean="), ("power_rolling_avg_w", "rolling avg="), ("power_window_s", "window="),
+                ("power_avg1s_w", "avg1s="), ("power_window1s_s", "window1s="), ("power_peak_w", "peak="),
+                ("tmem_max_c", "max_TMem="), ("observed_s", "observed="), ("samples", "samples="), ("missing", "missing="))}
+            card.update(id=m.group(1), power_window_kind=_telem_word(ln, "window_kind="),
+                        power_hold=_telem_word(ln, "hold="), verdict=_telem_word(ln, "->"))
+            if r["telem"] is None:
+                r["telem"] = {}
+            r["telem"].setdefault("cards", []).append(card)
+            continue
         m = RE_TELEM.search(ln)
         if m:
-            r["telem"] = {"rolling_avg_w": float(m.group(1)), "peak_w": float(m.group(2)),
-                          "max_tmem_c": float(m.group(3)), "verdict": m.group(4)}
+            cards = (r["telem"] or {}).get("cards", [])
+            r["telem"] = {"rolling_avg_w": _telem_number(ln, "rolling avg="), "peak_w": _telem_number(ln, "peak="),
+                          "max_tmem_c": _telem_number(ln, "max_TMem="), "verdict": m.group(1),
+                          "mean_w": _telem_number(ln, "mean="), "window_s": _telem_number(ln, "window="),
+                          "window_kind": _telem_word(ln, "window_kind="), "hold": _telem_word(ln, "hold="),
+                          "avg_limit_w": _telem_number(ln, "<="), "avg1s_w": _telem_number(ln, "worst 1 s avg="),
+                          "cards": cards}
             continue
         m = RE_INSITU.search(ln)
         if m:
@@ -215,9 +249,13 @@ def from_bench_json(doc, r=None):
     if code:
         r["parity"] = {"match": code["match"], "total": code["total"], "verdict": code.get("verdict") or None}
     tel = doc.get("telemetry") or {}
-    if tel.get("power_rolling_avg_w") is not None:
-        r["telem"] = {"rolling_avg_w": tel["power_rolling_avg_w"], "peak_w": tel.get("power_peak_w"),
-                      "max_tmem_c": tel.get("tmem_max_c"), "verdict": tel.get("verdict") or None}
+    if tel.get("power_rolling_avg_w") is not None or tel.get("verdict") or tel.get("cards"):
+        r["telem"] = {"rolling_avg_w": tel.get("power_rolling_avg_w"), "peak_w": tel.get("power_peak_w"),
+                      "max_tmem_c": tel.get("tmem_max_c"), "verdict": tel.get("verdict") or None,
+                      "mean_w": tel.get("power_mean_w"), "window_s": tel.get("power_window_s"),
+                      "window_kind": tel.get("power_window_kind"), "hold": tel.get("power_hold"),
+                      "avg_limit_w": tel.get("power_avg_limit_w"), "avg1s_w": tel.get("power_avg1s_w"),
+                      "cards": tel.get("cards") or []}
     for v in r["prefill"].values():
         v.pop("_from", None)
     return r
@@ -294,7 +332,24 @@ def format_text(r):
         o.append("parity          %d/%d %s" % (r["parity"]["match"], r["parity"]["total"], r["parity"]["verdict"] or ""))
     if r["telem"]:
         t = r["telem"]
-        o.append("telemetry       avg %.1f W  peak %.1f W  TMem %.1f C  %s" % (t["rolling_avg_w"], t["peak_w"], t["max_tmem_c"], t["verdict"]))
+        def measurement(value, unit):
+            return "unavailable" if value is None else "%.6g %s" % (value, unit)
+        o.append("telemetry       avg %s  mean %s  peak %s  TMem %s  %s" % (
+            measurement(t.get("rolling_avg_w"), "W"), measurement(t.get("mean_w"), "W"),
+            measurement(t.get("peak_w"), "W"), measurement(t.get("max_tmem_c"), "C"), t.get("verdict") or "INCOMPLETE"))
+        if t.get("window_kind"):
+            o.append("                window %s (%s; hold=%s)" % (
+                measurement(t.get("window_s"), "s"), t["window_kind"], t.get("hold") or "unknown"))
+        for c in t.get("cards", []):
+            o.append("  %-12s cap %s [min %s, max %s]  mean %s over %s  peak %s  "
+                     "avg %s over %s (%s; hold=%s)  samples %s missing %s  %s%s" % (
+                c["id"], measurement(c.get("power_cap_w"), "W"), measurement(c.get("power_cap_min_w"), "W"),
+                measurement(c.get("power_cap_max_w"), "W"), measurement(c.get("power_mean_w"), "W"),
+                measurement(c.get("observed_s"), "s"), measurement(c.get("power_peak_w"), "W"),
+                measurement(c.get("power_rolling_avg_w"), "W"), measurement(c.get("power_window_s"), "s"),
+                c.get("power_window_kind") or "unknown", c.get("power_hold") or "unknown", c.get("samples"),
+                c.get("missing"), c.get("verdict") or "INCOMPLETE",
+                " [" + c["timestamp_utc"] + "]" if c.get("timestamp_utc") else ""))
     if r["insitu"]:
         x = r["insitu"]
         o.append("in-situ profile base %.2f ms - stages %.2f ms = %.2f ms unattributed (%.1f%%)" % (

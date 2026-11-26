@@ -96,16 +96,16 @@ under G-SF-12.
 
 ---
 
-## 4. Roadmap: TP=3 and the 3× swarm (not in this alpha)
+## 4. TP=3 and the 3× swarm
 
-This section is roadmap procedure. The alpha GPU runner is fixed at two ranks; do not treat any step here as an
-alpha acceptance test.
+v0.1.1 runs the GPU engine at `TP=3` (`vegajet bench <model-file> --tp 3 --gpu 0,1,2`). The bring-up procedure
+below still applies. The 3× swarm remains roadmap.
 
 There are two ways to use three cards.
 
 | Mode | What runs | Status in this tree |
 | :--- | :--- | :--- |
-| **TP=3** | One engine; weights sharded by bandwidth; an all-reduce per layer. | Planner and CPU checks available: `core/tp3_plan`, `core/sharder` with `row_unit`, the ISA scanner, `doctor`. GPU execution follows the engine's TP path. |
+| **TP=3** | One engine; weights sharded by bandwidth; an all-reduce per layer. | GPU execution benchmarked in v0.1.1 (raw 174.25 tok/s, Hybrid 390.50 tok/s on Ornith-122B). Planner and CPU checks: `core/tp3_plan`, `core/sharder` with `row_unit`, the ISA scanner, `doctor`. |
 | **3× swarm** | Three single-GPU (N=1) servers behind `tools/swarm_router.py`. | Router and stress tests run today against `vj_mock_serve` workers and `vegajet serve --mock`. Per-process GPU selection (`--gpu`, `VJ_GPU_DEVICES`) and `vegajet serve <model-file>` are in place; live GPU workers still need a **streaming GPU engine** registered for the model's architecture (until then `serve <model-file>` exits 3). |
 
 ### 4.1 Preconditions (both modes)

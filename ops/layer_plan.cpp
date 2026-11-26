@@ -200,6 +200,8 @@ OpKind projection_kind(quant::NativeFormat f, bool prefill) {
         case quant::NativeFormat::VJ_Q4_DOT8: return OpKind::GemvQ4Dot8;
         case quant::NativeFormat::VJ_Q4_A8:   return OpKind::GemvQ4Dot8;
         case quant::NativeFormat::VJ_IQ_PACKED: return OpKind::GemvIqPacked;
+        case quant::NativeFormat::VJ_Q3_DOT8:   return OpKind::GemvQ4Dot8;   // sub-4-bit DOT8 GEMV class (opt-in)
+        case quant::NativeFormat::VJ_Q2_DOT8:   return OpKind::GemvQ4Dot8;
     }
     return OpKind::GemvQ8Dp4a;
 }

@@ -287,6 +287,62 @@ float turbo3_dot_rotated(const float* q_rot, const uint32_t* codes, const uint16
     return sum;
 }
 
+// CPU byte-array helpers use memcpy, so callers may pass unaligned storage.
+void pack_device_vector(const float* x, uint32_t d, DeviceFormat f, uint8_t* out) {
+    std::vector<uint16_t> scales(d/32);
+    std::vector<uint32_t> codes(d/8);
+    if (f == DeviceFormat::Fp16) {
+        for (uint32_t i=0;i<d;++i) { auto h=f32_to_f16(x[i]); std::memcpy(out+2*i,&h,2); }
+    } else if (f == DeviceFormat::Q8) {
+        std::vector<int8_t> c(d); std::vector<float> sc(d/32);
+        query_pack_i8(x,d,c.data(),sc.data());
+        for (uint32_t b=0;b<d/32;++b) scales[b]=f32_to_f16(sc[b]);
+        std::memcpy(out,scales.data(),d/16); std::memcpy(out+d/16,c.data(),d);
+    } else {
+        if (f == DeviceFormat::Q4) q4_pack(x,d,codes.data(),scales.data());
+        else { const auto signs=turbo3_signs(d,0x5455524230u); turbo3_pack(x,d,signs.data(),codes.data(),scales.data()); }
+        std::memcpy(out,scales.data(),d/16);
+        std::memcpy(out+d/16,codes.data(),vector_bytes(f,d)-d/16);
+    }
+}
+void unpack_device_vector(const uint8_t* x,uint32_t d,DeviceFormat f,float* out) {
+    if (f == DeviceFormat::Fp16) {
+        for(uint32_t i=0;i<d;++i) {uint16_t h;std::memcpy(&h,x+2*i,2);out[i]=f16_to_f32(h);}
+        return;
+    }
+    std::vector<uint16_t> scales(d/32); std::memcpy(scales.data(),x,d/16);
+    if (f == DeviceFormat::Q8) {
+        for(uint32_t i=0;i<d;++i) out[i]=f16_to_f32(scales[i/32])*int8_t(x[d/16+i]);
+    } else {
+        std::vector<uint32_t> c(d/8); std::memcpy(c.data(),x+d/16,vector_bytes(f,d)-d/16);
+        if(f==DeviceFormat::Q4) q4_unpack(c.data(),scales.data(),d,out);
+        else { const auto signs=turbo3_signs(d,0x5455524230u);turbo3_unpack(c.data(),scales.data(),d,signs.data(),out); }
+    }
+}
+std::vector<float> device_attention_reference(const float* q,const uint8_t* k,const uint8_t* v,
+    uint32_t d,uint32_t tokens,DeviceFormat f) {
+    std::vector<float> out(d,0),kd(d),vd(d),qd(q,q+d),qs(d/32);
+    if(!tokens) return out;
+    if(f==DeviceFormat::Q4) {
+        std::vector<uint32_t> qc(d/8); query_pack_i4(q,d,qc.data(),qs.data());
+        for(uint32_t i=0;i<d;++i) {unsigned n=(qc[i/8]>>(4*(i%8)))&15;qd[i]=float(n>=8?int(n)-16:int(n))*qs[i/32];}
+    }
+    std::vector<double> scores(tokens);double peak=-INFINITY,z=0;
+    for(uint32_t t=0;t<tokens;++t) {
+        unpack_device_vector(k+size_t(t)*vector_bytes(f,d),d,f,kd.data());
+        double score=0;for(uint32_t i=0;i<d;++i) score+=double(qd[i])*kd[i];
+        scores[t]=score/std::sqrt(double(d));peak=std::max(peak,scores[t]);
+    }
+    for(auto& s:scores) {s=std::exp(s-peak);z+=s;}
+    std::vector<double> accum(d,0);
+    for(uint32_t t=0;t<tokens;++t) {
+        unpack_device_vector(v+size_t(t)*vector_bytes(f,d),d,f,vd.data());
+        for(uint32_t i=0;i<d;++i) accum[i]+=scores[t]/z*vd[i];
+    }
+    for(uint32_t i=0;i<d;++i) out[i]=float(accum[i]);
+    return out;
+}
+
 // ------------------------------------------------------------------------------------------------ oracles
 const char* format_name(KvFormat f) {
     switch (f) {
@@ -444,6 +500,7 @@ OracleStats run_oracle(const OracleConfig& cfg, KvFormat k_fmt, KvFormat v_fmt, 
             }
             on += o_ref * o_ref;
             oe += (o - o_ref) * (o - o_ref);
+            st.out_max_abs = std::max(st.out_max_abs, std::fabs(o-o_ref));
         }
         out_err += std::sqrt(oe / std::max(on, 1e-30));
     }

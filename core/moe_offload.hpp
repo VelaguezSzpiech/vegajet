@@ -38,6 +38,7 @@
 #pragma once
 
 #include <sys/uio.h>
+#include "core/offload/policies.hpp"
 
 #include <array>
 #include <cstddef>
@@ -153,6 +154,13 @@ public:
     // ---- data
     // Copies expert_bytes to dst, staging the expert first if needed. False on bad id / I/O error.
     bool fetch(uint32_t layer, uint32_t expert, uint8_t* dst, std::string* err = nullptr);
+
+    // HOBBIT: full for row zero/hot experts. Cold draft rows may use an already
+    // staged lower-precision table; formats/byte counts belong to their callers.
+    // Missing low data falls back to full, never skips an expert. No GPU I/O.
+    bool fetch_spec(uint32_t layer, uint32_t expert, uint32_t row, uint32_t rank,
+                    double weight, MoeOffload* low, uint8_t* dst, size_t capacity,
+                    offload::FetchPrecision* precision, std::string* err = nullptr);
 
     // ---- release
     bool release(uint32_t layer, uint32_t expert); // munlock + MADV_DONTNEED + lock-on-fault of that slot

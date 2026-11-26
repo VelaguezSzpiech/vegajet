@@ -53,6 +53,82 @@ void vj_moe_down_dot8_kernel(
     }
 }
 
+// Lossless 32-column-sliced Routed Down (supports arbitrary TP=3 local_ff <= 512 multiple of 32, M >= 1).
+extern "C" __global__ __launch_bounds__(256, 5)
+void vj_moe_down_dot8_sub32_kernel(
+    const uint8_t* __restrict__ w_qs,
+    const uint8_t* __restrict__ w_sc,
+    const int8_t*  __restrict__ mid_q8,
+    const float*   __restrict__ mid_d,
+    const int32_t* __restrict__ top_ids,
+    const float*   __restrict__ top_w,
+    const float*   __restrict__ sh_down_in,
+    float*         __restrict__ out_f32,
+    uint32_t M,
+    uint32_t D,
+    uint32_t local_ff,
+    uint32_t w_stride,
+    uint32_t s_stride,
+    uint16_t*      __restrict__ peer_tx,
+    uint16_t*      __restrict__ peer_tx2) {
+    __shared__ uint4   sm_mq[256];
+    __shared__ float   sm_md[128];
+    __shared__ int32_t sm_ids[8];
+    __shared__ float   sm_w[8];
+    __shared__ float   sm_y[16];
+
+    const uint32_t m      = blockIdx.y;
+    const uint32_t grp16  = threadIdx.x >> 4;
+    const uint32_t lane16 = threadIdx.x & 15u;
+    const uint32_t row    = blockIdx.x * 16u + grp16;
+    if (m >= M) return;
+
+    const uint32_t n_blk   = local_ff >> 5;
+    const uint32_t n_q8_u4 = 8u * (local_ff >> 4);
+    const uint32_t n_d     = 8u * n_blk;
+    if (threadIdx.x < n_q8_u4)
+        sm_mq[threadIdx.x] = reinterpret_cast<const uint4*>(mid_q8 + static_cast<uint64_t>(m) * (8u * local_ff))[threadIdx.x];
+    if (threadIdx.x < n_d)
+        sm_md[threadIdx.x] = mid_d[static_cast<uint64_t>(m) * n_d + threadIdx.x];
+    if (threadIdx.x < 8u) {
+        sm_ids[threadIdx.x] = top_ids[static_cast<uint64_t>(m) * 8u + threadIdx.x];
+        sm_w[threadIdx.x]   = top_w[static_cast<uint64_t>(m) * 8u + threadIdx.x];
+    }
+    __syncthreads();
+    if (row < D) {
+        const float total = vegajet::dot8_dev::vj_dot8_down_row_iq3_sub32<4, true>(
+            w_qs, w_stride, w_sc, s_stride, sm_mq, sm_md, sm_ids, sm_w, row, D, n_blk, lane16);
+        if (lane16 == 0u) {
+            const float sh = sh_down_in ? sh_down_in[static_cast<uint64_t>(m) * D + row] : 0.0f;
+            const float v  = total + sh;
+            out_f32[static_cast<uint64_t>(m) * D + row] = v;
+            sm_y[grp16] = v;
+        }
+    }
+    // TP=3 speculative verify: FP16 BAR0 epilogue prepush of this WG's 16 rows to each peer (same RN packing as the
+    // N-way AllReduce, so the reduction stays bit-identical). Host passes nullptr when not pre-pushing.
+    if (peer_tx != nullptr && (D & 15u) == 0u) {
+        __syncthreads();
+        if (threadIdx.x < 2u) {
+            const uint32_t o = threadIdx.x * 8u;
+            const __half2 h0 = __float22half2_rn(make_float2(sm_y[o + 0u], sm_y[o + 1u]));
+            const __half2 h1 = __float22half2_rn(make_float2(sm_y[o + 2u], sm_y[o + 3u]));
+            const __half2 h2 = __float22half2_rn(make_float2(sm_y[o + 4u], sm_y[o + 5u]));
+            const __half2 h3 = __float22half2_rn(make_float2(sm_y[o + 6u], sm_y[o + 7u]));
+            typedef uint32_t u32x4_t __attribute__((ext_vector_type(4)));
+            u32x4_t pv = {
+                *reinterpret_cast<const uint32_t*>(&h0),
+                *reinterpret_cast<const uint32_t*>(&h1),
+                *reinterpret_cast<const uint32_t*>(&h2),
+                *reinterpret_cast<const uint32_t*>(&h3)
+            };
+            const uint64_t eo = static_cast<uint64_t>(m) * D + blockIdx.x * 16u + o;
+            __builtin_nontemporal_store(pv, reinterpret_cast<u32x4_t*>(peer_tx + eo));
+            if (peer_tx2 != nullptr) __builtin_nontemporal_store(pv, reinterpret_cast<u32x4_t*>(peer_tx2 + eo));
+        }
+    }
+}
+
 // Down with optional FP16 BAR0 epilogue prepush for M<=12 speculative verify (0 extra VGPRs, 64 B extra LDS).
 extern "C" __global__ __launch_bounds__(256, 5)
 void vj_moe_down_dot8_prepush_kernel(

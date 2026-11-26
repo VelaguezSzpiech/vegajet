@@ -33,6 +33,7 @@ struct OrnithGpuOptions {
     int         decode_tokens   = 32;
     bool        fuse_moe_router = true;    // M=1: one fused router+top8+shared Gate/Up+SwiGLU dispatch per layer (4 -> 1)
     bool        gdn_splitv      = true;    // M=1: Split-V GDN recurrence (128 WGs/GPU, 44 VGPRs) instead of the 32-WG kernel
+    bool        gdn_splitv8     = false;   // M=1: select Split-V=8 GDN ConvRec, two ordered dispatches (256 WGs each); off = current path
     bool        fuse_moe_back   = true;    // M=1: routed Gate/Up + shared Down + routed Down as one work-stealing dispatch (3 -> 1)
     uint32_t    moe_back_wgs    = 224;     // resident WGs for M=1 MoE back (224 = exact sum16 s224; 240 = experimental s240)
     uint32_t    gu_dot8_layers  = 0;       // promote layers [0..N) Gate+Up IQ2_S -> exact VJ_Q4_DOT8 (for M<16 decode/verify A/B)
@@ -42,8 +43,18 @@ struct OrnithGpuOptions {
     uint32_t    suffix_max_draft = 11;     // longest suffix-chain draft per cycle (verify batch = this + 1, max 12)
     bool        spec_force_reject = false; // test hook: corrupt one suffix draft per cycle (exercises partial commits)
     bool        spec_gdn        = false;   // M <= 12 verify: single-write Split-V GDN + recompute-on-reject (2-slot ring, ~783 MiB/GPU saved)
+    bool        treewy         = false;   // opt-in: route the spec-GDN verify/commit through the sealed tree-WY pair (VEGAJET_TREEWY=1); sequential fallback
     bool        spec_flash      = false;   // M < 16 decode/verify: 16:1 head-packed Split-KV FlashDecoding
-    bool        zero_tax_catchup = false;  // Hybrid MTP: DrafterKvSync deferred catch-up + confidence-gated suffix-first policy
+    bool        zero_tax_catchup = true;   // default since v0.1.1: lossless, +8-12 % Hybrid at TP=3 (VEGAJET_SPEC_CASCADE=0 / --no-zero-tax-catchup to disable). Hybrid MTP: DrafterKvSync deferred catch-up + confidence-gated suffix-first policy
+    // M1 sealed-wire attention (opt-in, default off): producer-adapt the normal engine's FP32 Q and
+    // 272 B active Q8_0 KV rows into the sealed Q8_0/Q4_0 Split-KV layout and dispatch the pair.
+    // VEGAJET_WIRE_ATTN=1|q4 and VEGAJET_WIRE_ATTN_Q4=1 are the equivalent env switches.
+    bool        sealed_wire_attn = false;
+    bool        sealed_wire_q4 = false;
+    bool        sealed_wire_strict = false;   // A/B guard: abort if a requested step falls back
+    bool        sealed_wire_exercise = false; // tests/short-context A/B: relax the split floor
+    uint32_t    sealed_wire_max_splits = 0;   // 0 = launch-header cap (64)
+    uint64_t    sealed_wire_scratch_budget = 0; // 0 = unbounded (still bounded by the arena allocation)
     uint32_t    fr_spec_rows    = 0;       // FR-Spec draft LM-head shortlist size (0=off/default, 32768 or 65536, multiple of 512; verify stays 100% full-vocab)
     uint32_t    mtp_k           = 4;       // blk.48 MTP draft steps per cycle (1..6)
     bool        gu_grp_verify   = false;   // M >= 8 verify: use expert-grouped Gate+Up instead of per-token Gate+Up
@@ -54,11 +65,22 @@ struct OrnithGpuOptions {
     uint32_t    pf_gemm         = 128;     // M >= 16 dense W4A8 GEMM: 0 legacy, 64 = 64x64 tile, 128 = 64x128 tile (default lossless)
     uint32_t    pf_gdn          = 1;       // M >= 16 GDN: 0 legacy WY (32 WGs), 1 Split-V batch (128 WGs, default lossless), 2 split WY
     bool        pf_gu_tiled     = true;    // M >= 16 routed Gate+Up: LDS-tiled kernel with a work queue (default lossless)
+    uint32_t    pf_moe_iq_lds   = 0;       // 0 = off; 1 = routed Gate+Up through the single 64x64x64
+                                           //   dequant-once-to-LDS work item (64 rows x 64 tokens x K64);
+                                           //   2 = also route the last MoE layer Down through its IQ3_XXS twin
+    uint32_t    pf_moe_iq_lds32 = 0;       // diagnostic alternative to pf_moe_iq_lds: 1 = 32-row x 64-token
+                                           //   tile (two values map to a 64-row block), 2 = also 32-row Down
+    uint32_t    pf_moe_iq_lds_layer = 0xFFFFFFFFu;  // 0..63 = apply the IQ-LDS tiles to that MoE layer only;
+                                                   //   0xFFFFFFFF = every MoE layer (one-layer A/B switch)
     bool        prefill_ar_int8 = true;    // M >= 16 prefill-only block-32 INT8 AllReduce (decode M < 16 ALWAYS stays FP16!)
     bool        ab_no_prepush   = false;   // A/B diagnostic: disable epilogue BAR0 prepush on M=1/verify projections
     bool        prefill_dot8    = false;   // M >= 64 opt-in W4A4 v_dot8_i32_i4 prefill (gated on held-out KLD <= 0.045)
     uint32_t    dot8_scope      = 0;       // 0=all (dense+MoE GU), 1=dense-only, 2=MoE-GU-only
     float       dot8_clip_alpha = 1.0f;    // symmetric INT4 activation clip ratio (0.5..1.0)
+    bool        dot8_fwht       = false;   // with --prefill-dot8: block-64 orthonormal FWHT tile on the 4 dense
+                                           // projections (rotated weight copies + rotated INT4 activations)
+    uint32_t    dot8_fwht_layers = 0;      // with --dot8-fwht: 0 = all 48 layers, N = rotate layers 0..N-1 only
+                                           // (N=1 isolates one layer's contribution in an A/B)
     std::string dump_logits_path;          // bench: dump full-vocab FP32 logits on held-out prompts (for KLD gate) and exit
     std::string gdn_state_dump;            // bench: two-chunk prompt + continuation; dump the carried GDN state at both chunk boundaries
     bool        prefill_seq     = false;   // with gdn_state_dump: feed the prompt one token at a time (sequential reference)
@@ -77,6 +99,11 @@ struct OrnithGpuOptions {
     using ServeGenerateFn = std::function<void(const std::vector<int32_t>& prompt_ids, int32_t max_tokens,
                                                const ServeTokenCb& on_tok)>;
     std::function<void(const ServeGenerateFn& gen, const std::string& engine_desc)> serve_hook;
+    // L6: published on the GPU owner thread before serve_hook starts its mailbox.
+    using ServeStepFn = std::function<std::vector<int32_t>(const std::vector<uint32_t>&,
+        const std::vector<uint32_t>&, const std::vector<int32_t>&, const std::vector<bool>&)>;
+    using ServePrefillFn = std::function<int32_t(uint32_t,uint32_t,const std::vector<int32_t>&,bool,bool)>;
+    std::function<void(ServeStepFn,ServePrefillFn)> serve_step_ready;
 };
 
 struct OrnithBenchMetrics {
@@ -84,6 +111,7 @@ struct OrnithBenchMetrics {
     double   load_sec = 0.0;
     double   vram_gib_gpu0 = 0.0;
     double   vram_gib_gpu1 = 0.0;
+    std::vector<double> vram_gib_per_gpu;
     double   tg128_raw_tps = 0.0;
     double   tg128_suffix_tps = 0.0;
     double   tg512_suffix_tps = 0.0;

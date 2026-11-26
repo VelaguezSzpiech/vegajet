@@ -1,0 +1,42 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+#pragma once
+// In-band readiness: each aligned dword contains one half and its 16-bit epoch.
+// No assumption that dwordx4 is indivisible.
+namespace vegajet { namespace ar_fused {
+constexpr uint64_t kOffset = 2ULL * 1024ULL * 1024ULL - 32768ULL;
+template<class P, class V>
+__device__ __forceinline__ void store8(P dst, V v, uint32_t epoch) {
+    #pragma unroll
+    for (uint32_t j = 0; j < 4; ++j) {
+        const uint32_t pair = v[j];
+        // Explicit scalar-width stores: readiness and value share one dword.
+        #pragma unroll
+        for (uint32_t k = 0; k < 2; ++k) {
+            uint32_t word = ((pair >> (16u * k)) & 65535u) | (epoch << 16u);
+            auto p = dst + 2u * j + k;
+            asm volatile("global_store_dword %0, %1, off slc" :: "v"(p), "v"(word) : "memory");
+        }
+    }
+}
+template<class P>
+__device__ __forceinline__ uint4 load8(P src, uint32_t epoch) {
+    uint4 pairs = make_uint4(0u, 0u, 0u, 0u);
+    #pragma nounroll
+    for (uint32_t j = 0; j < 4; ++j) {
+        uint32_t pair = 0;
+        #pragma unroll
+        for (uint32_t k = 0; k < 2; ++k) {
+            uint32_t word;
+            auto p = src + 2u * j + k;
+            // Unbounded wait: never consume stale payload on timeout.
+            do {
+                asm volatile("global_load_dword %0, %1, off glc slc\n\ts_waitcnt vmcnt(0)"
+                             : "=v"(word) : "v"(p) : "memory");
+            } while ((word >> 16u) != epoch);
+            pair |= (word & 65535u) << (16u * k);
+        }
+        pairs = make_uint4(pairs.y, pairs.z, pairs.w, pair);
+    }
+    return pairs;
+}
+} }

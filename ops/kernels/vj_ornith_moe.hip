@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 #include "ops/kernels/vj_ornith_common.hiph"
+#include "core/acceptmoe.hpp"
 
 // ============================================================================
 // 8. 33-WG FP16 MoE Router Logits + Shared Gate (8-token tiled for M > 1, 0 B spill!)
@@ -543,7 +544,7 @@ void ornith_moe_group_sort_kernel(
     }
 }
 
-extern "C" __global__ __launch_bounds__(256, 2)
+extern "C" __global__ __launch_bounds__(256, 2) __attribute__((amdgpu_num_vgpr(64)))
 void ornith_moe_gu_iq2s_grouped_kernel(
     const uint4*    __restrict__ wgu_merged,
     const int8_t*   __restrict__ x_q8,      // [M, 3072]
@@ -585,35 +586,39 @@ void ornith_moe_gu_iq2s_grouped_kernel(
             const uint32_t* hs_p = reinterpret_cast<const uint32_t*>(qp_p + 96u);
             const uint32_t* d_p  = reinterpret_cast<const uint32_t*>(qp_p + 120u);
 
-            float ag[8] = {0,0,0,0,0,0,0,0};
-            float au[8] = {0,0,0,0,0,0,0,0};
-
+            // Keep one eight-token accumulator bank live. Each projection retains the
+            // original six-block FMA order and 16-lane reduction; sm_y holds gate until up.
             #pragma nounroll
-            for (uint32_t it = 0u; it < 6u; ++it) {
-                const uint32_t ib  = it * 16u + lane16;
-                const uint4    q   = vegajet::ornith_dev::ldg_u32x4_stream(qp_p + ib);
-                const uint32_t hs2 = vegajet::ornith_dev::ldg_u32_stream(hs_p + ib);
-                const uint32_t d2  = d_p[ib >> 3];
+            for (uint32_t projection = 0u; projection < 2u; ++projection) {
+                float acc[8] = {0,0,0,0,0,0,0,0};
 
-                // Unpack Gate weights ONCE and reuse across all T tokens!
-                {
-                    const uint32_t qh = hs2 & 0xFFu, sc = (hs2 >> 8) & 0xFFu;
-                    const float gd    = vegajet::ornith_dev::fp16_to_f32(static_cast<uint16_t>(d2 & 0xFFFFu)) * 0.25f;
-                    const float gd0   = gd * (0.5f + static_cast<float>(sc & 0xFu));
-                    const float gd1   = gd * (0.5f + static_cast<float>(sc >> 4));
-                    const uint64_t g0 = sm_grid[(q.x & 0xFFu)         | ((qh << 8) & 0x300u)];
-                    const uint64_t g1 = sm_grid[((q.x >> 16) & 0xFFu) | ((qh << 6) & 0x300u)];
-                    const uint64_t g2 = sm_grid[(q.y & 0xFFu)         | ((qh << 4) & 0x300u)];
-                    const uint64_t g3 = sm_grid[((q.y >> 16) & 0xFFu) | ((qh << 2) & 0x300u)];
-                    const uint32_t w0 = vegajet::ornith_dev::apply_4signs_i8x4(static_cast<uint32_t>(g0),       (q.x >> 8)  & 0xFu);
-                    const uint32_t w1 = vegajet::ornith_dev::apply_4signs_i8x4(static_cast<uint32_t>(g0 >> 32), (q.x >> 12) & 0xFu);
-                    const uint32_t w2 = vegajet::ornith_dev::apply_4signs_i8x4(static_cast<uint32_t>(g1),       (q.x >> 24) & 0xFu);
-                    const uint32_t w3 = vegajet::ornith_dev::apply_4signs_i8x4(static_cast<uint32_t>(g1 >> 32), q.x >> 28);
-                    const uint32_t w4 = vegajet::ornith_dev::apply_4signs_i8x4(static_cast<uint32_t>(g2),       (q.y >> 8)  & 0xFu);
-                    const uint32_t w5 = vegajet::ornith_dev::apply_4signs_i8x4(static_cast<uint32_t>(g2 >> 32), (q.y >> 12) & 0xFu);
-                    const uint32_t w6 = vegajet::ornith_dev::apply_4signs_i8x4(static_cast<uint32_t>(g3),       (q.y >> 24) & 0xFu);
-                    const uint32_t w7 = vegajet::ornith_dev::apply_4signs_i8x4(static_cast<uint32_t>(g3 >> 32), q.y >> 28);
+                #pragma nounroll
+                for (uint32_t it = 0u; it < 6u; ++it) {
+                    const uint32_t ib  = it * 16u + lane16;
+                    const uint4    q   = vegajet::ornith_dev::ldg_u32x4_stream(qp_p + ib);
+                    const uint32_t hs2 = vegajet::ornith_dev::ldg_u32_stream(hs_p + ib);
+                    const uint32_t d2  = d_p[ib >> 3];
+                    const uint32_t q0  = (projection == 0u) ? q.x : q.z;
+                    const uint32_t q1  = (projection == 0u) ? q.y : q.w;
+                    const uint32_t hs  = hs2 >> (projection * 16u);
+                    const uint32_t qh  = hs & 0xFFu, sc = (hs >> 8) & 0xFFu;
+                    const float d     = vegajet::ornith_dev::fp16_to_f32(static_cast<uint16_t>(d2 >> (projection * 16u))) * 0.25f;
+                    const float d0    = d * (0.5f + static_cast<float>(sc & 0xFu));
+                    const float d1    = d * (0.5f + static_cast<float>(sc >> 4));
+                    const uint64_t g0 = sm_grid[(q0 & 0xFFu)         | ((qh << 8) & 0x300u)];
+                    const uint64_t g1 = sm_grid[((q0 >> 16) & 0xFFu) | ((qh << 6) & 0x300u)];
+                    const uint64_t g2 = sm_grid[(q1 & 0xFFu)         | ((qh << 4) & 0x300u)];
+                    const uint64_t g3 = sm_grid[((q1 >> 16) & 0xFFu) | ((qh << 2) & 0x300u)];
+                    const uint32_t w0 = vegajet::ornith_dev::apply_4signs_i8x4(static_cast<uint32_t>(g0),       (q0 >> 8)  & 0xFu);
+                    const uint32_t w1 = vegajet::ornith_dev::apply_4signs_i8x4(static_cast<uint32_t>(g0 >> 32), (q0 >> 12) & 0xFu);
+                    const uint32_t w2 = vegajet::ornith_dev::apply_4signs_i8x4(static_cast<uint32_t>(g1),       (q0 >> 24) & 0xFu);
+                    const uint32_t w3 = vegajet::ornith_dev::apply_4signs_i8x4(static_cast<uint32_t>(g1 >> 32), q0 >> 28);
+                    const uint32_t w4 = vegajet::ornith_dev::apply_4signs_i8x4(static_cast<uint32_t>(g2),       (q1 >> 8)  & 0xFu);
+                    const uint32_t w5 = vegajet::ornith_dev::apply_4signs_i8x4(static_cast<uint32_t>(g2 >> 32), (q1 >> 12) & 0xFu);
+                    const uint32_t w6 = vegajet::ornith_dev::apply_4signs_i8x4(static_cast<uint32_t>(g3),       (q1 >> 24) & 0xFu);
+                    const uint32_t w7 = vegajet::ornith_dev::apply_4signs_i8x4(static_cast<uint32_t>(g3 >> 32), q1 >> 28);
 
+                    // Unpack once per projection/block and reuse across all T tokens.
                     for (uint32_t t = 0u; t < T; ++t) {
                         const uint32_t m   = sm_ms[t] >> 3;
                         const uint4*   xq4 = reinterpret_cast<const uint4*>(x_q8 + static_cast<uint64_t>(m) * 3072u);
@@ -622,46 +627,23 @@ void ornith_moe_gu_iq2s_grouped_kernel(
                         const float    xda = x_ds[static_cast<uint64_t>(m) * 96u + ib].x;
                         int32_t dp0 = vegajet::ornith_dev::sdot4(w3, xa.w, vegajet::ornith_dev::sdot4(w2, xa.z, vegajet::ornith_dev::sdot4(w1, xa.y, vegajet::ornith_dev::sdot4(w0, xa.x, 0))));
                         int32_t dp1 = vegajet::ornith_dev::sdot4(w7, xb.w, vegajet::ornith_dev::sdot4(w6, xb.z, vegajet::ornith_dev::sdot4(w5, xb.y, vegajet::ornith_dev::sdot4(w4, xb.x, 0))));
-                        ag[t] = fmaf(gd0 * xda, static_cast<float>(dp0), fmaf(gd1 * xda, static_cast<float>(dp1), ag[t]));
+                        acc[t] = fmaf(d0 * xda, static_cast<float>(dp0), fmaf(d1 * xda, static_cast<float>(dp1), acc[t]));
                     }
                 }
-                // Unpack Up weights ONCE and reuse across all T tokens!
-                {
-                    const uint32_t qh = (hs2 >> 16) & 0xFFu, sc = hs2 >> 24;
-                    const float ud    = vegajet::ornith_dev::fp16_to_f32(static_cast<uint16_t>(d2 >> 16)) * 0.25f;
-                    const float ud0   = ud * (0.5f + static_cast<float>(sc & 0xFu));
-                    const float ud1   = ud * (0.5f + static_cast<float>(sc >> 4));
-                    const uint64_t g0 = sm_grid[(q.z & 0xFFu)         | ((qh << 8) & 0x300u)];
-                    const uint64_t g1 = sm_grid[((q.z >> 16) & 0xFFu) | ((qh << 6) & 0x300u)];
-                    const uint64_t g2 = sm_grid[(q.w & 0xFFu)         | ((qh << 4) & 0x300u)];
-                    const uint64_t g3 = sm_grid[((q.w >> 16) & 0xFFu) | ((qh << 2) & 0x300u)];
-                    const uint32_t w0 = vegajet::ornith_dev::apply_4signs_i8x4(static_cast<uint32_t>(g0),       (q.z >> 8)  & 0xFu);
-                    const uint32_t w1 = vegajet::ornith_dev::apply_4signs_i8x4(static_cast<uint32_t>(g0 >> 32), (q.z >> 12) & 0xFu);
-                    const uint32_t w2 = vegajet::ornith_dev::apply_4signs_i8x4(static_cast<uint32_t>(g1),       (q.z >> 24) & 0xFu);
-                    const uint32_t w3 = vegajet::ornith_dev::apply_4signs_i8x4(static_cast<uint32_t>(g1 >> 32), q.z >> 28);
-                    const uint32_t w4 = vegajet::ornith_dev::apply_4signs_i8x4(static_cast<uint32_t>(g2),       (q.w >> 8)  & 0xFu);
-                    const uint32_t w5 = vegajet::ornith_dev::apply_4signs_i8x4(static_cast<uint32_t>(g2 >> 32), (q.w >> 12) & 0xFu);
-                    const uint32_t w6 = vegajet::ornith_dev::apply_4signs_i8x4(static_cast<uint32_t>(g3),       (q.w >> 24) & 0xFu);
-                    const uint32_t w7 = vegajet::ornith_dev::apply_4signs_i8x4(static_cast<uint32_t>(g3 >> 32), q.w >> 28);
 
-                    for (uint32_t t = 0u; t < T; ++t) {
-                        const uint32_t m   = sm_ms[t] >> 3;
-                        const uint4*   xq4 = reinterpret_cast<const uint4*>(x_q8 + static_cast<uint64_t>(m) * 3072u);
-                        const uint4    xa  = xq4[ib * 2u];
-                        const uint4    xb  = xq4[ib * 2u + 1u];
-                        const float    xda = x_ds[static_cast<uint64_t>(m) * 96u + ib].x;
-                        int32_t dp0 = vegajet::ornith_dev::sdot4(w3, xa.w, vegajet::ornith_dev::sdot4(w2, xa.z, vegajet::ornith_dev::sdot4(w1, xa.y, vegajet::ornith_dev::sdot4(w0, xa.x, 0))));
-                        int32_t dp1 = vegajet::ornith_dev::sdot4(w7, xb.w, vegajet::ornith_dev::sdot4(w6, xb.z, vegajet::ornith_dev::sdot4(w5, xb.y, vegajet::ornith_dev::sdot4(w4, xb.x, 0))));
-                        au[t] = fmaf(ud0 * xda, static_cast<float>(dp0), fmaf(ud1 * xda, static_cast<float>(dp1), au[t]));
+                for (uint32_t t = 0u; t < T; ++t) {
+                    float v = acc[t];
+                    v += __shfl_xor(v, 8, 16); v += __shfl_xor(v, 4, 16); v += __shfl_xor(v, 2, 16); v += __shfl_xor(v, 1, 16);
+                    if (lane16 == 0u) {
+                        const uint32_t idx = t * 32u + half * 16u + sub_id;
+                        if (projection == 0u) {
+                            sm_y[idx] = v;
+                        } else {
+                            const float gv = sm_y[idx]; // same lane stored the gate result
+                            sm_y[idx] = (gv / (1.0f + __expf(-gv))) * v;
+                        }
                     }
                 }
-            }
-
-            for (uint32_t t = 0u; t < T; ++t) {
-                float gv = ag[t], uv = au[t];
-                gv += __shfl_xor(gv, 8, 16); gv += __shfl_xor(gv, 4, 16); gv += __shfl_xor(gv, 2, 16); gv += __shfl_xor(gv, 1, 16);
-                uv += __shfl_xor(uv, 8, 16); uv += __shfl_xor(uv, 4, 16); uv += __shfl_xor(uv, 2, 16); uv += __shfl_xor(uv, 1, 16);
-                if (lane16 == 0u) sm_y[t * 32u + half * 16u + sub_id] = (gv / (1.0f + __expf(-gv))) * uv;
             }
         }
         __syncthreads();
@@ -857,17 +839,18 @@ void ornith_moe_gu_q4a8_kernel(
 
 extern "C" __global__ __launch_bounds__(256, 5)
 void ornith_moe_down_q4a8_kernel(
-    const uint8_t*  __restrict__ wd_qs,    // [256 * D, 256] (cols=512 -> 256 B/row!)
-    const uint32_t* __restrict__ wd_dm,    // [256 * D, 16]
-    const int8_t*   __restrict__ mid_q8,   // [M, 8, 512]
-    const float2*   __restrict__ mid_ds,   // [M, 8, 16]
+    const uint8_t*  __restrict__ wd_qs,    // [256 * D, local_ff / 2] (e.g. 512->256B, 384->192B, 320->160B)
+    const uint32_t* __restrict__ wd_dm,    // [256 * D, local_ff / 32]
+    const int8_t*   __restrict__ mid_q8,   // [M, 8, local_ff]
+    const float2*   __restrict__ mid_ds,   // [M, 8, local_ff / 32]
     const int32_t*  __restrict__ top_ids,  // [M, 8]
     const float*    __restrict__ top_w,    // [M, 8]
     const float*    __restrict__ sh_down_in,
     float*          __restrict__ out_f32,
     uint32_t M,
     uint32_t D,
-    uint32_t stride_b) {
+    uint32_t stride_b,
+    uint32_t local_ff) {
     __shared__ uint4   sm_mq[256];
     __shared__ float2  sm_mds[128];
     __shared__ int32_t sm_ids[8];
@@ -879,9 +862,15 @@ void ornith_moe_down_q4a8_kernel(
     const uint32_t row    = blockIdx.x * 16u + sub_r;
     if (m >= M) return;
 
-    sm_mq[threadIdx.x] = reinterpret_cast<const uint4*>(mid_q8 + static_cast<uint64_t>(m) * 4096u)[threadIdx.x];
-    if (threadIdx.x < 128u) sm_mds[threadIdx.x] = mid_ds[static_cast<uint64_t>(m) * 128u + threadIdx.x];
-    if (threadIdx.x <   8u) {
+    const uint32_t n_blk   = local_ff >> 5;           // <= 16 (16 on TP=2, 12/10/10 on TP=3)
+    const uint32_t n_q8_u4 = 8u * (local_ff >> 4);    // <= 256
+    const uint32_t n_ds    = 8u * n_blk;              // <= 128
+
+    if (threadIdx.x < n_q8_u4)
+        sm_mq[threadIdx.x] = reinterpret_cast<const uint4*>(mid_q8 + static_cast<uint64_t>(m) * (8u * local_ff))[threadIdx.x];
+    if (threadIdx.x < n_ds)
+        sm_mds[threadIdx.x] = mid_ds[static_cast<uint64_t>(m) * n_ds + threadIdx.x];
+    if (threadIdx.x < 8u) {
         sm_ids[threadIdx.x] = top_ids[static_cast<uint64_t>(m) * 8u + threadIdx.x];
         sm_w[threadIdx.x]   = top_w[static_cast<uint64_t>(m) * 8u + threadIdx.x];
     }
@@ -889,32 +878,35 @@ void ornith_moe_down_q4a8_kernel(
     if (row >= D) return;
 
     float total = 0.0f;
-    #pragma nounroll
-    for (uint32_t slot = 0u; slot < 8u; ++slot) {
-        const uint32_t exp_id = static_cast<uint32_t>(sm_ids[slot]);
-        const float    ew     = sm_w[slot];
-        const uint64_t erow   = static_cast<uint64_t>(exp_id) * D + row;
-        const uint4*    w4    = reinterpret_cast<const uint4*>(wd_qs + erow * stride_b);
-        const uint32_t* dm    = wd_dm + erow * 16ULL;
+    if (lane16 < n_blk) {
+        const uint32_t n_blk2 = n_blk << 1;
+        #pragma nounroll
+        for (uint32_t slot = 0u; slot < 8u; ++slot) {
+            const uint32_t exp_id = static_cast<uint32_t>(sm_ids[slot]);
+            const float    ew     = sm_w[slot];
+            const uint64_t erow   = static_cast<uint64_t>(exp_id) * D + row;
+            const uint4*    w4    = reinterpret_cast<const uint4*>(wd_qs + erow * stride_b);
+            const uint32_t* dm    = wd_dm + erow * n_blk;
 
-        const uint4    wv  = vegajet::ornith_dev::ldg_u32x4_stream(w4 + lane16);
-        const uint32_t dmv = vegajet::ornith_dev::ldg_u32_stream(dm + lane16);
-        const uint4    xa  = sm_mq[slot * 32u + lane16 * 2u + 0u];
-        const uint4    xb  = sm_mq[slot * 32u + lane16 * 2u + 1u];
-        const float2   xds = sm_mds[slot * 16u + lane16];
+            const uint4    wv  = vegajet::ornith_dev::ldg_u32x4_stream(w4 + lane16);
+            const uint32_t dmv = vegajet::ornith_dev::ldg_u32_stream(dm + lane16);
+            const uint4    xa  = sm_mq[slot * n_blk2 + lane16 * 2u + 0u];
+            const uint4    xb  = sm_mq[slot * n_blk2 + lane16 * 2u + 1u];
+            const float2   xds = sm_mds[slot * n_blk + lane16];
 
-        int32_t dp = vegajet::ornith_dev::sdot4(wv.x & 0x0F0F0F0Fu, xa.x, 0);
-        dp         = vegajet::ornith_dev::sdot4(wv.y & 0x0F0F0F0Fu, xa.y, dp);
-        dp         = vegajet::ornith_dev::sdot4(wv.z & 0x0F0F0F0Fu, xa.z, dp);
-        dp         = vegajet::ornith_dev::sdot4(wv.w & 0x0F0F0F0Fu, xa.w, dp);
-        dp         = vegajet::ornith_dev::sdot4((wv.x >> 4) & 0x0F0F0F0Fu, xb.x, dp);
-        dp         = vegajet::ornith_dev::sdot4((wv.y >> 4) & 0x0F0F0F0Fu, xb.y, dp);
-        dp         = vegajet::ornith_dev::sdot4((wv.z >> 4) & 0x0F0F0F0Fu, xb.z, dp);
-        dp         = vegajet::ornith_dev::sdot4((wv.w >> 4) & 0x0F0F0F0Fu, xb.w, dp);
+            int32_t dp = vegajet::ornith_dev::sdot4(wv.x & 0x0F0F0F0Fu, xa.x, 0);
+            dp         = vegajet::ornith_dev::sdot4(wv.y & 0x0F0F0F0Fu, xa.y, dp);
+            dp         = vegajet::ornith_dev::sdot4(wv.z & 0x0F0F0F0Fu, xa.z, dp);
+            dp         = vegajet::ornith_dev::sdot4(wv.w & 0x0F0F0F0Fu, xa.w, dp);
+            dp         = vegajet::ornith_dev::sdot4((wv.x >> 4) & 0x0F0F0F0Fu, xb.x, dp);
+            dp         = vegajet::ornith_dev::sdot4((wv.y >> 4) & 0x0F0F0F0Fu, xb.y, dp);
+            dp         = vegajet::ornith_dev::sdot4((wv.z >> 4) & 0x0F0F0F0Fu, xb.z, dp);
+            dp         = vegajet::ornith_dev::sdot4((wv.w >> 4) & 0x0F0F0F0Fu, xb.w, dp);
 
-        const float wd = vegajet::ornith_dev::fp16_to_f32(static_cast<uint16_t>(dmv & 0xFFFFu));
-        const float wm = vegajet::ornith_dev::fp16_to_f32(static_cast<uint16_t>(dmv >> 16));
-        total = fmaf(ew, fmaf(wd * xds.x, static_cast<float>(dp), wm * xds.y), total);
+            const float wd = vegajet::ornith_dev::fp16_to_f32(static_cast<uint16_t>(dmv & 0xFFFFu));
+            const float wm = vegajet::ornith_dev::fp16_to_f32(static_cast<uint16_t>(dmv >> 16));
+            total = fmaf(ew, fmaf(wd * xds.x, static_cast<float>(dp), wm * xds.y), total);
+        }
     }
 
     total += __shfl_xor(total, 8, 16);
@@ -927,3 +919,106 @@ void ornith_moe_down_q4a8_kernel(
     }
 }
 
+
+// ============================================================================
+// 8z. AcceptMoE (VEGAJET_SPEC_ACCEPTMOE=1, opt-in, LOSSY): speculative-verify (M >= 2) top-8 routing that
+//     shrinks the per-batch expert union. Token 0 (the committed context token) is routed exactly as
+//     ornith_moe_router_top8_kernel. Draft token m >= 1 keeps its own top-`keep` experts, then fills the
+//     remaining 8 - keep slots ranking commitment-weighted union and cold-expert scores.
+//     Position m uses acceptance^m; nonunion multiplier = 1 - acceptance^m * (1-penalty).
+//     Recency is frozen for the cycle and updated after all rows; window=0 disables cold bias.
+//     Weights are the true softmax
+//     probabilities of the chosen experts renormalized like the baseline. Draft-position outputs change, so
+//     greedy acceptance is no longer guaranteed identical to raw decode: measure KL / parity before use.
+//     Grid = 64 threads (one wave), tokens processed in order.
+// ============================================================================
+extern "C" __global__ __launch_bounds__(64, 1)
+void vj_moe_top8_acceptmoe_kernel(
+    const float* __restrict__ logits_in,
+    int32_t*     __restrict__ top_ids,
+    float*       __restrict__ top_w,
+    uint32_t M,
+    uint32_t keep,
+    float    penalty,
+    float    acceptance,
+    float    cold_penalty,
+    uint32_t window,
+    uint32_t tick,
+    uint32_t* __restrict__ recency) {
+    using namespace vegajet::ornith_dev;
+    const uint32_t l = threadIdx.x;
+    __shared__ uint32_t sm_union[8];
+    if (l < 8u) sm_union[l] = 0u;
+    __syncthreads();
+    float commitment = 1.0f;
+    #pragma nounroll
+    for (uint32_t m = 0u; m < M; ++m) {
+        if (m != 0u) commitment *= acceptance;
+        const float* lg = logits_in + static_cast<uint64_t>(m) * 256u;
+        float x0 = lg[l], x1 = lg[l + 64u], x2 = lg[l + 128u], x3 = lg[l + 192u];
+        float mx = fmaxf(fmaxf(x0, x1), fmaxf(x2, x3));
+        mx = fmaxf(mx, xor_shfl_f32_fast<32>(mx));
+        mx = fmaxf(mx, xor_shfl_f32_fast<16>(mx));
+        mx = fmaxf(mx, xor_shfl_f32_fast<8>(mx));
+        mx = fmaxf(mx, xor_shfl_f32_fast<4>(mx));
+        mx = fmaxf(mx, xor_shfl_f32_fast<2>(mx));
+        mx = fmaxf(mx, xor_shfl_f32_fast<1>(mx));
+        float p[4] = {__expf(x0 - mx), __expf(x1 - mx), __expf(x2 - mx), __expf(x3 - mx)};
+        const float s = ((wave64_sum(p[0]) + wave64_sum(p[1])) + wave64_sum(p[2])) + wave64_sum(p[3]);
+        const float inv_s = 1.0f / fmaxf(s, 1e-30f);
+        uint64_t kp[4], ka[4];
+        const uint32_t keep_m = (m == 0u) ? 8u : min(keep, 8u);
+        #pragma unroll
+        for (uint32_t c = 0u; c < 4u; ++c) {
+            p[c] *= inv_s;
+            const uint32_t e = l + 64u * c;
+            const bool in_u = ((sm_union[e >> 5] >> (e & 31u)) & 1u) != 0u;
+            const float pa = p[c] * vegajet::acceptmoe::multiplier(in_u,
+                m != 0u && vegajet::acceptmoe::cold(recency[e], tick, window),
+                commitment, penalty, cold_penalty);
+            kp[c] = (static_cast<uint64_t>(__float_as_uint(p[c])) << 32) | static_cast<uint64_t>(255u - e);
+            ka[c] = (static_cast<uint64_t>(__float_as_uint(pa)) << 32) | static_cast<uint64_t>(255u - e);
+        }
+        float top_sum = 0.0f;
+        #pragma nounroll
+        for (uint32_t r = 0u; r < 8u; ++r) {
+            const bool own = (r < keep_m);
+            uint64_t a0 = own ? kp[0] : ka[0], a1 = own ? kp[1] : ka[1], a2 = own ? kp[2] : ka[2], a3 = own ? kp[3] : ka[3];
+            uint64_t bk = (a0 > a1) ? a0 : a1;
+            const uint64_t b2 = (a2 > a3) ? a2 : a3;
+            if (b2 > bk) bk = b2;
+            bk = step_max_u64<32>(bk);
+            bk = step_max_u64<16>(bk);
+            bk = step_max_u64<8>(bk);
+            bk = step_max_u64<4>(bk);
+            bk = step_max_u64<2>(bk);
+            bk = step_max_u64<1>(bk);
+            const uint32_t e_sel = 255u - static_cast<uint32_t>(bk & 255u);
+            // true probability of the chosen expert lives in lane e_sel & 63, component e_sel >> 6
+            const uint32_t c_sel = e_sel >> 6;
+            const float pc = (c_sel == 0u) ? p[0] : (c_sel == 1u) ? p[1] : (c_sel == 2u) ? p[2] : p[3];
+            const float v = __shfl(pc, static_cast<int>(e_sel & 63u), 64);
+            #pragma unroll
+            for (uint32_t c = 0u; c < 4u; ++c) {
+                if (l + 64u * c == e_sel) { kp[c] = 0ULL; ka[c] = 0ULL; }
+            }
+            if (l == 0u) {
+                top_ids[static_cast<uint64_t>(m) * 8u + r] = static_cast<int32_t>(e_sel);
+                top_w[static_cast<uint64_t>(m) * 8u + r]   = v;
+                top_sum += v;
+                sm_union[e_sel >> 5] |= (1u << (e_sel & 31u));
+            }
+        }
+        if (l == 0u) {
+            const float inv_w = 1.0f / fmaxf(top_sum, 1e-30f);
+            #pragma unroll
+            for (uint32_t r = 0u; r < 8u; ++r) top_w[static_cast<uint64_t>(m) * 8u + r] *= inv_w;
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for (uint32_t c = 0u; c < 4u; ++c) {
+        const uint32_t e = l + 64u * c;
+        if ((sm_union[e >> 5] >> (e & 31u)) & 1u) recency[e] = tick;
+    }
+}

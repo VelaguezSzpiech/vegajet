@@ -66,6 +66,20 @@ __device__ __forceinline__ float sum8(const float* r, uint32_t i) {  // left-to-
     return r[i] + r[32u + i] + r[64u + i] + r[96u + i] + r[128u + i] + r[160u + i] + r[192u + i] + r[224u + i];
 }
 
+// Combine one thread's four 4-row chains with lane c+32's (row groups 4..7 of the same 32-row wave) in the
+// super kernel's XOR 32,16,8 order: ((g0+g4)+(g2+g6))+((g1+g5)+(g3+g7)).
+__device__ __forceinline__ float super_wave_sum4(const float* pc) {
+    const float a0 = pc[0] + __shfl_xor(pc[0], 32, 64);
+    const float a1 = pc[1] + __shfl_xor(pc[1], 32, 64);
+    const float a2 = pc[2] + __shfl_xor(pc[2], 32, 64);
+    const float a3 = pc[3] + __shfl_xor(pc[3], 32, 64);
+    return (a0 + a2) + (a1 + a3);
+}
+
+__device__ __forceinline__ float sum4w(const float* r, uint32_t i) {  // (wave0 + wave1) + (wave2 + wave3)
+    return (r[i] + r[32u + i]) + (r[64u + i] + r[96u + i]);
+}
+
 } // namespace spec_gdn_dev
 } // namespace vegajet
 
@@ -109,8 +123,8 @@ void vj_spec_gdn_verify_kernel(
     __shared__ float sm_v[VJ_SPEC_GDN_MAX_M * 32];
     __shared__ float sm_g[VJ_SPEC_GDN_MAX_M];
     __shared__ float sm_b[VJ_SPEC_GDN_MAX_M];
-    __shared__ float sm_p[8 * 32];
-    __shared__ float sm_o[8 * 32];
+    __shared__ float sm_p[4 * 32];
+    __shared__ float sm_o[4 * 32];
     __shared__ float sm_dv[32];
 
     // ---- stage all M tokens' inputs in LDS (and record them for recompute-on-reject) ----
@@ -160,18 +174,26 @@ void vj_spec_gdn_verify_kernel(
     #pragma nounroll
     do {
         const float* km = sm_k + m * 128u + i_beg;
-        float p = 0.0f;
+        // Production M=1 super order: 4-row FMA chains, then per 32-row wave ((g0+g4)+(g2+g6))+((g1+g5)+(g3+g7)),
+        // then (w0+w1)+(w2+w3). Row groups g0..3 live in lane c, g4..7 in lane c+32 of the same wave.
+        float pc[4];
         #pragma unroll
-        for (uint32_t r = 0u; r < 16u; ++r) p = fmaf(s_reg[r], km[r], p);
-        sm_p[rg * 32u + c] = p;
+        for (uint32_t j = 0u; j < 4u; ++j) {
+            pc[j] = s_reg[4u * j] * km[4u * j];
+            #pragma unroll
+            for (uint32_t r = 1u; r < 4u; ++r) pc[j] = fmaf(s_reg[4u * j + r], km[4u * j + r], pc[j]);
+            __builtin_amdgcn_sched_barrier(0);
+        }
+        const float pw = super_wave_sum4(pc);
+        if ((rg & 1u) == 0u) sm_p[(rg >> 1) * 32u + c] = pw;
         __syncthreads();  // A: pred partials of token m visible; o partials of token m-1 visible
 
         if (tid < 32u) {
-            const float pred = sum8(sm_p, tid);
+            const float pred = sum4w(sm_p, tid);
             const float vj = sm_v[m * 32u + tid];
             sm_dv[tid] = sm_b[m] * (vj - sm_g[m] * pred);
         } else if (o_out != nullptr && q_src != nullptr && m > 0u && tid >= 64u && tid < 96u) {
-            o_out[(static_cast<uint64_t>(m - 1u) * nv + hv) * 128u + col0 + (tid - 64u)] = sum8(sm_o, tid - 64u);
+            o_out[(static_cast<uint64_t>(m - 1u) * nv + hv) * 128u + col0 + (tid - 64u)] = sum4w(sm_o, tid - 64u);
         }
         __syncthreads();  // B: dv visible; sm_o free for token m
 
@@ -179,21 +201,19 @@ void vj_spec_gdn_verify_kernel(
         const float g_exp = sm_g[m];
         if (q_src) {
             const float* qm = sm_q + m * 128u + i_beg;
-            float o = 0.0f;
-            // Two halves with a scheduling fence: bounds the LDS operands in flight to 8 k + 8 q values
-            // (47 VGPRs; unfenced the scheduler hoists all 32 reads: 55 VGPRs).
+            float oc[4];
             #pragma unroll
-            for (uint32_t r = 0u; r < 8u; ++r) {
-                s_reg[r] = fmaf(km[r], dv, g_exp * s_reg[r]);
-                o = fmaf(s_reg[r], qm[r], o);
+            for (uint32_t j = 0u; j < 4u; ++j) {
+                #pragma unroll
+                for (uint32_t r = 0u; r < 4u; ++r) {
+                    const uint32_t i = 4u * j + r;
+                    s_reg[i] = fmaf(km[i], dv, g_exp * s_reg[i]);
+                    oc[j] = (r == 0u) ? s_reg[i] * qm[i] : fmaf(s_reg[i], qm[i], oc[j]);
+                }
+                __builtin_amdgcn_sched_barrier(0);
             }
-            __builtin_amdgcn_sched_barrier(0);
-            #pragma unroll
-            for (uint32_t r = 8u; r < 16u; ++r) {
-                s_reg[r] = fmaf(km[r], dv, g_exp * s_reg[r]);
-                o = fmaf(s_reg[r], qm[r], o);
-            }
-            sm_o[rg * 32u + c] = o;
+            const float ow = super_wave_sum4(oc);
+            if ((rg & 1u) == 0u) sm_o[(rg >> 1) * 32u + c] = ow;
         } else {
             #pragma unroll
             for (uint32_t r = 0u; r < 16u; ++r) s_reg[r] = fmaf(km[r], dv, g_exp * s_reg[r]);
@@ -201,7 +221,7 @@ void vj_spec_gdn_verify_kernel(
     } while (++m < M);
     __syncthreads();
     if (o_out != nullptr && q_src != nullptr && tid >= 64u && tid < 96u)
-        o_out[(static_cast<uint64_t>(M - 1u) * nv + hv) * 128u + col0 + (tid - 64u)] = sum8(sm_o, tid - 64u);
+        o_out[(static_cast<uint64_t>(M - 1u) * nv + hv) * 128u + col0 + (tid - 64u)] = sum4w(sm_o, tid - 64u);
 
     // ---- S_M: written once ----
     float* S_thr_out = S_out + s_off;

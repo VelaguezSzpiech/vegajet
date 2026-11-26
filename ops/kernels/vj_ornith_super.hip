@@ -86,20 +86,27 @@ __device__ __forceinline__ uint32_t iq2s_perm4(uint32_t mag4_sel, uint32_t sign4
     return __builtin_amdgcn_perm(0x00D5E7F8u, 0x002B1908u, sel);
 }
 
-__device__ __forceinline__ void signal_out_peer_flag(
-    GPtr<uint32_t> sbar,
-    uint64_t       out_peer_flag_va,
-    uint32_t       n_active_wgs,
-    uint32_t       out_ar_epoch) {
+__device__ __forceinline__ void signal_out_peer_flag_n(
+    GPtr<uint32_t>  sbar,
+    const uint64_t* out_peer_flag,
+    uint32_t        rank,
+    uint32_t        n_ranks,
+    uint32_t        n_active_wgs,
+    uint32_t        out_ar_epoch) {
+    if (n_ranks <= 1u) return;
     asm volatile("s_waitcnt vmcnt(0)\n" ::: "memory");
+    __threadfence_system();
     __syncthreads();
     if (threadIdx.x == 0u) {
         const uint32_t arr = __atomic_fetch_add(&sbar[160], 1u, __ATOMIC_RELAXED) + 1u;
         if (arr == n_active_wgs) {
             __atomic_store_n(&sbar[160], 0u, __ATOMIC_RELAXED);
             __threadfence_system();
-            if (out_peer_flag_va != 0ULL) {
-                __atomic_store_n(as_gptr<uint32_t>(out_peer_flag_va), out_ar_epoch, __ATOMIC_RELEASE);
+            #pragma nounroll
+            for (uint32_t dst = 0u; dst < n_ranks; ++dst) {
+                if (dst != rank && out_peer_flag[dst] != 0ULL) {
+                    __atomic_store_n(as_gptr<uint32_t>(out_peer_flag[dst]), out_ar_epoch, __ATOMIC_RELEASE);
+                }
             }
         }
     }
@@ -153,7 +160,7 @@ __device__ __forceinline__ void grid_barrier_wbinvl1(GPtr<uint32_t> bar, uint32_
             #pragma nounroll
             for (uint32_t spin = 0u; spin < 5000000u; ++spin) {
                 if (load_u32_glc(&bar[16]) == sense) break;
-                __builtin_amdgcn_s_sleep(2);
+                __builtin_amdgcn_s_sleep(1);
             }
         }
         asm volatile("buffer_wbinvl1\n" ::: "memory");
@@ -240,72 +247,93 @@ __device__ __forceinline__ void fast_softmax_top8_wave64(
     }
 }
 
-// Bit-identical pre-pushed FP16 P2P AllReduce + Residual + RMSNorm + Q8 Quant (WG 0 only, M == 1).
-__device__ __forceinline__ void p2p_ar_prepush_m1(
-    GPtr<const float>    __restrict__ x_partial,
-    GPtr<const uint16_t> __restrict__ local_rx,
-    GPtr<uint32_t>       __restrict__ peer_flag,
-    GPtr<const uint32_t> __restrict__ local_flag,
-    GPtr<float>          __restrict__ h_io,
-    GPtr<const float>    __restrict__ w_rms,
-    GPtr<float>          __restrict__ x_norm_out,
-    GPtr<int8_t>         __restrict__ x_q8_out,
-    GPtr<float2>         __restrict__ x_ds_out,
-    float*               sm_red4,
+// Bit-identical pre-pushed FP16 P2P AllReduce (N=1..4) + Residual + RMSNorm + Q8 Quant (WG 0 only, M == 1).
+// Canonical rank-order accumulation (0, 1, ..., n_ranks-1) guarantees bit-identical h/x_norm/x_q8/x_ds on every rank.
+__device__ __forceinline__ void p2p_ar_prepush_m1_n(
+    GPtr<const float> __restrict__ x_partial,
+    const uint64_t*                ar_local_rx_base,
+    const uint64_t*                ar_local_flag,
+    uint64_t                       slot_off,
+    GPtr<float>       __restrict__ h_io,
+    GPtr<const float> __restrict__ w_rms,
+    GPtr<float>       __restrict__ x_norm_out,
+    GPtr<int8_t>      __restrict__ x_q8_out,
+    GPtr<float2>      __restrict__ x_ds_out,
+    float*                         sm_red4,
     uint32_t D,
     uint32_t epoch,
+    uint32_t rank,
+    uint32_t n_ranks,
     float    eps) {
     const uint32_t tid  = threadIdx.x;
     const uint32_t wave = tid >> 6;
     const uint32_t lane = tid & 63u;
     const uint32_t n8   = D >> 3;
 
-    if (tid == 0u) {
-        if (peer_flag != nullptr) {
-            __threadfence_system();
-            __atomic_store_n(peer_flag, epoch, __ATOMIC_RELEASE);
+    if (n_ranks > 1u) {
+        if (tid == 0u) {
+            #pragma nounroll
+            for (uint32_t src = 0u; src < n_ranks; ++src) {
+                if (src != rank && ar_local_flag[src] != 0ULL) {
+                    GPtr<const uint32_t> fp = as_gptr<const uint32_t>(ar_local_flag[src]);
+                    #pragma nounroll
+                    for (uint32_t spin = 0u; spin < 5000000u; ++spin) {
+                        if (load_u32_glc(fp) == epoch) break;
+                        __builtin_amdgcn_s_sleep(1);
+                    }
+                }
+            }
         }
-        #pragma nounroll
-        for (uint32_t spin = 0u; spin < 5000000u; ++spin) {
-            if (load_u32_glc(local_flag) == epoch) break;
-            __builtin_amdgcn_s_sleep(1);
-        }
+        __syncthreads();
     }
-    __syncthreads();
 
     GPtr<const float4> xp4 = reinterpret_cast<GPtr<const float4>>(x_partial);
-    GPtr<const uint4>  lr4 = reinterpret_cast<GPtr<const uint4>>(local_rx);
     GPtr<const float4> h4c = reinterpret_cast<GPtr<const float4>>(h_io);
     GPtr<float4>       h4  = reinterpret_cast<GPtr<float4>>(h_io);
 
-    float4 la[2], lb[2], ha[2], hb[2];
-    uint4  rv[2];
-    #pragma unroll
-    for (uint32_t it = 0u; it < 2u; ++it) {
-        const uint32_t i = min(tid + 256u * it, n8 - 1u);
-        la[it] = xp4[i * 2u];
-        lb[it] = xp4[i * 2u + 1u];
-        rv[it] = ldg_u32x4_stream(lr4 + i);
-        ha[it] = h4c[i * 2u];
-        hb[it] = h4c[i * 2u + 1u];
-    }
-    __builtin_amdgcn_sched_barrier(0);
+    float4 ha[2], hb[2];
     float ss = 0.0f;
     #pragma unroll
     for (uint32_t it = 0u; it < 2u; ++it) {
-        const uint32_t i = tid + 256u * it;
-        const float2 p0 = __half22float2(*reinterpret_cast<const __half2*>(&rv[it].x));
-        const float2 p1 = __half22float2(*reinterpret_cast<const __half2*>(&rv[it].y));
-        const float2 p2 = __half22float2(*reinterpret_cast<const __half2*>(&rv[it].z));
-        const float2 p3 = __half22float2(*reinterpret_cast<const __half2*>(&rv[it].w));
-        ha[it].x += __half2float(__float2half(la[it].x)) + p0.x;
-        ha[it].y += __half2float(__float2half(la[it].y)) + p0.y;
-        ha[it].z += __half2float(__float2half(la[it].z)) + p1.x;
-        ha[it].w += __half2float(__float2half(la[it].w)) + p1.y;
-        hb[it].x += __half2float(__float2half(lb[it].x)) + p2.x;
-        hb[it].y += __half2float(__float2half(lb[it].y)) + p2.y;
-        hb[it].z += __half2float(__float2half(lb[it].z)) + p3.x;
-        hb[it].w += __half2float(__float2half(lb[it].w)) + p3.y;
+        const uint32_t i  = tid + 256u * it;
+        const uint32_t ic = min(i, n8 - 1u);
+        const float4 la = xp4[ic * 2u];
+        const float4 lb = xp4[ic * 2u + 1u];
+        ha[it] = h4c[ic * 2u];
+        hb[it] = h4c[ic * 2u + 1u];
+        if (n_ranks <= 1u) {
+            ha[it].x += la.x; ha[it].y += la.y; ha[it].z += la.z; ha[it].w += la.w;
+            hb[it].x += lb.x; hb[it].y += lb.y; hb[it].z += lb.z; hb[it].w += lb.w;
+        } else {
+            float4 sa = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            float4 sb = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            #pragma nounroll
+            for (uint32_t r = 0u; r < n_ranks; ++r) {
+                #pragma clang fp contract(off)
+                float4 va, vb;
+                if (r == rank) {
+                    va = make_float4(__half2float(__float2half(la.x)), __half2float(__float2half(la.y)),
+                                     __half2float(__float2half(la.z)), __half2float(__float2half(la.w)));
+                    vb = make_float4(__half2float(__float2half(lb.x)), __half2float(__float2half(lb.y)),
+                                     __half2float(__float2half(lb.z)), __half2float(__float2half(lb.w)));
+                } else {
+                    const uint4 rv = ldg_u32x4_stream(as_gptr<const uint4>(ar_local_rx_base[r] + slot_off) + ic);
+                    const float2 p0 = __half22float2(*reinterpret_cast<const __half2*>(&rv.x));
+                    const float2 p1 = __half22float2(*reinterpret_cast<const __half2*>(&rv.y));
+                    const float2 p2 = __half22float2(*reinterpret_cast<const __half2*>(&rv.z));
+                    const float2 p3 = __half22float2(*reinterpret_cast<const __half2*>(&rv.w));
+                    va = make_float4(p0.x, p0.y, p1.x, p1.y);
+                    vb = make_float4(p2.x, p2.y, p3.x, p3.y);
+                }
+                if (r == 0u) { sa = va; sb = vb; }
+                else {
+                    sa.x += va.x; sa.y += va.y; sa.z += va.z; sa.w += va.w;
+                    sb.x += vb.x; sb.y += vb.y; sb.z += vb.z; sb.w += vb.w;
+                }
+            }
+            ha[it].x += sa.x; ha[it].y += sa.y; ha[it].z += sa.z; ha[it].w += sa.w;
+            hb[it].x += sb.x; hb[it].y += sb.y; hb[it].z += sb.z; hb[it].w += sb.w;
+        }
         if (i < n8) {
             h4[i * 2u]      = ha[it];
             h4[i * 2u + 1u] = hb[it];
@@ -375,7 +403,11 @@ __device__ __forceinline__ void gemv_q4a8_persistent(
     GPtr<const int8_t>   __restrict__ x_q8,
     GPtr<const float2>   __restrict__ x_ds,
     GPtr<float>          __restrict__ y_out,
-    GPtr<uint16_t>       __restrict__ peer_tx,
+    const uint64_t*                   out_peer_tx_base,
+    uint64_t                          slot_off,
+    uint32_t                          rank,
+    uint32_t                          n_ranks,
+    bool                              do_prepush,
     uint4*               sm_xq,
     float2*              sm_xds,
     float*               sm_out8,
@@ -394,22 +426,35 @@ __device__ __forceinline__ void gemv_q4a8_persistent(
     if (tid < nb)        sm_xds[tid] = x_ds[tid];
     __syncthreads();
 
+    // Untyped MUBUF SRDs via LLVM builtins (32-bit offen glc slc, compiler-tracked vmcnt, LDS=0!)
+    auto make_srd = [](const void* p) -> __amdgpu_buffer_rsrc_t {
+        return __builtin_amdgcn_make_buffer_rsrc(const_cast<void*>(p), static_cast<short>(0), 0x7FFFFFFF, 0x00027000);
+    };
+    auto mubuf_x4 = [](__amdgpu_buffer_rsrc_t rsrc, uint32_t voff, uint32_t soff) -> uint4 {
+        return __builtin_bit_cast(uint4, __builtin_amdgcn_raw_buffer_load_b128(rsrc, voff, soff, 3));
+    };
+    auto mubuf_u32 = [](__amdgpu_buffer_rsrc_t rsrc, uint32_t voff, uint32_t soff) -> uint32_t {
+        return __builtin_amdgcn_raw_buffer_load_b32(rsrc, voff, soff, 3);
+    };
+    const __amdgpu_buffer_rsrc_t srd_w  = make_srd(reinterpret_cast<const void*>(w_qs));
+    const __amdgpu_buffer_rsrc_t srd_dm = make_srd(reinterpret_cast<const void*>(w_dm));
+    const uint32_t dm_row_bytes = dm_st * 4u;
+
     uint32_t iter = 0u;
     #pragma nounroll
     for (uint32_t rg = blockIdx.x; rg < n_rg; rg += gridDim.x) {
         const uint32_t row = rg * 8u + grp;
         float acc = 0.0f;
         if (row < rows) {
-            GPtr<const uint4>    w4 = reinterpret_cast<GPtr<const uint4>>(w_qs + static_cast<uint64_t>(row) * qs_stride);
-            GPtr<const uint32_t> dm = w_dm + static_cast<uint64_t>(row) * dm_st;
+            const uint32_t w_voff  = row * qs_stride + lane * 16u;
+            const uint32_t dm_voff = row * dm_row_bytes + lane * 4u;
             if (nb == 128u) {
                 uint4    wvs[4];
                 uint32_t dms[4];
                 #pragma unroll
                 for (uint32_t k = 0u; k < 4u; ++k) {
-                    const uint32_t b = lane + k * 32u;
-                    wvs[k] = ldg_u32x4_stream(w4 + b);
-                    dms[k] = ldg_u32_stream(dm + b);
+                    wvs[k] = mubuf_x4(srd_w,  w_voff,  k * 512u);
+                    dms[k] = mubuf_u32(srd_dm, dm_voff, k * 128u);
                 }
                 __builtin_amdgcn_sched_barrier(0);
                 #pragma unroll
@@ -437,9 +482,8 @@ __device__ __forceinline__ void gemv_q4a8_persistent(
                 uint32_t dms[3];
                 #pragma unroll
                 for (uint32_t k = 0u; k < 3u; ++k) {
-                    const uint32_t b = lane + k * 32u;
-                    wvs[k] = ldg_u32x4_stream(w4 + b);
-                    dms[k] = ldg_u32_stream(dm + b);
+                    wvs[k] = mubuf_x4(srd_w,  w_voff,  k * 512u);
+                    dms[k] = mubuf_u32(srd_dm, dm_voff, k * 128u);
                 }
                 __builtin_amdgcn_sched_barrier(0);
                 #pragma unroll
@@ -462,6 +506,41 @@ __device__ __forceinline__ void gemv_q4a8_persistent(
                     const float wm = fp16_to_f32(static_cast<uint16_t>(dmv >> 16));
                     acc = fmaf(wd * xds.x, static_cast<float>(dp), fmaf(wm, xds.y, acc));
                 }
+            } else if (nb == 80u) {
+                // TP=3 GPU1/2 exact fast path (cols=2560, 0 clamped block-79 re-loads!)
+                uint4    wvs[3];
+                uint32_t dms[3];
+                wvs[0] = mubuf_x4(srd_w,  w_voff,  0u);
+                dms[0] = mubuf_u32(srd_dm, dm_voff, 0u);
+                wvs[1] = mubuf_x4(srd_w,  w_voff,  512u);
+                dms[1] = mubuf_u32(srd_dm, dm_voff, 128u);
+                if (lane < 16u) {
+                    wvs[2] = mubuf_x4(srd_w,  w_voff,  1024u);
+                    dms[2] = mubuf_u32(srd_dm, dm_voff, 256u);
+                }
+                __builtin_amdgcn_sched_barrier(0);
+                #pragma unroll
+                for (uint32_t k = 0u; k < 3u; ++k) {
+                    const uint32_t b = lane + k * 32u;
+                    if (k < 2u || lane < 16u) {
+                        const uint4    wv  = wvs[k];
+                        const uint32_t dmv = dms[k];
+                        const uint4    xa  = sm_xq[b * 2u];
+                        const uint4    xb  = sm_xq[b * 2u + 1u];
+                        const float2   xds = sm_xds[b];
+                        int32_t dp = sdot4(wv.x & 0x0F0F0F0Fu, xa.x, 0);
+                        dp         = sdot4(wv.y & 0x0F0F0F0Fu, xa.y, dp);
+                        dp         = sdot4(wv.z & 0x0F0F0F0Fu, xa.z, dp);
+                        dp         = sdot4(wv.w & 0x0F0F0F0Fu, xa.w, dp);
+                        dp         = sdot4((wv.x >> 4) & 0x0F0F0F0Fu, xb.x, dp);
+                        dp         = sdot4((wv.y >> 4) & 0x0F0F0F0Fu, xb.y, dp);
+                        dp         = sdot4((wv.z >> 4) & 0x0F0F0F0Fu, xb.z, dp);
+                        dp         = sdot4((wv.w >> 4) & 0x0F0F0F0Fu, xb.w, dp);
+                        const float wd = fp16_to_f32(static_cast<uint16_t>(dmv & 0xFFFFu));
+                        const float wm = fp16_to_f32(static_cast<uint16_t>(dmv >> 16));
+                        acc = fmaf(wd * xds.x, static_cast<float>(dp), fmaf(wm, xds.y, acc));
+                    }
+                }
             } else {
                 const uint32_t b_last = nb - 1u;
                 #pragma nounroll
@@ -471,8 +550,8 @@ __device__ __forceinline__ void gemv_q4a8_persistent(
                     #pragma unroll
                     for (uint32_t k = 0u; k < 3u; ++k) {
                         const uint32_t bc = min(b0 + k * 32u, b_last);
-                        wvs[k] = ldg_u32x4_stream(w4 + bc);
-                        dms[k] = ldg_u32_stream(dm + bc);
+                        wvs[k] = mubuf_x4(srd_w,  row * qs_stride + bc * 16u, 0u);
+                        dms[k] = mubuf_u32(srd_dm, row * dm_row_bytes + bc * 4u, 0u);
                     }
                     __builtin_amdgcn_sched_barrier(0);
                     #pragma unroll
@@ -502,7 +581,7 @@ __device__ __forceinline__ void gemv_q4a8_persistent(
             acc = block32_sum(acc);
             if (lane == 0u) y_out[row] = acc;
         }
-        if (peer_tx != nullptr && (rows & 7u) == 0u) {
+        if (do_prepush && n_ranks > 1u && (rows & 7u) == 0u) {
             float* s8 = sm_out8 + ((iter & 1u) << 3);
             if (lane == 0u) s8[grp] = acc;
             __syncthreads();
@@ -517,11 +596,26 @@ __device__ __forceinline__ void gemv_q4a8_persistent(
                     *reinterpret_cast<const uint32_t*>(&h2),
                     *reinterpret_cast<const uint32_t*>(&h3)
                 };
-                __builtin_nontemporal_store(pv, reinterpret_cast<GPtr<u32x4>>(peer_tx + rg * 8u));
+                #pragma nounroll
+                for (uint32_t dst = 0u; dst < n_ranks; ++dst) {
+                    if (dst != rank && out_peer_tx_base[dst] != 0ULL) {
+                        __builtin_nontemporal_store(pv, reinterpret_cast<GPtr<u32x4>>(out_peer_tx_base[dst] + slot_off) + rg);
+                    }
+                }
             }
         }
         ++iter;
     }
+}
+
+__device__ __forceinline__ void divmod_slot_u(uint32_t tile, uint32_t nblk16, uint32_t& slot, uint32_t& t_in_slot) {
+    uint32_t rem = __builtin_amdgcn_readfirstlane(tile);
+    const uint32_t nb = __builtin_amdgcn_readfirstlane(nblk16);
+    uint32_t s = 0u;
+    #pragma nounroll
+    while (rem >= nb) { rem -= nb; ++s; }
+    slot = s;
+    t_in_slot = rem;
 }
 
 // Helper for 16-row IQ2_S Gate+Up tile using 4-KiB sm_grid32 + v_perm_b32 -> writes SiLU*Up to LDS sm_y (bit-exact!).
@@ -533,14 +627,16 @@ __device__ __forceinline__ void moe_gu_16r_tile_g32_sm(
     const float*        sm_xd,
     const int32_t*      sm_ids,
     float*              sm_y_dst,
-    uint32_t tile_idx) {
+    uint32_t tile_idx,
+    uint32_t local_ff,
+    uint32_t nblk16) {
     const uint32_t sub_id = threadIdx.x >> 4;
     const uint32_t lane16 = threadIdx.x & 15u;
-    const uint32_t gidx   = tile_idx * 16u + sub_id;
-    const uint32_t slot   = gidx >> 9; // / 512
-    const uint32_t rloc   = gidx & 511u;
+    uint32_t slot, t_in_slot;
+    divmod_slot_u(tile_idx, nblk16, slot, t_in_slot);
+    const uint32_t rloc   = t_in_slot * 16u + sub_id;
     const uint32_t exp_id = __builtin_amdgcn_readfirstlane(static_cast<uint32_t>(sm_ids[slot]));
-    GPtr<const uint8_t> eb = wgu_merged_b + vegajet::dot8_dev::uniform_u64(static_cast<uint64_t>(exp_id) * 512ULL * 1968ULL);
+    GPtr<const uint8_t> eb = wgu_merged_b + vegajet::dot8_dev::uniform_u64(static_cast<uint64_t>(exp_id) * local_ff * 1968ULL);
     const uint32_t r_off  = rloc * 1968u;
     // Preload all 12 FP16 scale pairs (48 B) ONCE across lanes 0..11 of each 16-lane group!
     const uint32_t d2_mine = (lane16 < 12u)
@@ -645,25 +741,25 @@ void ornith_m1_gdn_super_kernel(
     // ---- Stage 0: Optional previous layer Post-MoE P2P AllReduce + RMSNorm + Q8 Quant ----
     if (prev_ar_epoch != 0u) {
         if (wg == 0u) {
-            const uint64_t rx_va = desc->ar_local_rx_base + static_cast<uint64_t>(prev_ar_epoch & 1u) * VJ_SUPER_AR_SLOT_BYTES;
-            p2p_ar_prepush_m1(
+            const uint64_t slot_off = static_cast<uint64_t>(prev_ar_epoch & 1u) * VJ_SUPER_AR_SLOT_BYTES;
+            p2p_ar_prepush_m1_n(
                 as_gptr<const float>(desc->x_partial),
-                as_gptr<const uint16_t>(rx_va),
-                nullptr,
-                as_gptr<const uint32_t>(desc->ar_local_flag),
+                desc->ar_local_rx_base,
+                desc->ar_local_flag,
+                slot_off,
                 as_gptr<float>(desc->h_io),
                 as_gptr<const float>(desc->w_attn_norm),
                 nullptr,
                 as_gptr<int8_t>(desc->x_q8),
                 as_gptr<float2>(desc->x_ds),
                 sm_fo,
-                desc->D, prev_ar_epoch, desc->eps);
+                desc->D, prev_ar_epoch, desc->rank, desc->n_ranks, desc->eps);
         }
         grid_barrier_wbinvl1(sbar, gridDim.x, super_sense);
         p_acc(0u);
     }
 
-    // ---- Stage 1: w_gdn_qkv_gab GEMV [10304, 3072] across all WGs ----
+    // ---- Stage 1: w_gdn_qkv_gab GEMV [qkv_rows, 3072] across all WGs ----
     {
         gemv_q4a8_persistent(
             as_gptr<const uint8_t>(desc->w_qkv_qs),
@@ -671,14 +767,14 @@ void ornith_m1_gdn_super_kernel(
             as_gptr<const int8_t>(desc->x_q8),
             as_gptr<const float2>(desc->x_ds),
             as_gptr<float>(desc->gdn_qkv_gab),
-            nullptr, sm_xq, sm_xds, sm_fo,
+            nullptr, 0ULL, 0u, 1u, false, sm_xq, sm_xds, sm_fo,
             desc->qkv_rows, desc->qkv_cols, desc->qkv_qs_stride, desc->qkv_dm_stride);
         grid_barrier_wbinvl1(sbar + 32u, gridDim.x, super_sense);
         p_acc(1u);
     }
 
-    // ---- Stage 2: GDN Conv1D + L2 + Gate + Split-V Recurrence + Gated RMSNorm + Quant (128 WGs) ----
-    if (wg < 128u) {
+    // ---- Stage 2: GDN Conv1D + L2 + Gate + Split-V=4 Recurrence + Gated RMSNorm + Quant (nv * 4 WGs) ----
+    if (wg < desc->nv * 4u) {
         const uint32_t nk       = desc->nk;
         const uint32_t nv       = desc->nv;
         const uint32_t conv_dim = desc->conv_dim;
@@ -870,21 +966,21 @@ void ornith_m1_gdn_super_kernel(
     grid_barrier_wbinvl1(sbar + 64u, gridDim.x, super_sense);
     p_acc(2u);
 
-    // ---- Stage 3: w_ssm_out GEMV [3072, 4096] + FP16 BAR0 prepush ----
+    // ---- Stage 3: w_ssm_out GEMV [3072, nv*128] + FP16 BAR0 prepush ----
     {
-        GPtr<uint16_t> ptx = (out_ar_epoch != 0u)
-            ? as_gptr<uint16_t>(desc->out_peer_tx_base + static_cast<uint64_t>(out_ar_epoch & 1u) * VJ_SUPER_AR_SLOT_BYTES)
-            : nullptr;
+        const uint64_t slot_off = static_cast<uint64_t>(out_ar_epoch & 1u) * VJ_SUPER_AR_SLOT_BYTES;
+        const bool do_pp = (out_ar_epoch != 0u) && (desc->n_ranks > 1u);
         gemv_q4a8_persistent(
             as_gptr<const uint8_t>(desc->w_out_qs),
             as_gptr<const uint32_t>(desc->w_out_dm),
             as_gptr<const int8_t>(desc->mid_q8),
             as_gptr<const float2>(desc->mid_ds),
             as_gptr<float>(desc->x_partial),
-            ptx, sm_xq, sm_xds, sm_fo,
+            desc->out_peer_tx_base, slot_off, desc->rank, desc->n_ranks, do_pp,
+            sm_xq, sm_xds, sm_fo,
             desc->out_rows, desc->out_cols, desc->out_qs_stride, desc->out_dm_stride);
-        if (ptx != nullptr) {
-            signal_out_peer_flag(sbar, desc->out_peer_flag, gridDim.x, out_ar_epoch);
+        if (do_pp) {
+            signal_out_peer_flag_n(sbar, desc->out_peer_flag, desc->rank, desc->n_ranks, gridDim.x, out_ar_epoch);
         }
         p_acc(3u);
     }
@@ -928,25 +1024,25 @@ void ornith_m1_gqa_super_kernel(
     // ---- Stage 0: Optional previous Post-MoE P2P AllReduce + RMSNorm + Q8 Quant ----
     if (prev_ar_epoch != 0u) {
         if (wg == 0u) {
-            const uint64_t rx_va = desc->ar_local_rx_base + static_cast<uint64_t>(prev_ar_epoch & 1u) * VJ_SUPER_AR_SLOT_BYTES;
-            p2p_ar_prepush_m1(
+            const uint64_t slot_off = static_cast<uint64_t>(prev_ar_epoch & 1u) * VJ_SUPER_AR_SLOT_BYTES;
+            p2p_ar_prepush_m1_n(
                 as_gptr<const float>(desc->x_partial),
-                as_gptr<const uint16_t>(rx_va),
-                nullptr,
-                as_gptr<const uint32_t>(desc->ar_local_flag),
+                desc->ar_local_rx_base,
+                desc->ar_local_flag,
+                slot_off,
                 as_gptr<float>(desc->h_io),
                 as_gptr<const float>(desc->w_attn_norm),
                 nullptr,
                 as_gptr<int8_t>(desc->x_q8),
                 as_gptr<float2>(desc->x_ds),
                 sm_red,
-                desc->D, prev_ar_epoch, desc->eps);
+                desc->D, prev_ar_epoch, desc->rank, desc->n_ranks, desc->eps);
         }
         grid_barrier_wbinvl1(sbar, gridDim.x, super_sense);
         p_acc(4u);
     }
 
-    // ---- Stage 1: w_attn_qkv GEMV [8704, 3072] across all WGs ----
+    // ---- Stage 1: w_attn_qkv GEMV [qkv_rows, 3072] across all WGs ----
     {
         gemv_q4a8_persistent(
             as_gptr<const uint8_t>(desc->w_qkv_qs),
@@ -954,7 +1050,7 @@ void ornith_m1_gqa_super_kernel(
             as_gptr<const int8_t>(desc->x_q8),
             as_gptr<const float2>(desc->x_ds),
             as_gptr<float>(desc->attn_qkv),
-            nullptr, sm_xq, sm_xds, sm_red,
+            nullptr, 0ULL, 0u, 1u, false, sm_xq, sm_xds, sm_red,
             desc->qkv_rows, desc->qkv_cols, desc->qkv_qs_stride, desc->qkv_dm_stride);
         grid_barrier_wbinvl1(sbar + 32u, gridDim.x, super_sense);
         p_acc(5u);
@@ -1048,7 +1144,9 @@ void ornith_m1_gqa_super_kernel(
         if (wg < n_q_local * active_ch) {
             const uint32_t h   = wg / active_ch;
             const uint32_t ch0 = wg - h * active_ch;
-            const uint32_t kv_h = (h * n_kv_local) / n_q_local;
+            const uint32_t kv_h = (desc->gqa_group != 0u)
+                ? (((desc->q_head_off + h) / desc->gqa_group) - desc->kv_head_off)
+                : ((h * n_kv_local) / n_q_local);
             const float qv = as_gptr<const float>(desc->q_buf)[static_cast<uint64_t>(h) * 256u + d];
             GPtr<const uint8_t> k_cache = as_gptr<const uint8_t>(desc->k_cache_q8);
             GPtr<const uint8_t> v_cache = as_gptr<const uint8_t>(desc->v_cache_q8);
@@ -1152,21 +1250,21 @@ void ornith_m1_gqa_super_kernel(
         p_acc(8u);
     }
 
-    // ---- Stage 3: w_o GEMV [3072, 4096] + FP16 BAR0 prepush ----
+    // ---- Stage 3: w_o GEMV [3072, n_q_local*256] + FP16 BAR0 prepush ----
     {
-        GPtr<uint16_t> ptx = (out_ar_epoch != 0u)
-            ? as_gptr<uint16_t>(desc->out_peer_tx_base + static_cast<uint64_t>(out_ar_epoch & 1u) * VJ_SUPER_AR_SLOT_BYTES)
-            : nullptr;
+        const uint64_t slot_off = static_cast<uint64_t>(out_ar_epoch & 1u) * VJ_SUPER_AR_SLOT_BYTES;
+        const bool do_pp = (out_ar_epoch != 0u) && (desc->n_ranks > 1u);
         gemv_q4a8_persistent(
             as_gptr<const uint8_t>(desc->w_o_qs),
             as_gptr<const uint32_t>(desc->w_o_dm),
             as_gptr<const int8_t>(desc->mid_q8),
             as_gptr<const float2>(desc->mid_ds),
             as_gptr<float>(desc->x_partial),
-            ptx, sm_xq, sm_xds, sm_red,
+            desc->out_peer_tx_base, slot_off, desc->rank, desc->n_ranks, do_pp,
+            sm_xq, sm_xds, sm_red,
             desc->o_rows, desc->o_cols, desc->o_qs_stride, desc->o_dm_stride);
-        if (ptx != nullptr) {
-            signal_out_peer_flag(sbar, desc->out_peer_flag, gridDim.x, out_ar_epoch);
+        if (do_pp) {
+            signal_out_peer_flag_n(sbar, desc->out_peer_flag, desc->rank, desc->n_ranks, gridDim.x, out_ar_epoch);
         }
         p_acc(9u);
     }
@@ -1202,19 +1300,19 @@ void ornith_m1_moe_super_kernel(
 
     // ---- Stage 0: Optional Post-Mixer Prepush FP16 AR (WG 0) overlapped with 4-KiB sm_grid32 LDS preload! ----
     if (ar_epoch != 0u && wg == 0u) {
-        const uint64_t rx_va = desc->ar_local_rx_base + static_cast<uint64_t>(ar_epoch & 1u) * VJ_SUPER_AR_SLOT_BYTES;
-        p2p_ar_prepush_m1(
+        const uint64_t slot_off = static_cast<uint64_t>(ar_epoch & 1u) * VJ_SUPER_AR_SLOT_BYTES;
+        p2p_ar_prepush_m1_n(
             as_gptr<const float>(desc->x_partial),
-            as_gptr<const uint16_t>(rx_va),
-            nullptr,
-            as_gptr<const uint32_t>(desc->ar_local_flag),
+            desc->ar_local_rx_base,
+            desc->ar_local_flag,
+            slot_off,
             as_gptr<float>(desc->h_io),
             as_gptr<const float>(desc->w_post_attn_norm),
             as_gptr<float>(desc->x_norm),
             as_gptr<int8_t>(desc->x_q8),
             as_gptr<float2>(desc->x_ds),
             sm_y,
-            desc->D, ar_epoch, desc->eps);
+            desc->D, ar_epoch, desc->rank, desc->n_ranks, desc->eps);
     }
     // Preload 4-KiB sm_grid32 into LDS ONLY on non-DOT8 (IQ2_S) layers!
     if (desc->w_gu_d8_w == 0ULL) {
@@ -1242,7 +1340,8 @@ void ornith_m1_moe_super_kernel(
 
         const uint32_t D = desc->D;
         GPtr<const float4> x4f = as_gptr<const float4>(desc->x_norm);
-        if (wg < 128u) {
+        const uint32_t sh_wgs = (gridDim.x == 240u && desc->sh_gu_rows <= 768u) ? 96u : 128u;
+        if (wg < sh_wgs) {
             const uint32_t sh_rows = desc->sh_gu_rows;
             const uint32_t row = wg * 8u + grp;
             if (row < sh_rows) {
@@ -1282,10 +1381,13 @@ void ornith_m1_moe_super_kernel(
                 if (l32 == 0u) as_gptr<float>(desc->sh_gu_out)[row] = acc;
             }
         } else {
-            const uint32_t rwg = wg - 128u;
+            const uint32_t rwg = wg - sh_wgs;
             uint32_t e_beg = 256u, e_end = 256u;
             bool do_sh_gate = false;
-            if (gridDim.x == 240u) {
+            if (sh_wgs == 96u) {
+                if (rwg < 128u)       { e_beg = rwg * 2u; e_end = e_beg + 2u; }
+                else if (rwg == 128u) { do_sh_gate = true; }
+            } else if (gridDim.x == 240u) {
                 if (rwg < 78u)       { e_beg = rwg * 2u; e_end = e_beg + 2u; }
                 else if (rwg < 111u) { e_beg = 156u + (rwg - 78u) * 3u; e_end = e_beg + 3u; }
                 else if (rwg == 111u){ e_beg = 255u; e_end = 256u; do_sh_gate = true; }
@@ -1346,7 +1448,7 @@ void ornith_m1_moe_super_kernel(
                 }
                 __syncthreads();
             }
-            if (do_sh_gate && gridDim.x != 240u) {
+            if (do_sh_gate && (gridDim.x != 240u || sh_wgs == 96u)) {
                 GPtr<const float4> w4 = as_gptr<const float4>(desc->w_sh_gate);
                 const uint32_t n4 = D >> 2;
                 float acc = 0.0f;
@@ -1383,6 +1485,9 @@ void ornith_m1_moe_super_kernel(
 
     // ---- Stage 3: ALL WGs (240 WGs = 4 WGs/CU!) Exact VJ_Q3_IQ2S (kBatch=3 + v_bfi_b32) / DOT8 / IQ2_S Gate+Up + 64-WG Shared Down ----
     {
+        const uint32_t local_ff = desc->local_ff;
+        const uint32_t nblk16   = local_ff >> 4;
+        const uint32_t n_tiles  = 8u * nblk16;
         GPtr<const uint8_t> wgu_d8_w = as_gptr<const uint8_t>(desc->w_gu_d8_w);
         GPtr<const uint8_t> wgu_d8_s = as_gptr<const uint8_t>(desc->w_gu_d8_s);
         const uint32_t gu_w_st  = desc->gu_d8_w_stride;
@@ -1391,24 +1496,24 @@ void ornith_m1_moe_super_kernel(
         GPtr<uint32_t> pair_cnt = as_gptr<uint32_t>(desc->super_bar + 1536u);
         GPtr<float> mf32 = as_gptr<float>(desc->mid_f32);
         #pragma nounroll
-        for (uint32_t tile = wg; tile < 256u; tile += gridDim.x) {
+        for (uint32_t tile = wg; tile < n_tiles; tile += gridDim.x) {
             if (wgu_d8_w != nullptr) {
                 const uint32_t sub_id = tid >> 4;
                 const uint32_t lane16 = tid & 15u;
-                const uint32_t gidx   = tile * 16u + sub_id;
-                const uint32_t slot   = gidx >> 9;
-                const uint32_t rloc   = gidx & 511u;
+                uint32_t slot, t_in_slot;
+                divmod_slot_u(tile, nblk16, slot, t_in_slot);
+                const uint32_t rloc   = t_in_slot * 16u + sub_id;
                 const uint32_t exp_id = __builtin_amdgcn_readfirstlane(static_cast<uint32_t>(sm_ids[slot]));
                 const float2 gu = (gu_w_st == 2304u)
                     ? vegajet::dot8_dev::vj_q3_gu_row_iq2s<6, 2>(
                           wgu_d8_w, gu_w_st, wgu_d8_s, gu_s_st,
-                          sm_x, sm_xd, exp_id * 512u, rloc, lane16)
+                          sm_x, sm_xd, exp_id * local_ff, rloc, lane16)
                     : vegajet::dot8_dev::vj_dot8_gu_row_iq2s<6, 2>(
                           wgu_d8_w, gu_w_st, wgu_d8_s, gu_s_st,
-                          sm_x, sm_xd, exp_id * 512u, rloc, lane16);
+                          sm_x, sm_xd, exp_id * local_ff, rloc, lane16);
                 if (lane16 == 0u) sm_y[sub_id] = (gu.x / (1.0f + __expf(-gu.x))) * gu.y;
             } else {
-                moe_gu_16r_tile_g32_sm(wgu_b, sm_grid32, sm_x, sm_xd, sm_ids, sm_y, tile);
+                moe_gu_16r_tile_g32_sm(wgu_b, sm_grid32, sm_x, sm_xd, sm_ids, sm_y, tile, local_ff, nblk16);
             }
             __syncthreads();
             const uint32_t blk    = tile >> 1;
@@ -1416,7 +1521,6 @@ void ornith_m1_moe_super_kernel(
             GPtr<float> dst = mf32 + tile * 16u;
             if (tid < 16u) dst[tid] = sm_y[tid];
             asm volatile("s_waitcnt vmcnt(0)\n" ::: "memory");
-            __syncthreads();
             if (tid == 0u) sm_y[16] = __uint_as_float(__atomic_fetch_xor(pair_cnt + blk, 1u, __ATOMIC_RELAXED));
             __syncthreads();
             if (__float_as_uint(sm_y[16]) == 1u && tid < 32u) {
@@ -1434,23 +1538,32 @@ void ornith_m1_moe_super_kernel(
             __syncthreads();
         }
 
-        // CU-balanced Shared Down: at 240 WGs, 44 tiles on wg 16..59 (CUs 16..59) + 20 tiles on wg 76..95 (CUs 16..35) -> 0 overlap with 2-tile CUs 0..15!
+        // TP=3 (n_tiles <= 192): run 48 Shared Down WGs x 64 rows strictly on IDLE WGs 192..239 (0 Gate+Up collision!).
+        // TP=2 (n_tiles == 256): 64 tiles x 48 rows on wg 16..59 + 76..95 (0 overlap with 2-tile CUs 0..15).
         uint32_t sh_tile = 64u;
-        if (gridDim.x == 240u) {
+        uint32_t sh_steps = 3u;
+        uint32_t sh_stride_rows = 48u;
+        if (gridDim.x == 240u && n_tiles <= 192u) {
+            if (wg >= 192u && wg < 240u) {
+                sh_tile = wg - 192u;
+                sh_steps = 4u;
+                sh_stride_rows = 64u;
+            }
+        } else if (gridDim.x == 240u) {
             if (wg >= 16u && wg < 60u)      sh_tile = wg - 16u;
             else if (wg >= 76u && wg < 96u) sh_tile = 44u + (wg - 76u);
         } else if (wg >= 128u && wg < 192u) {
             sh_tile = wg - 128u;
         }
         if (sh_tile < 64u) {
-            const uint32_t local_ff = desc->local_ff;
+            const uint32_t n_blk = local_ff >> 5;
             const float sc_g = as_gptr<const float>(desc->sh_gate_sc)[0];
             GPtr<const float> g_p = as_gptr<const float>(desc->sh_gu_out);
             GPtr<const float> u_p = g_p + local_ff;
             int8_t* sh_q8_sm = reinterpret_cast<int8_t*>(sm_x);
             float2* sh_ds_sm = reinterpret_cast<float2*>(sm_x + 32u);
             #pragma nounroll
-            for (uint32_t blk = tid >> 5; blk < (local_ff >> 5); blk += 8u) {
+            for (uint32_t blk = tid >> 5; blk < n_blk; blk += 8u) {
                 const uint32_t c = (blk << 5) + l32;
                 const float gv = g_p[c], uv = u_p[c];
                 const float y  = (gv / (1.0f + __expf(-gv))) * uv * sc_g;
@@ -1464,28 +1577,33 @@ void ornith_m1_moe_super_kernel(
             __syncthreads();
             const uint32_t lane16 = tid & 15u;
             const uint32_t grp16  = tid >> 4;
-            const uint32_t base   = sh_tile * 48u;
-            const uint4    xa     = sm_x[lane16 * 2u];
-            const uint4    xb     = sm_x[lane16 * 2u + 1u];
-            const float2   xds    = sh_ds_sm[lane16];
+            const uint32_t base   = sh_tile * sh_stride_rows;
+            const bool     act16  = (lane16 < n_blk);
+            const uint4    xa     = act16 ? sm_x[lane16 * 2u]      : make_uint4(0u, 0u, 0u, 0u);
+            const uint4    xb     = act16 ? sm_x[lane16 * 2u + 1u] : make_uint4(0u, 0u, 0u, 0u);
+            const float2   xds    = act16 ? sh_ds_sm[lane16]       : make_float2(0.0f, 0.0f);
             #pragma nounroll
-            for (uint32_t step = 0u; step < 3u; ++step) {
-                const uint32_t  row = base + step * 16u + grp16;
-                GPtr<const uint4> w4 = as_gptr<const uint4>(desc->sh_dn_qs + static_cast<uint64_t>(row) * desc->sh_dn_stride);
-                GPtr<const uint32_t> dm = as_gptr<const uint32_t>(desc->sh_dn_dm) + static_cast<uint64_t>(row) * 16u;
-                const uint4     wv  = ldg_u32x4_stream(w4 + lane16);
-                const uint32_t  dmv = ldg_u32_stream(dm + lane16);
-                int32_t dp = sdot4(wv.x & 0x0F0F0F0Fu, xa.x, 0);
-                dp = sdot4(wv.y & 0x0F0F0F0Fu, xa.y, dp);
-                dp = sdot4(wv.z & 0x0F0F0F0Fu, xa.z, dp);
-                dp = sdot4(wv.w & 0x0F0F0F0Fu, xa.w, dp);
-                dp = sdot4((wv.x >> 4) & 0x0F0F0F0Fu, xb.x, dp);
-                dp = sdot4((wv.y >> 4) & 0x0F0F0F0Fu, xb.y, dp);
-                dp = sdot4((wv.z >> 4) & 0x0F0F0F0Fu, xb.z, dp);
-                dp = sdot4((wv.w >> 4) & 0x0F0F0F0Fu, xb.w, dp);
-                const float wd = fp16_to_f32(static_cast<uint16_t>(dmv & 0xFFFFu));
-                const float wm = fp16_to_f32(static_cast<uint16_t>(dmv >> 16));
-                const float acc = vegajet::dot8_dev::sum16(fmaf(wd * xds.x, static_cast<float>(dp), wm * xds.y));
+            for (uint32_t step = 0u; step < sh_steps; ++step) {
+                const uint32_t row = base + step * 16u + grp16;
+                float part_acc = 0.0f;
+                if (act16) {
+                    GPtr<const uint4> w4 = as_gptr<const uint4>(desc->sh_dn_qs + static_cast<uint64_t>(row) * desc->sh_dn_stride);
+                    GPtr<const uint32_t> dm = as_gptr<const uint32_t>(desc->sh_dn_dm) + static_cast<uint64_t>(row) * n_blk;
+                    const uint4     wv  = ldg_u32x4_stream(w4 + lane16);
+                    const uint32_t  dmv = ldg_u32_stream(dm + lane16);
+                    int32_t dp = sdot4(wv.x & 0x0F0F0F0Fu, xa.x, 0);
+                    dp = sdot4(wv.y & 0x0F0F0F0Fu, xa.y, dp);
+                    dp = sdot4(wv.z & 0x0F0F0F0Fu, xa.z, dp);
+                    dp = sdot4(wv.w & 0x0F0F0F0Fu, xa.w, dp);
+                    dp = sdot4((wv.x >> 4) & 0x0F0F0F0Fu, xb.x, dp);
+                    dp = sdot4((wv.y >> 4) & 0x0F0F0F0Fu, xb.y, dp);
+                    dp = sdot4((wv.z >> 4) & 0x0F0F0F0Fu, xb.z, dp);
+                    dp = sdot4((wv.w >> 4) & 0x0F0F0F0Fu, xb.w, dp);
+                    const float wd = fp16_to_f32(static_cast<uint16_t>(dmv & 0xFFFFu));
+                    const float wm = fp16_to_f32(static_cast<uint16_t>(dmv >> 16));
+                    part_acc = fmaf(wd * xds.x, static_cast<float>(dp), wm * xds.y);
+                }
+                const float acc = vegajet::dot8_dev::sum16(part_acc);
                 if (lane16 == 0u) as_gptr<float>(desc->sh_down_out)[row] = acc;
             }
         }
@@ -1493,44 +1611,63 @@ void ornith_m1_moe_super_kernel(
         prof_acc(prof, (desc->w_gu_d8_w != 0ULL) ? 15u : 13u, t_p, prof_on);
     }
 
-    // ---- Stage 4: ALL 192 WGs load L2-hot 4 KiB mid_q8 -> LDS + Routed DOT8 Down + sh_down + 16B FP16 BAR0 PP ----
-    if (wg < 192u) {
-        sm_x[tid] = as_gptr<const uint4>(desc->mid_q8)[tid];
-        if (tid < 128u) sm_xd[tid] = as_gptr<const float>(desc->mid_d)[tid];
-        __syncthreads();
-
-        const uint32_t grp16  = tid >> 4;
-        const uint32_t lane16 = tid & 15u;
-        const uint32_t row    = wg * 16u + grp16;
-        const float total = vegajet::dot8_dev::vj_dot8_down_row_iq3<4>(
-            as_gptr<const uint8_t>(desc->w_dn_d8_w), desc->dn_w_stride,
-            as_gptr<const uint8_t>(desc->w_dn_d8_s), desc->dn_s_stride,
-            sm_x, sm_xd, sm_ids, sm_w, row, desc->D, lane16);
-        if (lane16 == 0u) {
-            const float v = total + as_gptr<const float>(desc->sh_down_out)[row];
-            as_gptr<float>(desc->x_partial)[row] = v;
-            sm_y[grp16] = v;
-        }
-        if (out_ar_epoch != 0u) {
+    // ---- Stage 4: CU-balanced 240-WG (144x16 + 96x8 = 3072) or 192-WG Routed DOT8 Down + sh_down + 16B FP16 BAR0 PP ----
+    {
+        const bool use_240 = (gridDim.x == 240u && desc->D == 3072u);
+        const uint32_t dn_wgs = use_240 ? 240u : 192u;
+        if (wg < dn_wgs) {
+            const uint32_t n_blk   = desc->local_ff >> 5;
+            const uint32_t n_q8_u4 = 8u * (n_blk << 1);
+            const uint32_t n_d     = 8u * n_blk;
+            uint32_t t4 = tid;
+            asm volatile("" : "+v"(t4));
+            if (t4 < n_q8_u4) sm_x[t4]  = as_gptr<const uint4>(desc->mid_q8)[t4];
+            if (t4 < n_d)     sm_xd[t4] = as_gptr<const float>(desc->mid_d)[t4];
             __syncthreads();
-            GPtr<uint16_t> ptx = as_gptr<uint16_t>(desc->out_peer_tx_base + static_cast<uint64_t>(out_ar_epoch & 1u) * VJ_SUPER_AR_SLOT_BYTES);
-            if (tid < 2u) {
-                const uint32_t o = tid * 8u;
-                const __half2 h0 = __float22half2_rn(make_float2(sm_y[o + 0u], sm_y[o + 1u]));
-                const __half2 h1 = __float22half2_rn(make_float2(sm_y[o + 2u], sm_y[o + 3u]));
-                const __half2 h2 = __float22half2_rn(make_float2(sm_y[o + 4u], sm_y[o + 5u]));
-                const __half2 h3 = __float22half2_rn(make_float2(sm_y[o + 6u], sm_y[o + 7u]));
-                u32x4 pv = {
-                    *reinterpret_cast<const uint32_t*>(&h0),
-                    *reinterpret_cast<const uint32_t*>(&h1),
-                    *reinterpret_cast<const uint32_t*>(&h2),
-                    *reinterpret_cast<const uint32_t*>(&h3)
-                };
-                __builtin_nontemporal_store(pv, reinterpret_cast<GPtr<u32x4>>(ptx + wg * 16u + o));
+
+            const uint32_t grp16  = t4 >> 4;
+            const uint32_t lane16 = t4 & 15u;
+            const uint32_t n_rows = (use_240 && wg >= 144u) ? 8u : 16u;
+            const uint32_t row0   = (use_240 && wg >= 144u) ? (2304u + (wg - 144u) * 8u) : (wg * 16u);
+            if (grp16 < n_rows) {
+                const uint32_t row = row0 + grp16;
+                const float total = vegajet::dot8_dev::vj_dot8_down_row_iq3_flex<2>(
+                    as_gptr<const uint8_t>(desc->w_dn_d8_w), desc->dn_w_stride,
+                    as_gptr<const uint8_t>(desc->w_dn_d8_s), desc->dn_s_stride,
+                    sm_x, sm_xd, sm_ids, sm_w, row, desc->D, n_blk, desc->dn_is_sub32 != 0u, lane16);
+                if (lane16 == 0u) {
+                    const float v = total + as_gptr<const float>(desc->sh_down_out)[row];
+                    as_gptr<float>(desc->x_partial)[row] = v;
+                    sm_y[grp16] = v;
+                }
             }
-            signal_out_peer_flag(sbar, desc->out_peer_flag, 192u, out_ar_epoch);
+            if (out_ar_epoch != 0u && desc->n_ranks > 1u) {
+                __syncthreads();
+                const uint64_t slot_off = static_cast<uint64_t>(out_ar_epoch & 1u) * VJ_SUPER_AR_SLOT_BYTES;
+                if (tid < (n_rows >> 3)) {
+                    const uint32_t o = tid * 8u;
+                    const __half2 h0 = __float22half2_rn(make_float2(sm_y[o + 0u], sm_y[o + 1u]));
+                    const __half2 h1 = __float22half2_rn(make_float2(sm_y[o + 2u], sm_y[o + 3u]));
+                    const __half2 h2 = __float22half2_rn(make_float2(sm_y[o + 4u], sm_y[o + 5u]));
+                    const __half2 h3 = __float22half2_rn(make_float2(sm_y[o + 6u], sm_y[o + 7u]));
+                    u32x4 pv = {
+                        *reinterpret_cast<const uint32_t*>(&h0),
+                        *reinterpret_cast<const uint32_t*>(&h1),
+                        *reinterpret_cast<const uint32_t*>(&h2),
+                        *reinterpret_cast<const uint32_t*>(&h3)
+                    };
+                    #pragma nounroll
+                    for (uint32_t dst = 0u; dst < desc->n_ranks; ++dst) {
+                        if (dst != desc->rank && desc->out_peer_tx_base[dst] != 0ULL) {
+                            __builtin_nontemporal_store(pv, reinterpret_cast<GPtr<u32x4>>(
+                                as_gptr<uint16_t>(desc->out_peer_tx_base[dst] + slot_off) + row0 + o));
+                        }
+                    }
+                }
+                signal_out_peer_flag_n(sbar, desc->out_peer_flag, desc->rank, desc->n_ranks, dn_wgs, out_ar_epoch);
+            }
+            prof_acc(prof, 14u, t_p, prof_on);
         }
-        prof_acc(prof, 14u, t_p, prof_on);
     }
 }
 
@@ -1567,19 +1704,19 @@ void ornith_m1_moe_super_q3_kernel(
     // ---- Stage 0: Post-Mixer Prepush FP16 AR (WG 0) ----
     if (ar_epoch != 0u) {
         if (wg == 0u) {
-            const uint64_t rx_va = desc->ar_local_rx_base + static_cast<uint64_t>(ar_epoch & 1u) * VJ_SUPER_AR_SLOT_BYTES;
-            p2p_ar_prepush_m1(
+            const uint64_t slot_off = static_cast<uint64_t>(ar_epoch & 1u) * VJ_SUPER_AR_SLOT_BYTES;
+            p2p_ar_prepush_m1_n(
                 as_gptr<const float>(desc->x_partial),
-                as_gptr<const uint16_t>(rx_va),
-                nullptr,
-                as_gptr<const uint32_t>(desc->ar_local_flag),
+                desc->ar_local_rx_base,
+                desc->ar_local_flag,
+                slot_off,
                 as_gptr<float>(desc->h_io),
                 as_gptr<const float>(desc->w_post_attn_norm),
                 as_gptr<float>(desc->x_norm),
                 as_gptr<int8_t>(desc->x_q8),
                 as_gptr<float2>(desc->x_ds),
                 sm_y,
-                desc->D, ar_epoch, desc->eps);
+                desc->D, ar_epoch, desc->rank, desc->n_ranks, desc->eps);
         }
         grid_barrier_wbinvl1(sbar, gridDim.x, super_sense);
         p_acc(10u);
@@ -1600,7 +1737,8 @@ void ornith_m1_moe_super_q3_kernel(
         __syncthreads();
 
         GPtr<const float4> x4f = as_gptr<const float4>(desc->x_norm);
-        if (wg < 128u) {
+        const uint32_t sh_wgs = (gridDim.x == 240u && desc->sh_gu_rows <= 768u) ? 96u : 128u;
+        if (wg < sh_wgs) {
             const uint32_t row = wg * 8u + grp;
             if (row < desc->sh_gu_rows) {
                 GPtr<const uint4> w4 = as_gptr<const uint4>(desc->sh_gu_qs + static_cast<uint64_t>(row) * desc->sh_gu_stride);
@@ -1637,12 +1775,17 @@ void ornith_m1_moe_super_q3_kernel(
                 if (l32 == 0u) as_gptr<float>(desc->sh_gu_out)[row] = acc;
             }
         } else {
-            const uint32_t rwg = wg - 128u;
+            const uint32_t rwg = wg - sh_wgs;
             uint32_t e_beg = 256u, e_end = 256u;
             bool do_sh_gate = false;
-            if (rwg < 78u)       { e_beg = rwg * 2u; e_end = e_beg + 2u; }
-            else if (rwg < 111u) { e_beg = 156u + (rwg - 78u) * 3u; e_end = e_beg + 3u; }
-            else if (rwg == 111u){ e_beg = 255u; e_end = 256u; do_sh_gate = true; }
+            if (sh_wgs == 96u) {
+                if (rwg < 128u)       { e_beg = rwg * 2u; e_end = e_beg + 2u; }
+                else if (rwg == 128u) { do_sh_gate = true; }
+            } else {
+                if (rwg < 78u)        { e_beg = rwg * 2u; e_end = e_beg + 2u; }
+                else if (rwg < 111u)  { e_beg = 156u + (rwg - 78u) * 3u; e_end = e_beg + 3u; }
+                else if (rwg == 111u) { e_beg = 255u; e_end = 256u; do_sh_gate = true; }
+            }
             const uint32_t half_id = tid >> 7;
             const uint32_t l128    = tid & 127u;
             #pragma nounroll
@@ -1686,6 +1829,22 @@ void ornith_m1_moe_super_q3_kernel(
                 }
                 __syncthreads();
             }
+            if (do_sh_gate && sh_wgs == 96u) {
+                GPtr<const float4> w4 = as_gptr<const float4>(desc->w_sh_gate);
+                float acc = 0.0f;
+                #pragma nounroll
+                for (uint32_t i = tid; i < 768u; i += 256u) {
+                    const float4 wv = w4[i], xv = x4f[i];
+                    acc = fmaf(wv.x, xv.x, fmaf(wv.y, xv.y, fmaf(wv.z, xv.z, fmaf(wv.w, xv.w, acc))));
+                }
+                acc = wave64_sum(acc);
+                if ((tid & 63u) == 0u) sm_y[tid >> 6] = acc;
+                __syncthreads();
+                if (tid == 0u) {
+                    const float tot = (sm_y[0] + sm_y[1]) + (sm_y[2] + sm_y[3]);
+                    as_gptr<float>(desc->sh_gate_sc)[0] = 1.0f / (1.0f + __expf(-tot));
+                }
+            }
         }
         grid_barrier_wbinvl1(sbar + 32u, gridDim.x, super_sense);
         p_acc(11u);
@@ -1702,18 +1861,21 @@ void ornith_m1_moe_super_q3_kernel(
 
     // ---- Stage 3: Pure VJ_Q3_IQ2S Gate+Up (kBatch=3 deep prefetch!) + Parallel Shared Down! ----
     {
+        const uint32_t local_ff = desc->local_ff;
+        const uint32_t nblk16   = local_ff >> 4;
+        const uint32_t n_tiles  = 8u * nblk16;
         #pragma nounroll
-        for (uint32_t tile = wg; tile < 256u; tile += gridDim.x) {
+        for (uint32_t tile = wg; tile < n_tiles; tile += gridDim.x) {
             const uint32_t sub_id = tid >> 4;
             const uint32_t lane16 = tid & 15u;
-            const uint32_t gidx   = tile * 16u + sub_id;
-            const uint32_t slot   = gidx >> 9;
-            const uint32_t rloc   = gidx & 511u;
+            uint32_t slot, t_in_slot;
+            divmod_slot_u(tile, nblk16, slot, t_in_slot);
+            const uint32_t rloc   = t_in_slot * 16u + sub_id;
             const uint32_t exp_id = __builtin_amdgcn_readfirstlane(static_cast<uint32_t>(sm_ids[slot]));
             const float2 gu = vegajet::dot8_dev::vj_q3_gu_row_iq2s<6, 3>(
                 as_gptr<const uint8_t>(desc->w_gu_d8_w), desc->gu_d8_w_stride,
                 as_gptr<const uint8_t>(desc->w_gu_d8_s), desc->gu_d8_s_stride,
-                sm_x, sm_xd, exp_id * 512u, rloc, lane16);
+                sm_x, sm_xd, exp_id * local_ff, rloc, lane16);
             if (lane16 == 0u) sm_y[sub_id] = (gu.x / (1.0f + __expf(-gu.x))) * gu.y;
             __syncthreads();
             GPtr<uint32_t> pair_cnt = as_gptr<uint32_t>(desc->super_bar + 1536u);
@@ -1741,20 +1903,32 @@ void ornith_m1_moe_super_q3_kernel(
             __syncthreads();
         }
 
-        // CU-balanced Shared Down: 44 tiles on wg 16..59 + 20 tiles on wg 76..95 (0 overlap with 2-tile CUs 0..15!)
+        // TP=3 (n_tiles <= 192): run 48 Shared Down WGs x 64 rows strictly on IDLE WGs 192..239 (0 Gate+Up collision!).
+        // TP=2 (n_tiles == 256): 64 tiles x 48 rows on wg 16..59 + 76..95 (0 overlap with 2-tile CUs 0..15!).
         uint32_t sh_tile = 64u;
-        if (wg >= 16u && wg < 60u)      sh_tile = wg - 16u;
-        else if (wg >= 76u && wg < 96u) sh_tile = 44u + (wg - 76u);
+        uint32_t sh_steps = 3u;
+        uint32_t sh_stride_rows = 48u;
+        if (n_tiles <= 192u) {
+            if (wg >= 192u && wg < 240u) {
+                sh_tile = wg - 192u;
+                sh_steps = 4u;
+                sh_stride_rows = 64u;
+            }
+        } else {
+            if (wg >= 16u && wg < 60u)      sh_tile = wg - 16u;
+            else if (wg >= 76u && wg < 96u) sh_tile = 44u + (wg - 76u);
+        }
         asm volatile("" : "+s"(sh_tile));
         if (sh_tile < 64u) {
+            const uint32_t n_blk = local_ff >> 5;
             const float sc_g = as_gptr<const float>(desc->sh_gate_sc)[0];
             GPtr<const float> g_p = as_gptr<const float>(desc->sh_gu_out);
-            GPtr<const float> u_p = g_p + 512u;
+            GPtr<const float> u_p = g_p + local_ff;
             int8_t* sh_q8_sm = reinterpret_cast<int8_t*>(sm_x);
             float2* sh_ds_sm = reinterpret_cast<float2*>(sm_x + 32u);
             const uint32_t l32 = tid & 31u;
             #pragma nounroll
-            for (uint32_t blk = tid >> 5; blk < 16u; blk += 8u) {
+            for (uint32_t blk = tid >> 5; blk < n_blk; blk += 8u) {
                 const uint32_t c = (blk << 5) + l32;
                 const float gv = g_p[c], uv = u_p[c];
                 const float y  = (gv / (1.0f + __expf(-gv))) * uv * sc_g;
@@ -1768,28 +1942,33 @@ void ornith_m1_moe_super_q3_kernel(
             __syncthreads();
             const uint32_t lane16 = tid & 15u;
             const uint32_t grp16  = tid >> 4;
-            const uint32_t base   = sh_tile * 48u;
-            const uint4    xa     = sm_x[lane16 * 2u];
-            const uint4    xb     = sm_x[lane16 * 2u + 1u];
-            const float2   xds    = sh_ds_sm[lane16];
+            const uint32_t base   = sh_tile * sh_stride_rows;
+            const bool     act16  = (lane16 < n_blk);
+            const uint4    xa     = act16 ? sm_x[lane16 * 2u]      : make_uint4(0u, 0u, 0u, 0u);
+            const uint4    xb     = act16 ? sm_x[lane16 * 2u + 1u] : make_uint4(0u, 0u, 0u, 0u);
+            const float2   xds    = act16 ? sh_ds_sm[lane16]       : make_float2(0.0f, 0.0f);
             #pragma nounroll
-            for (uint32_t st = 0u; st < 3u; ++st) {
+            for (uint32_t st = 0u; st < sh_steps; ++st) {
                 const uint32_t row = base + st * 16u + grp16;
-                GPtr<const uint4> w4 = as_gptr<const uint4>(desc->sh_dn_qs + static_cast<uint64_t>(row) * desc->sh_dn_stride);
-                GPtr<const uint32_t> dm = as_gptr<const uint32_t>(desc->sh_dn_dm) + static_cast<uint64_t>(row) * 16u;
-                const uint4 wv = ldg_u32x4_stream(w4 + lane16);
-                const uint32_t dmv = ldg_u32_stream(dm + lane16);
-                int32_t dp = sdot4(wv.x & 0x0F0F0F0Fu, xa.x, 0);
-                dp = sdot4(wv.y & 0x0F0F0F0Fu, xa.y, dp);
-                dp = sdot4(wv.z & 0x0F0F0F0Fu, xa.z, dp);
-                dp = sdot4(wv.w & 0x0F0F0F0Fu, xa.w, dp);
-                dp = sdot4((wv.x >> 4) & 0x0F0F0F0Fu, xb.x, dp);
-                dp = sdot4((wv.y >> 4) & 0x0F0F0F0Fu, xb.y, dp);
-                dp = sdot4((wv.z >> 4) & 0x0F0F0F0Fu, xb.z, dp);
-                dp = sdot4((wv.w >> 4) & 0x0F0F0F0Fu, xb.w, dp);
-                const float wd = fp16_to_f32(static_cast<uint16_t>(dmv & 0xFFFFu));
-                const float wm = fp16_to_f32(static_cast<uint16_t>(dmv >> 16));
-                const float acc = vegajet::dot8_dev::sum16(fmaf(wd * xds.x, static_cast<float>(dp), wm * xds.y));
+                float part_acc = 0.0f;
+                if (act16) {
+                    GPtr<const uint4> w4 = as_gptr<const uint4>(desc->sh_dn_qs + static_cast<uint64_t>(row) * desc->sh_dn_stride);
+                    GPtr<const uint32_t> dm = as_gptr<const uint32_t>(desc->sh_dn_dm) + static_cast<uint64_t>(row) * n_blk;
+                    const uint4 wv = ldg_u32x4_stream(w4 + lane16);
+                    const uint32_t dmv = ldg_u32_stream(dm + lane16);
+                    int32_t dp = sdot4(wv.x & 0x0F0F0F0Fu, xa.x, 0);
+                    dp = sdot4(wv.y & 0x0F0F0F0Fu, xa.y, dp);
+                    dp = sdot4(wv.z & 0x0F0F0F0Fu, xa.z, dp);
+                    dp = sdot4(wv.w & 0x0F0F0F0Fu, xa.w, dp);
+                    dp = sdot4((wv.x >> 4) & 0x0F0F0F0Fu, xb.x, dp);
+                    dp = sdot4((wv.y >> 4) & 0x0F0F0F0Fu, xb.y, dp);
+                    dp = sdot4((wv.z >> 4) & 0x0F0F0F0Fu, xb.z, dp);
+                    dp = sdot4((wv.w >> 4) & 0x0F0F0F0Fu, xb.w, dp);
+                    const float wd = fp16_to_f32(static_cast<uint16_t>(dmv & 0xFFFFu));
+                    const float wm = fp16_to_f32(static_cast<uint16_t>(dmv >> 16));
+                    part_acc = fmaf(wd * xds.x, static_cast<float>(dp), wm * xds.y);
+                }
+                const float acc = vegajet::dot8_dev::sum16(part_acc);
                 if (lane16 == 0u) as_gptr<float>(desc->sh_down_out)[row] = acc;
             }
         }
@@ -1799,10 +1978,13 @@ void ornith_m1_moe_super_q3_kernel(
 
     // ---- Stage 4: CU-balanced 240-WG (144x16 + 96x8 = 3072, 16B u32x4 BAR0 PP!) Routed DOT8 Down ----
     if (wg < 240u) {
+        const uint32_t n_blk   = desc->local_ff >> 5;
+        const uint32_t n_q8_u4 = 8u * (n_blk << 1);
+        const uint32_t n_d     = 8u * n_blk;
         uint32_t t4 = tid;
         asm volatile("" : "+v"(t4));
-        sm_x[t4] = as_gptr<const uint4>(desc->mid_q8)[t4];
-        if (t4 < 128u) sm_xd[t4] = as_gptr<const float>(desc->mid_d)[t4];
+        if (t4 < n_q8_u4) sm_x[t4]  = as_gptr<const uint4>(desc->mid_q8)[t4];
+        if (t4 < n_d)     sm_xd[t4] = as_gptr<const float>(desc->mid_d)[t4];
         __syncthreads();
         const uint32_t grp16  = t4 >> 4;
         const uint32_t lane16 = t4 & 15u;
@@ -1810,19 +1992,19 @@ void ornith_m1_moe_super_q3_kernel(
         const uint32_t row0   = (wg < 144u) ? (wg * 16u) : (2304u + (wg - 144u) * 8u);
         if (grp16 < n_rows) {
             const uint32_t row = row0 + grp16;
-            const float total = vegajet::dot8_dev::vj_dot8_down_row_iq3<4>(
+            const float total = vegajet::dot8_dev::vj_dot8_down_row_iq3_flex<2>(
                 as_gptr<const uint8_t>(desc->w_dn_d8_w), desc->dn_w_stride,
                 as_gptr<const uint8_t>(desc->w_dn_d8_s), desc->dn_s_stride,
-                sm_x, sm_xd, sm_ids, sm_w, row, desc->D, lane16);
+                sm_x, sm_xd, sm_ids, sm_w, row, desc->D, n_blk, desc->dn_is_sub32 != 0u, lane16);
             if (lane16 == 0u) {
                 const float v = total + as_gptr<const float>(desc->sh_down_out)[row];
                 as_gptr<float>(desc->x_partial)[row] = v;
                 sm_y[grp16] = v;
             }
         }
-        if (out_ar_epoch != 0u) {
+        if (out_ar_epoch != 0u && desc->n_ranks > 1u) {
             __syncthreads();
-            GPtr<uint16_t> ptx = as_gptr<uint16_t>(desc->out_peer_tx_base + static_cast<uint64_t>(out_ar_epoch & 1u) * VJ_SUPER_AR_SLOT_BYTES);
+            const uint64_t slot_off = static_cast<uint64_t>(out_ar_epoch & 1u) * VJ_SUPER_AR_SLOT_BYTES;
             if (tid < (n_rows >> 3)) {
                 const uint32_t o = tid * 8u;
                 const __half2 h0 = __float22half2_rn(make_float2(sm_y[o + 0u], sm_y[o + 1u]));
@@ -1835,10 +2017,86 @@ void ornith_m1_moe_super_q3_kernel(
                     *reinterpret_cast<const uint32_t*>(&h2),
                     *reinterpret_cast<const uint32_t*>(&h3)
                 };
-                __builtin_nontemporal_store(pv, reinterpret_cast<GPtr<u32x4>>(ptx + row0 + o));
+                #pragma nounroll
+                for (uint32_t dst = 0u; dst < desc->n_ranks; ++dst) {
+                    if (dst != desc->rank && desc->out_peer_tx_base[dst] != 0ULL) {
+                        __builtin_nontemporal_store(pv, reinterpret_cast<GPtr<u32x4>>(
+                            as_gptr<uint16_t>(desc->out_peer_tx_base[dst] + slot_off) + row0 + o));
+                    }
+                }
             }
-            signal_out_peer_flag(sbar, desc->out_peer_flag, 240u, out_ar_epoch);
+            signal_out_peer_flag_n(sbar, desc->out_peer_flag, desc->rank, desc->n_ranks, 240u, out_ar_epoch);
         }
         p_acc(14u);
+    }
+}
+
+// Ring-verify (M = 2..8) router front end in the exact M = 1 super order: each expert logit is one 128-lane
+// half-WG dot (3 uint4 packets/lane at D = 3072, wave64_sum per wave, wave0 + wave1), the shared scalar gate is
+// the super's 128-lane half-WG loop, and top-8 selects raw logits then normalises the eight exponentials.
+// Grid (129 WG, M): WG 0..127 -> experts 2*wg + half, WG 128 half 1 -> shared gate. Same kernargs as
+// ornith_moe_router_fp16_logits_kernel.
+extern "C" __global__ __launch_bounds__(256, 4)
+void ornith_ring_router_super_order_kernel(
+    uint64_t w_router_f16, uint64_t w_sh_gate, uint64_t x_norm, uint64_t logits_out, uint64_t sh_gate_out,
+    uint32_t M, uint32_t D) {
+    using namespace vegajet::super_dev;
+    __shared__ float sm_y[4];
+    const uint32_t m = blockIdx.y;
+    if (m >= M || D != 3072u) return;
+    const uint32_t tid = threadIdx.x, wg = blockIdx.x;
+    const uint32_t half_id = tid >> 7, l128 = tid & 127u;
+    GPtr<const float4> x4f = as_gptr<const float4>(x_norm) + static_cast<uint64_t>(m) * (D >> 2);
+    float acc = 0.0f;
+    if (wg < 128u) {
+        const uint32_t e = wg * 2u + half_id;
+        GPtr<const uint4> w4 = reinterpret_cast<GPtr<const uint4>>(
+            as_gptr<const uint16_t>(w_router_f16) + static_cast<uint64_t>(e) * 3200u);
+        uint4 wvs[3];
+        #pragma unroll
+        for (uint32_t r = 0u; r < 3u; ++r) wvs[r] = ldg_u32x4_stream(w4 + l128 + r * 128u);
+        #pragma unroll
+        for (uint32_t r = 0u; r < 3u; ++r) {
+            const uint32_t i = l128 + r * 128u;
+            const uint4 wv = wvs[r];
+            const float4 xa = x4f[i * 2u], xb = x4f[i * 2u + 1u];
+            const float2 h0 = __half22float2(*reinterpret_cast<const __half2*>(&wv.x));
+            const float2 h1 = __half22float2(*reinterpret_cast<const __half2*>(&wv.y));
+            const float2 h2 = __half22float2(*reinterpret_cast<const __half2*>(&wv.z));
+            const float2 h3 = __half22float2(*reinterpret_cast<const __half2*>(&wv.w));
+            acc = fmaf(h0.x, xa.x, fmaf(h0.y, xa.y, fmaf(h1.x, xa.z, fmaf(h1.y, xa.w, acc))));
+            acc = fmaf(h2.x, xb.x, fmaf(h2.y, xb.y, fmaf(h3.x, xb.z, fmaf(h3.y, xb.w, acc))));
+        }
+    } else if (half_id == 1u) {
+        GPtr<const float4> w4 = as_gptr<const float4>(w_sh_gate);
+        const uint32_t n4 = D >> 2;
+        #pragma nounroll
+        for (uint32_t i = l128; i < n4; i += 128u) {
+            const float4 wv = w4[i], xv = x4f[i];
+            acc = fmaf(wv.x, xv.x, fmaf(wv.y, xv.y, fmaf(wv.z, xv.z, fmaf(wv.w, xv.w, acc))));
+        }
+    }
+    acc = wave64_sum(acc);
+    if ((tid & 63u) == 0u) sm_y[tid >> 6] = acc;
+    __syncthreads();
+    if (l128 == 0u) {
+        const float tot = sm_y[half_id * 2u] + sm_y[half_id * 2u + 1u];
+        if (wg < 128u) as_gptr<float>(logits_out)[static_cast<uint64_t>(m) * 256u + wg * 2u + half_id] = tot;
+        else if (half_id == 1u) as_gptr<float>(sh_gate_out)[m] = 1.0f / (1.0f + __expf(-tot));
+    }
+}
+
+extern "C" __global__ __launch_bounds__(256, 4)
+void ornith_ring_top8_super_order_kernel(uint64_t logits_in, uint64_t top_ids, uint64_t top_w, uint32_t M) {
+    using namespace vegajet::super_dev;
+    __shared__ int32_t sm_ids[8];
+    __shared__ float   sm_w[8];
+    const uint32_t m = blockIdx.x, tid = threadIdx.x;
+    if (m >= M) return;
+    if (tid < 64u) fast_softmax_top8_wave64(as_gptr<const float>(logits_in) + static_cast<uint64_t>(m) * 256u, sm_ids, sm_w, tid);
+    __syncthreads();
+    if (tid < 8u) {
+        as_gptr<int32_t>(top_ids)[static_cast<uint64_t>(m) * 8u + tid] = sm_ids[tid];
+        as_gptr<float>(top_w)[static_cast<uint64_t>(m) * 8u + tid]     = sm_w[tid];
     }
 }

@@ -160,6 +160,17 @@ int run_serve(const std::vector<std::string>& args, const gpusel::Selection& gpu
     }
     if (c.help) { print_serve_usage(stdout); return 0; }
 
+    if (!c.mock) {
+        const char* value=std::getenv("VEGAJET_GPU_BATCH");
+        if (value) {
+            char* end=nullptr;
+            const long width=std::strtol(value,&end,10);
+            if (!*value || *end || width<1 || width>8) {
+                std::fprintf(stderr,"[vegajet] VEGAJET_GPU_BATCH must be 1..8\n"); return 2;
+            }
+            c.slots=static_cast<uint32_t>(width);
+        }
+    }
     // ---- tokenizer + chat template
     bpe::Tokenizer tok;
     bpe::ChatFormat fmt = bpe::ChatFormat::ChatML;
@@ -241,6 +252,14 @@ int run_serve(const std::vector<std::string>& args, const gpusel::Selection& gpu
     if (batch && c.slots > 1) {
         sched::SchedulerConfig sc;
         sc.max_slots = c.slots;
+        if (!c.mock) {
+            sc.speculative=false;
+            sc.prefill_chunk=1024;
+            sc.step_token_budget=sc.prefill_chunk*c.slots+c.slots;
+            sc.prefix_reuse=false; // hybrid state snapshots are not shared
+            sc.sequence_context=c.ctx/8u;
+            so.context_length=sc.sequence_context;
+        }
         sc.kv_blocks = std::max<uint32_t>(64, c.ctx * c.slots / 16 + c.slots);
         sc.block_tokens = 16;
         sched::ServeHooks h;

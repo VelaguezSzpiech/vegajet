@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 #include "models/ornith/ornith_model.hpp"
+#include "core/gdn_vshard.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace vegajet::ornith {
@@ -26,6 +28,9 @@ int32_t layer_of(const std::string& name) {
 
 bool arch_ok(const std::string& a) { return a == "qwen35moe" || a == "qwen3_5_moe" || a == "ornith"; }
 
+// A 512-layer cap is far above anything real and keeps the per-layer loops below bounded.
+constexpr uint32_t kMaxBlockCount = 512;
+
 } // namespace
 
 bool OrnithModel::can_load(const GgufFile& f) const {
@@ -47,6 +52,10 @@ bool OrnithModel::parse_hparams(const GgufFile& f, std::string* err) {
     double d = 0;
     auto need = [&](const char* key, uint32_t& out) {
         if (!f.get_arch_u64(key, u)) { if (err) *err = "missing " + h.arch + "." + key; return false; }
+        if (u > 0xFFFFFFFFull) {
+            if (err) *err = h.arch + "." + key + " out of range: " + std::to_string(u);
+            return false;
+        }
         out = static_cast<uint32_t>(u);
         return true;
     };
@@ -57,8 +66,53 @@ bool OrnithModel::parse_hparams(const GgufFile& f, std::string* err) {
         !need("ssm.group_count", h.ssm_groups) || !need("ssm.time_step_rank", h.ssm_v_heads) ||
         !need("ssm.inner_size", h.ssm_inner))
         return false;
-    h.n_nextn = f.get_arch_u64("nextn_predict_layers", u) ? static_cast<uint32_t>(u) : 0;
+    h.n_nextn = 0;
+    if (f.get_arch_u64("nextn_predict_layers", u)) {
+        if (u > 0xFFFFFFFFull) {
+            if (err) *err = h.arch + ".nextn_predict_layers out of range: " + std::to_string(u);
+            return false;
+        }
+        h.n_nextn = static_cast<uint32_t>(u);
+    }
+    // Layer counts index recurrent[] and every per-block loop: validate before any arithmetic.
+    if (h.n_block == 0 || h.n_block > kMaxBlockCount) {
+        if (err) *err = h.arch + ".block_count out of range: " + std::to_string(h.n_block);
+        return false;
+    }
+    if (h.n_nextn > h.n_block) {
+        if (err) *err = h.arch + ".nextn_predict_layers (" + std::to_string(h.n_nextn) +
+                        ") > block_count (" + std::to_string(h.n_block) + ")";
+        return false;
+    }
     h.n_trunk = h.n_block - h.n_nextn;
+    if (h.n_trunk == 0) {
+        if (err) *err = h.arch + ".nextn_predict_layers leaves no trunk layers";
+        return false;
+    }
+    // Division sites below (n_embd / n_head, (i + 1) % full_attn_interval): refuse zero divisors
+    // instead of raising SIGFPE deep inside load().
+    if (h.n_embd == 0) {
+        if (err) *err = h.arch + ".embedding_length is zero";
+        return false;
+    }
+    if (h.n_head == 0) {
+        if (err) *err = h.arch + ".attention.head_count is zero";
+        return false;
+    }
+    if (h.n_head_kv == 0) {
+        if (err) *err = h.arch + ".attention.head_count_kv is zero";
+        return false;
+    }
+    if (h.n_head_kv > h.n_head) {
+        if (err) *err = h.arch + ".attention.head_count_kv (" + std::to_string(h.n_head_kv) +
+                        ") > attention.head_count (" + std::to_string(h.n_head) + ")";
+        return false;
+    }
+    if (h.n_embd % h.n_head != 0) {
+        if (err) *err = h.arch + ".embedding_length (" + std::to_string(h.n_embd) +
+                        ") is not a multiple of attention.head_count (" + std::to_string(h.n_head) + ")";
+        return false;
+    }
     h.head_dim_k = f.get_arch_u64("attention.key_length", u) ? static_cast<uint32_t>(u) : h.n_embd / h.n_head;
     h.head_dim_v = f.get_arch_u64("attention.value_length", u) ? static_cast<uint32_t>(u) : h.head_dim_k;
     h.rope_dims = f.get_arch_u64("rope.dimension_count", u) ? static_cast<uint32_t>(u) : h.head_dim_k;
@@ -67,6 +121,10 @@ bool OrnithModel::parse_hparams(const GgufFile& f, std::string* err) {
     h.n_ff_exp = f.get_arch_u64("expert_feed_forward_length", u) ? static_cast<uint32_t>(u) : 0;
     h.n_ff_shexp = f.get_arch_u64("expert_shared_feed_forward_length", u) ? static_cast<uint32_t>(u) : 0;
     h.full_attn_interval = f.get_arch_u64("full_attention_interval", u) ? static_cast<uint32_t>(u) : 4;
+    if (h.full_attn_interval == 0) {  // modulo divisor for the recurrent-layer pattern
+        if (err) *err = h.arch + ".full_attention_interval is zero";
+        return false;
+    }
     h.context_length = f.get_arch_u64("context_length", u) ? u : 0;
     if (const GgufValue* v = f.find(h.arch + ".rope.dimension_sections"))
         for (double x : v->arr_num) h.rope_sections.push_back(static_cast<uint32_t>(x));
@@ -121,6 +179,11 @@ bool OrnithModel::parse_draft(const std::string& path, LoadReport& rep) {
     if (d.get_u64("tokenizer.ggml.mask_token_id", u)) h.mask_token = u;
     if (const GgufValue* v = d.find("dflash.target_layers"))
         for (double x : v->arr_num) h.target_layers.push_back(static_cast<uint32_t>(x));
+    // Per-layer attention type (z-lab layer_types): sizes the drafter KV cache per layer (core/spec_replay).
+    if (const GgufValue* v = d.find("dflash.attention.sliding_window_pattern")) {
+        if (v->arr_num.size() != h.n_layer) { rep.error = "draft: sliding_window_pattern needs one entry per layer"; return false; }
+        for (double x : v->arr_num) h.swa_pattern.push_back(x != 0.0 ? 1u : 0u);
+    }
     if (h.n_embd != hp_.n_embd) { rep.error = "draft: embedding_length mismatch"; return false; }
     for (uint32_t t : h.target_layers)
         if (t > hp_.n_trunk) { rep.error = "draft: target layer out of range"; return false; }
@@ -166,7 +229,10 @@ LoadReport OrnithModel::load(GgufFile& f, const LoadOptions& opt) {
     for (double b : bw_) bw_sum += b;
 
     attn_ = shard::plan_attention(hp_.n_head, hp_.n_head_kv, bw_);
-    gdn_ = shard::plan_gdn(hp_.ssm_groups, hp_.ssm_v_heads, bw_);
+    // Load-time override shared with the live GPU planner (whole K groups only).
+    const char* vshard = std::getenv("VEGAJET_GDN_VSHARD");
+    if (!shard::plan_gdn_vshard(hp_.ssm_groups, hp_.ssm_v_heads, bw_, vshard ? vshard : "", gdn_, &rep.error))
+        return rep;
 
     // ---- tensor classification ----------------------------------------------------------------
     for (const auto& t : f.tensors()) {
@@ -336,6 +402,12 @@ LoadReport OrnithModel::load(GgufFile& f, const LoadOptions& opt) {
         cm.moe_byte_fraction = total > 0 ? moe / total : 0.5;
     }
     gov_ = spec::MoeKGovernor(cm);
+    {   // One draft slot may route one full top-k expert set across every MoE trunk layer without expert pressure;
+        // denser unions (or more layers) shorten the advisory prefix instead of silently inflating verify cost.
+        EvictDepthConfig ecfg;
+        ecfg.experts_per_depth = std::max(1u, hp_.n_expert_used * hp_.n_trunk);
+        evict_ = EvictDepth(kEvictMaxDepth, ecfg);
+    }
     ring_ = ssm::ReplayRing();
     suffix_ = spec::SuffixTree();
     pos_ = 0;
@@ -371,6 +443,9 @@ bool OrnithModel::repack_shard_for_test(GgufFile& f, const std::string& tensor, 
         case NativeFormat::VJ_Q4_DOT8: quant::dequantize_vj_q4_dot8(quant::repack_to_vj_q4_dot8(p->disk, src, R, C, p->fwht64), native.data()); break;
         case NativeFormat::VJ_Q4_A8:   quant::dequantize_vj_q4_a8(quant::repack_to_vj_q4_a8(p->disk, src, R, C), native.data()); break;
         case NativeFormat::VJ_IQ_PACKED: quant::dequantize_vj_iq(quant::repack_to_vj_iq(p->disk, src, R, C), native.data()); break;
+        case NativeFormat::VJ_Q3_DOT8:
+        case NativeFormat::VJ_Q2_DOT8:
+            quant::dequantize_vj_sub4(quant::pack_f32_to_vj_sub4(disk.data(), R, C, p->format, 64u), native.data()); break;
     }
     f.release(src, rows * rb);
     return true;

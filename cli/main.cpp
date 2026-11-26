@@ -3,6 +3,7 @@
 #include "cli/serve_cmd.hpp"
 #include "core/doctor.hpp"
 #include "core/doctor_rules.hpp"
+#include "core/hw_preflight.hpp"
 #include "core/gpu_select.hpp"
 #include "cli/chat_repl.hpp"
 #include "cli/tui_top.hpp"
@@ -17,7 +18,7 @@ namespace {
 
 void print_usage(const char* prog) {
     std::printf(
-        "VegaJet CLI v0.1.0-alpha.1 — Bare-Metal gfx906 (Vega 20: MI50 / MI60) LLM Engine\n\n"
+        "VegaJet CLI v0.1.1 — Bare-Metal gfx906 (Vega 20: MI50 / MI60) LLM Engine\n\n"
         "Usage:\n"
         "  %s inspect <model-file> [--all-keys]                Header-only GGUF metadata / tensor / footprint report\n"
         "  %s plan <model-file> [--tp N] [--ctx T] ...         Plan + graph summary only (= bench --dry-run; any build)\n"
@@ -112,6 +113,8 @@ int run_doctor(const std::vector<std::string>& args, const char* prog) {
     auto rep = vegajet::doctor::run_doctor();
     if (as_json) vegajet::doctor::print_report_json(rep);
     else vegajet::doctor::print_report_text(rep);
+    for (const auto& w : vegajet::hw_preflight::run([&] { std::vector<std::string> b; for (const auto& g : rep.gpus) b.push_back(g.bdf); return b; }()))
+        std::printf("[WARN] fabric %s %s: %s\n", w.bdf.c_str(), w.check.c_str(), w.detail.c_str());
     if (do_bench) {
         if (!vegajet::doctor::calibrate_and_save_hw_profile()) {
             std::fprintf(stderr, "[vegajet] Failed to write hw_profile.json\n");
@@ -135,7 +138,7 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (cmd == "--version" || cmd == "-v") {
-        std::printf("vegajet 0.1.0-alpha.1\n");
+        std::printf("vegajet 0.1.1\n");
         return 0;
     }
     std::vector<std::string> args(argv + 2, argv + argc);

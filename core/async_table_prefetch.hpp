@@ -118,6 +118,7 @@ struct IoUringOptions {
     uint32_t max_bytes_per_sqe = 0;
     bool simulate_unavailable = false;  // setup fails with ENOSYS
     int simulate_enter_errno = 0;       // the first io_uring_enter() fails with this errno
+    std::vector<iovec> registered_buffers{}; // caller keeps these alive until backend destruction
 };
 
 struct IoUringStats {
@@ -138,6 +139,7 @@ public:
     size_t reap(std::vector<Completion>& out, int wait_ms) override;
     const char* name() const override;          // "io_uring", or "io_uring-degraded-preadv" after a runtime failure
     IoUringStats stats() const;
+    bool buffers_registered() const;
     uint32_t sq_entries() const;
 
 private:

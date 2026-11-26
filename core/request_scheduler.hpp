@@ -50,6 +50,8 @@ struct SchedulerConfig {
     uint32_t block_tokens = 16;
     bool speculative = true;           // draft depth from the EvictController (needs a drafter)
     uint32_t admit_reserve_blocks = 1; // admit only if this many blocks are free or evictable beyond the first chunk
+    bool prefix_reuse = true;          // false for engines without physical prefix snapshots
+    uint32_t sequence_context = 0;     // 0 = pool capacity; fixed-slot engines set their segment size
 };
 
 enum class EndReason : uint8_t { None = 0, Eos = 1, Length = 2, ContextFull = 3, Cancelled = 4, Failed = 5 };
@@ -68,6 +70,7 @@ struct StepPlan {
     std::vector<WorkItem> items;
     uint32_t tokens = 0;
     std::vector<paged::CopyOp> copies;  // KV block copies (COW) the engine applies before the step
+    std::vector<paged::SeqId> resident; // all physical sequences still live after planning
 };
 struct StepOutput {
     uint64_t req = 0;
@@ -100,6 +103,8 @@ public:
     // Plans one step. `out` receives deliveries produced while planning (cancellations, failures, context-full).
     StepPlan schedule(const Drafter& drafter, std::vector<Delivery>& out);
     void commit(const StepPlan& plan, const std::vector<StepOutput>& results, std::vector<Delivery>& out);
+
+    void fail(const StepPlan& plan, const std::string& error, std::vector<Delivery>& out);
 
     bool idle() const { return reqs_.empty(); }
     size_t active() const;

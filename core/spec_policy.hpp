@@ -123,6 +123,44 @@ EvictDecision plan_evict(const std::vector<double>& cond, const VerifyCostModel&
                          double draft_ms = 0.0);
 
 // ---------------------------------------------------------------------------------------------------------
+// Measured-cost depth governor (v1.2 C7+S1). Chases the same objective as plan_evict, but the per-M verify
+// cost comes from the wall time the decode loop measures for each verify batch (t_ver[M]) and the acceptance
+// from the live accepted length, so no fabricated inflation constant is needed. Unseen M values are
+// interpolated between the measured ones (parametric ratio below the smallest measured M) and the result is
+// only used once the caller has fed it at least one sample.
+// ---------------------------------------------------------------------------------------------------------
+struct MeasuredDepthConfig {
+    uint32_t k_min = 1;          // shortest proposal the governor may return (0 would mean plain decode)
+    uint32_t min_samples = 2;    // verify samples of one M before that point is trusted on its own
+    double   ema = 0.3;          // smoothing of the measured per-M time
+    double   alpha_lo = 0.02;    // clamp for the live acceptance
+    double   alpha_hi = 0.99;
+    uint32_t alpha_window = 32;  // cycles of (proposed, accepted) behind the live acceptance
+};
+
+class MeasuredDepthGovernor {
+public:
+    explicit MeasuredDepthGovernor(MeasuredDepthConfig cfg = MeasuredDepthConfig());
+
+    void observe_verify(uint32_t m, double ms);          // one verify pass over m tokens (m >= 1)
+    void observe_accept(uint32_t proposed, uint32_t accepted);
+
+    // Proposal depth for a batch capped at `cap`; 0 = not warmed up, the caller keeps its own depth.
+    uint32_t next_depth(uint32_t cap) const;
+    double alpha() const;
+    double measured_ms(uint32_t m) const;   // smoothed measured verify time, 0 when unseen
+    double est_ms(uint32_t m) const;        // measured / interpolated verify time, 0 when no sample at all
+    double time_inflation(uint32_t m) const; // est_ms(m) / est_ms(1), 0 when unknown
+    uint32_t samples(uint32_t m) const;
+
+private:
+    MeasuredDepthConfig cfg_;
+    std::vector<double>   ms_;      // EWMA of the measured verify time per M
+    std::vector<uint32_t> n_;       // samples per M
+    std::deque<std::pair<uint32_t, uint32_t>> win_;  // (proposed, accepted) tail
+};
+
+// ---------------------------------------------------------------------------------------------------------
 // Drafter (MTP head) KV resynchronisation bookkeeping.
 // h sources map to engine buffers: kPend -> S[g].mtp_h_pend_va, kTrunkRow j -> S[g].h_va + j*D*4,
 // kStash s -> (new) stash buffer + s*D*4.

@@ -24,6 +24,15 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <csignal>
+
+namespace {
+// SIGINT drain: a supervisor's soft stop must not kill the process while waves are resident, because KFD then
+// preempts the live queues (CWSR save through the trap handler). The handler only sets a flag; the next batch
+// submit with every queue idle exits with 130. serve installs its own SIGINT handler after init, so this covers bench.
+volatile std::sig_atomic_t g_vj_drain_requested = 0;
+void vj_drain_on_sigint(int) { g_vj_drain_requested = 1; }
+} // namespace
 #endif
 
 namespace vegajet::kfd {
@@ -159,13 +168,45 @@ std::vector<DeviceInfo> Runtime::scan_gfx906_topology() {
             if (key == "gfx_target_version") info.gfx_target_version = static_cast<uint32_t>(val);
             else if (key == "simd_count") info.simd_count = static_cast<uint32_t>(val);
             else if (key == "drm_render_minor") info.drm_render_minor = static_cast<uint32_t>(val);
+            else if (key == "domain") info.domain = static_cast<uint32_t>(val);
             else if (key == "location_id") info.location_id = static_cast<uint32_t>(val);
             else if (key == "p2p_links_count") info.p2p_links_count = static_cast<uint32_t>(val);
             else if (key == "cwsr_size") info.cwsr_size = static_cast<uint32_t>(val);
             else if (key == "ctl_stack_size") info.ctl_stack_size = static_cast<uint32_t>(val);
+            else if (key == "unique_id") info.unique_id = val;
         }
         if (info.gfx_target_version != 90006u) continue;
         info.n_cu = info.simd_count / 4u;
+        {
+            char bdf_buf[32];
+            std::snprintf(bdf_buf, sizeof(bdf_buf), "%04x:%02x:%02x.%u",
+                          info.domain, (info.location_id >> 8) & 0xFFu,
+                          (info.location_id >> 3) & 0x1Fu, info.location_id & 7u);
+            info.bdf = bdf_buf;
+            if (info.unique_id != 0ULL) {
+                char uid_buf[32];
+                std::snprintf(uid_buf, sizeof(uid_buf), "%016llx", static_cast<unsigned long long>(info.unique_id));
+                info.unique_id_hex = uid_buf;
+            } else {
+                std::ifstream uf("/sys/bus/pci/devices/" + info.bdf + "/unique_id");
+                std::string s;
+                if (uf >> s && !s.empty()) {
+                    for (char& c : s) if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+                    info.unique_id_hex = s;
+                    info.unique_id = std::strtoull(s.c_str(), nullptr, 16);
+                }
+            }
+            std::ifstream mf("/sys/bus/pci/devices/" + info.bdf + "/pp_dpm_mclk");
+            std::string line;
+            double mx = 0.0;
+            while (mf.is_open() && std::getline(mf, line)) {
+                auto colon = line.find(':');
+                if (colon == std::string::npos) continue;
+                double v = std::atof(line.c_str() + colon + 1);
+                if (v > mx) mx = v;
+            }
+            info.mclk_mhz = mx;
+        }
 
         uint64_t gid = 0;
         if (read_u64_file((ndir / "gpu_id").string(), gid)) info.gpu_id = static_cast<uint32_t>(gid);
@@ -287,6 +328,13 @@ bool Runtime::init(double vram_arena_gib, size_t host_pinned_mb, std::string* er
     if (const char* dl = std::getenv("VEGAJET_DISPATCH_LOG"); dl && dl[0] && dlog_fd_ < 0)
         dlog_fd_ = ::open(dl, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
     if (open_) return true;
+    {
+        // bench/run/doctor own no handler: SIGINT and SIGTERM both drain. serve installs its own after init.
+        for (int sig : {SIGINT, SIGTERM}) {
+            struct sigaction cur{};
+            if (sigaction(sig, nullptr, &cur) == 0 && cur.sa_handler == SIG_DFL) std::signal(sig, vj_drain_on_sigint);
+        }
+    }
 
     devices_ = scan_gfx906_topology();
     if (!gpusel::filter_from_env(devices_, err)) return false;  // per-process selection (--gpu / VJ_GPU_DEVICES)
@@ -491,10 +539,17 @@ void Runtime::reset_allreduce_mailboxes() {
 }
 
 bool Runtime::setup_allreduce_mailbox() {
-    uint32_t total_p2p = 0;
-    for (const auto& g : devices_) total_p2p += g.p2p_links_count;
+    if (devices_.size() <= 1) {
+        transport_ = AllReduceTransport::None;
+        return true;
+    }
 
-    if (total_p2p > 0 && devices_.size() > 1) {
+    bool all_have_p2p = true;
+    for (const auto& g : devices_) {
+        if (g.p2p_links_count == 0u) all_have_p2p = false;
+    }
+
+    if (all_have_p2p && devices_.size() > 1 && devices_.size() <= kMaxGpus) {
         const uint32_t uc_flags = KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC |
                                   KFD_IOC_ALLOC_MEM_FLAGS_COHERENT |
                                   KFD_IOC_ALLOC_MEM_FLAGS_UNCACHED;
@@ -503,7 +558,7 @@ bool Runtime::setup_allreduce_mailbox() {
         const uint32_t cc_flags = KFD_IOC_ALLOC_MEM_FLAGS_PUBLIC |
                                   KFD_IOC_ALLOC_MEM_FLAGS_COHERENT;
         const uint64_t p_slice = kArGpuBytes;
-        const uint64_t f_slice = 4096ULL;
+        const uint64_t f_slice = kArFlagGpuBytes;
         const uint64_t p_base  = reserve_va(kMaxGpus * p_slice, 0x200000ULL);
         const uint64_t f_base  = reserve_va(kMaxGpus * f_slice, 4096ULL);
 
@@ -932,7 +987,9 @@ bool Runtime::reload_hsaco(const std::string& module_name, std::string* err) {
     if (existing) {
         for (size_t g = 0; g < ng; ++g) {
             for (const auto& old_kn : existing->kernel_names) kernels_[g].erase(old_kn);
-            if (g < existing->code_buffers.size()) free_buffer(existing->code_buffers[g]);
+            // Keep the replaced code BO mapped until close(): unmapping executable memory mid-process can make KFD
+            // evict/preempt this process's queues, and a CWSR context save then enters the trap handler.
+            if (g < existing->code_buffers.size()) code_buffers_.push_back(existing->code_buffers[g]);
         }
         existing->code_buffers = std::move(staged_bufs);
         existing->kernel_names = std::move(new_names);
@@ -986,23 +1043,48 @@ bool Runtime::load_hsaco_dir(const std::string& hsaco_dir, std::string* err) {
     }
     // Optional modules: loaded (and gated) when present, so builds without them keep working.
     const char* optional[] = {
+        "vj_kvq.hsaco",
+        "vj_ornith_gqa_kvq.hsaco",
+        "vj_ornith_l4.hsaco",
         "vj_ornith_ar.hsaco",
         "vj_ornith_gemm.hsaco",
+        "vj_sub4_dot8.hsaco",
+        "vj_milo.hsaco",
         "vj_ornith_attn.hsaco",
+        "vj_ornith_gdn_sv8.hsaco",
         "vj_ornith_moe.hsaco",
+        "vj_acceptmoe_plain.hsaco",
+        "vj_ornith_router_s240.hsaco",
         "vj_ornith_moe_m1.hsaco",
         "vj_ornith_vocab.hsaco",
         "vj_ornith_ops.hsaco",
         "vj_moe_dot8.hsaco",
+        "vj_verify_moe.hsaco",
         "vj_prefill_fa2.hsaco",
         "vj_prefill_gemm.hsaco",
         "vj_prefill_dot8.hsaco",
+        "vj_prefill_dot8_fwht.hsaco",
+        "vj_prefill_moe_iq_lds.hsaco",
         "vj_prefill_gdn.hsaco",
         "vj_moe_down_grouped.hsaco",
         "vj_spec_flash.hsaco",
         "vj_spec_gdn.hsaco",
+        "vj_gdn_treewy.hsaco",
+        "vj_gdn_wire_pack.hsaco",
         "vj_dflash2.hsaco",
         "vj_ornith_super.hsaco",
+        "vj_ornith_mega.hsaco",
+        // Opt-in super-kernel build with AR tile tags / DN_K4 (kernel names suffixed _x).
+        "vj_ornith_super_x.hsaco",
+        // Sealed Q8/Q4 Split-KV attention pair; host contract in ops/flash_decode_splitkv_launch.hpp.
+        "vj_flash_decode_splitkv.hsaco",
+        // Normal-engine Q/KV wire producers + epilogue for that pair (ops/wire_normal_launch.hpp).
+        "vj_wire_normal.hsaco",
+        // Sealed hot-expert cache refill + hit set (host contract: core/moe_lru_sealed.hpp). Loaded and
+        // gated only when the build produced it; the production runner does not dispatch it.
+        "vj_moe_lru_refill_dot8.hsaco",
+        // Opt-in Q4 LM head (VEGAJET_HEAD_Q4=1).
+        "vj_w75_vocab_q4a8.hsaco",
     };
     for (const char* f : optional) {
         const fs::path p = fs::path(dir) / f;
@@ -1432,7 +1514,13 @@ bool Runtime::enqueue_kernel(size_t gpu_idx, const LoadedKernel& kernel,
     const size_t total_ka   = std::max<size_t>(hidden_off + 256, kernel.kernarg_size);
     if (total_ka > 512) return false;
 
-    const uint32_t kslot = (q.kernarg_slot++) & 2047u;
+    if (q.kernarg_slot >= 2048u) {
+        std::fprintf(stderr, "[vegajet::kfd] rank %zu exhausted %u kernarg slots: read=%llu fence_end=%llu next=%llu\n",
+                     gpu_idx, q.kernarg_slot, static_cast<unsigned long long>(__atomic_load_n(q.read_ptr, __ATOMIC_ACQUIRE)),
+                     static_cast<unsigned long long>(q.kernarg_fence_end), static_cast<unsigned long long>(q.next_write_idx));
+        return false; // never wait for a peer whose dispatch has not yet been enqueued
+    }
+    const uint32_t kslot = q.kernarg_slot++;
     uint8_t* ka_dst_host = reinterpret_cast<uint8_t*>(q.kernarg_host) + static_cast<size_t>(kslot) * 512ULL;
     const uint64_t ka_dst_va = q.kernarg_va + static_cast<uint64_t>(kslot) * 512ULL;
 
@@ -1487,9 +1575,23 @@ bool Runtime::enqueue_kernel(size_t gpu_idx, const LoadedKernel& kernel,
 }
 
 bool Runtime::submit_batch(size_t gpu_idx) {
+    if (g_vj_drain_requested) {
+        // Exit only at a step boundary: with TP=2 a rank-0 batch already in flight spins on peer flags that only
+        // rank 1's batch writes, so exiting mid-step would leave waves resident. Defer until every queue is idle.
+        bool idle = true;
+        for (const auto& oq : queues_) idle = idle && __atomic_load_n(&oq.completion_sig->value, __ATOMIC_ACQUIRE) == 0;
+        if (idle) {
+            std::fprintf(stderr, "[vegajet::kfd] stop signal: all queues idle, exiting\n");
+            std::_Exit(130);
+        }
+    }
     auto& q = queues_[gpu_idx];
     if (dlog_fd_ >= 0) dprintf(dlog_fd_, "S rank=%zu upto_seq=%llu\n", gpu_idx, static_cast<unsigned long long>(dlog_seq_));
     if (!aql_wait_space(q, 1u, 5000000ULL)) return false;
+    if (__atomic_load_n(&q.completion_sig->value, __ATOMIC_ACQUIRE) != 0) {
+        std::fprintf(stderr, "[vegajet::kfd] rank %zu cannot rearm an outstanding batch signal\n", gpu_idx);
+        return false;
+    }
     __atomic_store_n(&q.completion_sig->value, 1LL, __ATOMIC_RELEASE);
 
     const uint64_t idx  = q.next_write_idx++;
@@ -1506,6 +1608,7 @@ bool Runtime::submit_batch(size_t gpu_idx) {
 
     __atomic_store_n(q.write_ptr, q.next_write_idx, __ATOMIC_RELEASE);
     __atomic_store_n(q.doorbell, idx, __ATOMIC_RELEASE);
+    q.kernarg_fence_end = q.next_write_idx;
     return true;
 }
 
@@ -1548,6 +1651,14 @@ bool Runtime::wait_idle(size_t gpu_idx, uint64_t timeout_us) {
         std::this_thread::yield();
 #endif
     }
+    if (dlog_fd_ >= 0) dprintf(dlog_fd_, "K rank=%zu slots=%u read=%llu fence_end=%llu next=%llu\n",
+        gpu_idx, q.kernarg_slot, static_cast<unsigned long long>(__atomic_load_n(q.read_ptr, __ATOMIC_ACQUIRE)),
+        static_cast<unsigned long long>(q.kernarg_fence_end), static_cast<unsigned long long>(q.next_write_idx));
+    // Only one submitted barrier can own this signal. Its completion retires prior kernargs;
+    // the CP read pointer can still point at the barrier itself. Never recycle a newer enqueue.
+    if (q.kernarg_fence_end != 0 && q.kernarg_fence_end == q.next_write_idx &&
+        __atomic_load_n(&q.completion_sig->value, __ATOMIC_ACQUIRE) == 0)
+        q.kernarg_slot = 0;
     if (dlog_fd_ >= 0) dprintf(dlog_fd_, "C rank=%zu upto_seq=%llu\n", gpu_idx, static_cast<unsigned long long>(dlog_seq_));
     return true;
 }

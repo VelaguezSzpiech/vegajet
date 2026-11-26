@@ -202,7 +202,130 @@ __device__ __forceinline__ float vj_dot8_down_row_iq3(
 }
 
 // -------------------------------------------------------------------------------------------------
-// (b) Routed Gate+Up row pair, merged IQ2_S-sourced VJ_Q4_DOT8.
+// (a2) Lossless 32-column-sliced Routed Down row (IQ3_XXS -> VJ_Q4_DOT8, cols = n_blk * 32 <= 512).
+//      w_sc holds precomputed exact FP32 gdb = d_f32 * (0.5f + s4) * 0.5f per 32-weight block (4 B/block).
+//      Enables balanced TP=3 splits (320/352/384 cols -> n_blk = 10/11/12) with 0 quantization error!
+// -------------------------------------------------------------------------------------------------
+template <uint32_t kBatch, bool kCached = false, typename WPtr = const uint8_t*, typename SPtr = const uint8_t*>
+__device__ __forceinline__ float vj_dot8_down_row_iq3_sub32(
+    WPtr __restrict__ w_qs, uint32_t w_stride,
+    SPtr __restrict__ w_sc, uint32_t s_stride,
+    const uint4* sm_mq, const float* sm_md, const int32_t* sm_ids, const float* sm_w,
+    uint32_t row, uint32_t D, uint32_t n_blk, uint32_t lane16) {
+    static_assert(8u % kBatch == 0u, "kBatch must divide 8");
+    constexpr bool kIsG = __is_same(WPtr, GPtr<const uint8_t>);
+    using U4P  = typename CondT<kIsG, GPtr<const uint4>, const uint4*>::type;
+    using U32P = typename CondT<kIsG, GPtr<const uint32_t>, const uint32_t*>::type;
+    const bool active = (lane16 < n_blk);
+    const uint32_t w_off = row * w_stride + lane16 * 16u;
+    const uint32_t s_off = row * s_stride + lane16 * 4u;
+    const uint32_t mq_slot_u4 = n_blk * 2u;
+
+    float total = 0.0f;
+    #pragma unroll
+    for (uint32_t s0 = 0u; s0 < 8u; s0 += kBatch) {
+        uint4    wv[kBatch];
+        uint32_t sv[kBatch];
+        #pragma unroll
+        for (uint32_t k = 0u; k < kBatch; ++k) {
+            const uint32_t e  = __builtin_amdgcn_readfirstlane(static_cast<uint32_t>(sm_ids[s0 + k]));
+            const uint64_t eb = static_cast<uint64_t>(e * D);
+            WPtr wb = w_qs + uniform_u64(eb * w_stride);
+            SPtr sb = w_sc + uniform_u64(eb * s_stride);
+            uint32_t wo = w_off, so = s_off;
+            asm volatile("" : "+v"(wo), "+v"(so));
+            if (active) {
+                if constexpr (kCached) {
+                    wv[k] = *reinterpret_cast<U4P>(wb + wo);
+                    sv[k] = *reinterpret_cast<U32P>(sb + so);
+                } else {
+                    wv[k] = ldg_x4_nt(reinterpret_cast<U4P>(wb + wo));
+                    sv[k] = ldg_u32_nt(reinterpret_cast<U32P>(sb + so));
+                }
+            }
+        }
+        __builtin_amdgcn_sched_barrier(0);
+        if (active) {
+            #pragma unroll
+            for (uint32_t k = 0u; k < kBatch; ++k) {
+                const uint32_t slot = s0 + k;
+                const float    ew   = sm_w[slot];
+                const uint4    xa   = sm_mq[slot * mq_slot_u4 + lane16 * 2u + 0u];
+                const uint4    xb   = sm_mq[slot * mq_slot_u4 + lane16 * 2u + 1u];
+                const float    xd   = sm_md[slot * n_blk + lane16];
+                const int32_t  dp   = dot32_iq3(wv[k], xa, xb);
+                const float    gdb  = __uint_as_float(sv[k]);
+                total = fmaf(ew * gdb * xd, static_cast<float>(dp), total);
+            }
+        }
+    }
+    return sum16(total);
+}
+
+// Unified flex helper for super-kernels (0 B spill, single dot32_iq3 instantiation, uniform SGPR mode switch!).
+template <uint32_t kBatch, bool kCached = false, typename WPtr = const uint8_t*, typename SPtr = const uint8_t*>
+__device__ __forceinline__ float vj_dot8_down_row_iq3_flex(
+    WPtr __restrict__ w_qs, uint32_t w_stride,
+    SPtr __restrict__ w_sc, uint32_t s_stride,
+    const uint4* sm_mq, const float* sm_md, const int32_t* sm_ids, const float* sm_w,
+    uint32_t row, uint32_t D, uint32_t n_blk, bool is_sub32, uint32_t lane16) {
+    static_assert(8u % kBatch == 0u, "kBatch must divide 8");
+    constexpr bool kIsG = __is_same(WPtr, GPtr<const uint8_t>);
+    using U4P  = typename CondT<kIsG, GPtr<const uint4>, const uint4*>::type;
+    using U2P  = typename CondT<kIsG, GPtr<const uint2>, const uint2*>::type;
+    using U32P = typename CondT<kIsG, GPtr<const uint32_t>, const uint32_t*>::type;
+    const uint32_t n_blk_u = __builtin_amdgcn_readfirstlane(n_blk);
+    const bool     sub32_u = (__builtin_amdgcn_readfirstlane(is_sub32 ? 1u : 0u) != 0u);
+    const bool     active  = (lane16 < n_blk_u);
+    const uint32_t w_off   = row * w_stride + lane16 * 16u;
+    const uint32_t s_off   = row * s_stride + (sub32_u ? (lane16 * 4u) : ((lane16 >> 3) * 8u));
+    const uint32_t sh_sub  = (lane16 & 7u) * 4u;
+    const uint32_t mq_slot = n_blk_u << 1;
+
+    float total = 0.0f;
+    #pragma nounroll
+    for (uint32_t s0 = 0u; s0 < 8u; s0 += kBatch) {
+        uint4 wv[kBatch];
+        uint2 sv[kBatch];
+        #pragma unroll
+        for (uint32_t k = 0u; k < kBatch; ++k) {
+            const uint32_t e  = __builtin_amdgcn_readfirstlane(static_cast<uint32_t>(sm_ids[s0 + k]));
+            const uint64_t eb = static_cast<uint64_t>(e * D);
+            WPtr wb = w_qs + uniform_u64(eb * w_stride);
+            SPtr sb = w_sc + uniform_u64(eb * s_stride);
+            uint32_t wo = w_off, so = s_off;
+            asm volatile("" : "+v"(wo), "+v"(so));
+            if (active) {
+                if constexpr (kCached) {
+                    wv[k] = *reinterpret_cast<U4P>(wb + wo);
+                    sv[k] = sub32_u ? make_uint2(*reinterpret_cast<U32P>(sb + so), 0u)
+                                    : *reinterpret_cast<U2P>(sb + so);
+                } else {
+                    wv[k] = ldg_x4_nt(reinterpret_cast<U4P>(wb + wo));
+                    sv[k] = sub32_u ? make_uint2(ldg_u32_nt(reinterpret_cast<U32P>(sb + so)), 0u)
+                                    : ldg_x2_nt(reinterpret_cast<U2P>(sb + so));
+                }
+            }
+        }
+        __builtin_amdgcn_sched_barrier(0);
+        if (active) {
+            #pragma unroll
+            for (uint32_t k = 0u; k < kBatch; ++k) {
+                const uint32_t slot = s0 + k;
+                const float    ew   = sm_w[slot];
+                const uint4    xa   = sm_mq[slot * mq_slot + lane16 * 2u + 0u];
+                const uint4    xb   = sm_mq[slot * mq_slot + lane16 * 2u + 1u];
+                const float    xd   = sm_md[slot * n_blk_u + lane16];
+                const int32_t  dp   = dot32_iq3(wv[k], xa, xb);
+                const float    gdb  = sub32_u
+                    ? __uint_as_float(sv[k].x)
+                    : (__uint_as_float(sv[k].y) * (0.5f + static_cast<float>((sv[k].x >> sh_sub) & 0xFu)) * 0.5f);
+                total = fmaf(ew * gdb * xd, static_cast<float>(dp), total);
+            }
+        }
+    }
+    return sum16(total);
+}
 //   w_gu : merged weight plane base of this layer [n_exp * local_ff rows, w_stride]: per block {gate uint4, up uint4}
 //   w_sc : scale region base [rows, s_stride]: [nblk x u16 (gate sc | up sc << 8)] [nsb x u32 (gate d | up d << 16)]
 //   erow_base = exp * local_ff (wave uniform), row = row inside the expert, kNIt = nblk / 16 (6 for D = 3072),

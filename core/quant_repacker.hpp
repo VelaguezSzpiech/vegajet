@@ -24,6 +24,8 @@ enum class NativeFormat : uint32_t {
     VJ_Q8_DP4A = 0,    // ~8.5 bpw: int8 qs + FP16 scale per 32 (v_dot4_i32_i8), rows 16-byte aligned
     VJ_Q4_DOT8 = 1,    // ~4.5 bpw: 8 signed nibbles per uint32 + FP16 scale per 32 (v_dot8_i32_i4)
     VJ_IQ_PACKED = 2,  // disk bpw: lossless split-plane (scale / sign / index) re-layout of sub-4-bit blocks
+    VJ_Q2_DOT8 = 4,
+    VJ_Q3_DOT8 = 5,
     VJ_Q4_A8 = 3,      // ~5.0 bpw: unsigned 4-bit nibbles (low=0..15, high=16..31) + packed FP16 (d,m) per 32, TCC anti-camping on qs & dm
 };
 const char* native_format_name(NativeFormat f);
@@ -106,6 +108,50 @@ struct PackedVjQ4A8 {
     size_t real_read_bytes() const { return static_cast<size_t>(rows) * (cols / 2u + (cols / 32u) * 4u); }
 };
 
+// Zero-LUT affine formats. Row-major blocks of 32; Q2: 2 words, Q3: 3 words.
+// i -> low word i/16, bits 4*((i%16)/2)+2*(i%2).
+// Q3 word 2: bit 4*((i%16)/2)+2*(i/16)+(i%2). Each stripe
+// occupies one bit position across the eight nibbles (not a contiguous byte).
+// Four zero guard words at end permit 16-byte vector loads of the final block.
+// dm = fp16(scale) | fp16(zero_point)<<16, per 64/128 weights;
+// dequant = scale*(unsigned_code-zero_point). Zero point is fractional.
+struct PackedVjSub4 {
+    NativeFormat format = NativeFormat::VJ_Q2_DOT8;
+    uint32_t rows = 0, cols = 0, group = 64;
+    bool tcc_xor = false; // XOR layout expands metadata to one word per block32
+    std::vector<uint32_t> qs, dm;
+    size_t total_bytes() const { return (qs.size()+dm.size())*4; }
+};
+PackedVjSub4 pack_f32_to_vj_sub4(const float*, uint32_t rows, uint32_t cols,
+                               NativeFormat, uint32_t group = 64);
+PackedVjSub4 pack_f16_to_vj_sub4(const uint16_t*, uint32_t rows, uint32_t cols,
+                               NativeFormat, uint32_t group = 64);
+uint32_t sub4_code(const PackedVjSub4&, size_t index);
+void dequantize_vj_sub4(const PackedVjSub4&, float*);
+// x: consecutive signed int4 codes represented as int8, scale per block32.
+// Integer dot and sum, then affine epilogue. Output [M,rows].
+void gemv_vj_sub4(const PackedVjSub4&, const int8_t* x, const float* scales,
+                  float* y, uint32_t M = 1);
+// Physical block mapping is involutive; requires complete 16-block tiles.
+PackedVjQ4A8 repack_tcc_xor(const PackedVjQ4A8&);
+PackedVjSub4 repack_tcc_xor(const PackedVjSub4&);
+uint32_t sub4_dot8_bits(); // VEGAJET_SUB4_DOT8=q2|q3, otherwise off
+bool tcc_xor_enabled(); // VEGAJET_TCC_XOR=1
+enum class MiloStorage { Fp16, Int3 };
+struct MiloResidual {
+    uint32_t rows = 0, cols = 0, rank = 0;
+    MiloStorage storage = MiloStorage::Fp16;
+    std::vector<uint16_t> u, v; // row-major [rows,rank], [rank,cols], fp16
+    std::vector<uint32_t> u3, v3; // contiguous signed INT3, per-row scales
+    std::vector<float> us, vs;
+    size_t total_bytes() const { return (u.size()+v.size())*2 + (u3.size()+v3.size()+us.size()+vs.size())*4; }
+};
+bool milo_enabled(); // VEGAJET_MILO=1, default off; explicit offline opt-in
+MiloResidual fit_milo(const float* original, const PackedVjSub4&, uint32_t rank = 16,
+                      uint32_t iterations = 24, MiloStorage storage = MiloStorage::Fp16);
+float milo_factor(const MiloResidual&, bool u, size_t index);
+void apply_milo(const MiloResidual&, const float* x, float* y); // adds U@(V@x)
+
 enum class IqPlane : uint8_t { Scale = 0, Sign = 1, Index = 2 };
 
 struct IqSegment { uint16_t offset; uint16_t bytes; IqPlane plane; };
@@ -141,7 +187,8 @@ std::vector<uint8_t> unpack_vj_iq_to_disk(const PackedVjIq& p);  // exact invers
 // Hardware roofline + 0/1 VRAM knapsack
 // =================================================================================================
 struct GpuRooflineInfo {
-    std::string id;              // free-form device label
+    std::string id;              // PCI BDF or free-form device label
+    std::string unique_id;       // 16-char lowercase hex hardware unique_id (optional)
     uint32_t n_cu = 60;
     double sclk_ghz = 1.725;
     double mclk_mhz = 1000.0;

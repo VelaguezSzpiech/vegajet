@@ -56,6 +56,7 @@ struct Gpu {
     uint32_t index = 0;
     std::string id;        // stable label, e.g. "gpu0"
     std::string bdf;       // optional runtime label; may be empty
+    std::string unique_id; // 16-char lowercase hex hardware unique_id from sysfs/KFD (optional)
     uint32_t cu = 0;
     uint64_t vram_bytes = 0;
     MemKind mem = MemKind::HBM2;

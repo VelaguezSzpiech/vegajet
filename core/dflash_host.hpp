@@ -100,6 +100,40 @@ struct MaskDiff {
 // observed mask equals.
 MaskDiff diff_mask(const MaskSpec& expected, const std::vector<uint8_t>& observed);
 
+// ---- 3b. engine block-mask plan (`vj_dflash2_attn_kernel`) -----------------------------------------------------
+// The three `tools/dflash_ref --block-mask` modes; the shipped engine default is Bidir (one bidirectional block
+// mask on every drafter layer). The plan below is the single place that turns a mode into the per-layer flag the
+// kernel takes, so the engine cannot apply one mask to layers of different attention types by accident.
+enum class BlockMaskMode { Bidir, ZLab, Causal };
+const char* block_mask_mode_name(BlockMaskMode m);
+// Exact `tools/dflash_ref --block-mask` spelling: "bidir", "zlab", "causal". Null or empty text means unset and
+// yields Bidir; any other value returns false (the caller refuses instead of picking a mask).
+bool parse_block_mask_mode(const char* text, BlockMaskMode* out);
+
+struct DraftBlockMaskConfig {
+    BlockMaskMode mode = BlockMaskMode::Bidir;
+    bool     pattern_known = false;  // dflash.attention.sliding_window_pattern present, one entry per layer
+    uint32_t swa_layer_mask = 0;     // bit l: layer l is a sliding_attention layer (read when pattern_known)
+    uint32_t n_layer = 0;
+    uint32_t block_start = 0;        // anchor position; the context is positions 0 .. block_start - 1
+    uint32_t block_len = 0;          // B
+    uint32_t swa_window = 0;         // GLOBAL attention.sliding_window; never a per-layer ring size
+};
+struct DraftBlockMaskPlan {
+    bool     ok = false;
+    std::string error;               // !ok: fail closed; the caller must not run a masked arm
+    bool     arm = false;            // the masked arm is active for this cycle
+    uint32_t causal_mask = 0;        // bit l: block keys are causal on layer l for this cycle
+    std::string summary;
+};
+// Bidir needs no pattern and always returns arm = false (the shipped mask). A masked mode fails closed when the
+// pattern is unknown, n_layer / block_len are out of range or the global SWA window is 0. Inside the arm the
+// boundary is global: block_start + block_len <= swa_window, i.e. the oldest key of the block's last query is
+// still inside the SWA window, so the kernel's window clamp is a no-op and the block mask is the only change.
+// Bit l of causal_mask is cleared for a full-attention layer in ZLab, and every bit is cleared outside the arm,
+// so the full layer is bidirectional and no layer is masked past the boundary (s_pos = W + 1 included).
+DraftBlockMaskPlan plan_draft_block_mask(const DraftBlockMaskConfig& c);
+
 // Reference masked attention for one head: q [B][hd], k/v [n_keys][hd], mask [B][n_keys] -> out [B][hd].
 void masked_attention(const float* q, const float* k, const float* v, const std::vector<uint8_t>& mask, int B,
                       int n_keys, int hd, float* out);

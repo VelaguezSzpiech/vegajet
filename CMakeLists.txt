@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 cmake_minimum_required(VERSION 3.18)  # find_program(... REQUIRED), file(CONFIGURE)
-project(VegaJet VERSION 0.1.0 LANGUAGES CXX)
+project(VegaJet VERSION 0.1.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -59,6 +59,7 @@ file(CONFIGURE OUTPUT "${CMAKE_BINARY_DIR}/generated/hsaco_gates.inc" CONTENT "$
 add_library(vegajet_core STATIC
     core/doctor.cpp
     core/host_preflight.cpp
+    core/hw_preflight.cpp
     core/hsaco_gate.cpp
     core/hsaco_bundle.cpp
     core/gguf_arch_detect.cpp
@@ -73,12 +74,14 @@ add_library(vegajet_core STATIC
     core/quant_repacker.cpp
     core/quant_unpackers.cpp
     core/sharder.cpp
+    core/gdn_vshard.cpp
     core/topology_planner.cpp
     core/hw_profile.cpp
     core/kv_cache.cpp
     core/dflash_host.cpp
     core/ssm_state.cpp
     core/spec_engine.cpp
+    core/gdn_treewy_engine.cpp
     core/grid_planner.cpp
     core/launch_planner.cpp
     core/sampler.cpp
@@ -95,6 +98,8 @@ add_library(vegajet_core STATIC
     core/doctor_rules.cpp
     core/kv_quant_oracle.cpp
     core/evict_controller.cpp
+    core/evict_depth.cpp
+    core/route_union.cpp
     core/tp3_plan.cpp
     core/async_table_prefetch.cpp
     core/warm_bench.cpp
@@ -144,10 +149,18 @@ if(NOT VEGAJET_CPU_ONLY)
     file(MAKE_DIRECTORY "${VEGAJET_HSACO_DIR}")
 
     set(VEGAJET_HSACO_COMMON_DEPS
+        "${CMAKE_CURRENT_SOURCE_DIR}/ops/kernels/vj_ar_fused.hiph"
         "${CMAKE_CURRENT_SOURCE_DIR}/core/ggml_iq_tables.hpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/ops/kernels/vj_moe_dot8.hiph"
+        "${CMAKE_CURRENT_SOURCE_DIR}/ops/verify_routes.hpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/ops/kernels/vj_moe_down_grouped.hiph"
         "${CMAKE_CURRENT_SOURCE_DIR}/ops/kernels/vj_ornith_super_desc.hpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/ops/kernels/vj_kvq_device.hiph"
+        "${CMAKE_CURRENT_SOURCE_DIR}/ops/ornith_gqa_kvq_launch.hpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/ops/wire_normal_launch.hpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/ops/sub4_launch.hpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/ops/milo_launch.hpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/core/acceptmoe.hpp"
     )
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/ops/kernels/vj_ornith_common.hiph")
         list(APPEND VEGAJET_HSACO_COMMON_DEPS "${CMAKE_CURRENT_SOURCE_DIR}/ops/kernels/vj_ornith_common.hiph")
@@ -158,6 +171,14 @@ if(NOT VEGAJET_CPU_ONLY)
         set(bundle_out "${VEGAJET_HSACO_DIR}/${name}.bundle")
         set(hsaco_out  "${VEGAJET_HSACO_DIR}/${name}.hsaco")
         set(extra_flags ${ARGN})
+        set(extra_gates)
+        set(extra_deps)
+        if(name STREQUAL "vj_ornith_mega")
+            find_program(VEGAJET_PYTHON3 python3 REQUIRED)
+            list(APPEND extra_gates COMMAND "${VEGAJET_PYTHON3}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_mega_text.py" "${hsaco_out}")
+            list(APPEND extra_deps "${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_mega_text.py")
+        endif()
         add_custom_command(
             OUTPUT "${hsaco_out}"
             COMMAND "${VEGAJET_HIPCC}" --genco --offload-arch=${VEGAJET_GFX_ARCH} -O3
@@ -169,7 +190,8 @@ if(NOT VEGAJET_CPU_ONLY)
                     "--input=${bundle_out}" "--output=${hsaco_out}" --unbundle
             COMMAND vj_hsaco_gate "${hsaco_out}"
             COMMAND vj_isa_scan "${hsaco_out}"
-            DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${src_file}" ${VEGAJET_HSACO_COMMON_DEPS} vj_hsaco_gate vj_isa_scan
+            ${extra_gates}
+            DEPENDS ${extra_deps} "${CMAKE_CURRENT_SOURCE_DIR}/${src_file}" ${VEGAJET_HSACO_COMMON_DEPS} vj_hsaco_gate vj_isa_scan
             COMMENT "Building gated (0 B spill, VGPR, code size, ISA scan) ${VEGAJET_GFX_ARCH} code object ${name}.hsaco"
             VERBATIM
         )
@@ -179,8 +201,13 @@ if(NOT VEGAJET_CPU_ONLY)
         set(VEGAJET_HSACO_TARGETS "${VEGAJET_HSACO_TARGETS}" PARENT_SCOPE)
     endfunction()
 
+    vj_add_hsaco(vj_sub4_dot8 ops/kernels/vj_sub4_dot8.hip)
+    vj_add_hsaco(vj_verify_moe ops/kernels/vj_verify_moe.hip)
+    vj_add_hsaco(vj_milo ops/kernels/vj_milo.hip)
     vj_add_hsaco(vj_kfd_base           ops/kernels/vj_kfd_base.hip)
     vj_add_hsaco(vj_quant_ops          ops/kernels/vj_quant_ops.hiph -Wno-pragma-once-outside-header -x hip)
+    vj_add_hsaco(vj_ornith_l4 ops/kernels/vj_ornith_l4.hip)
+    vj_add_hsaco(vj_kvq ops/kernels/vj_kvq.hip -fno-unroll-loops)
     vj_add_hsaco(vj_kv_flash_ops       ops/kernels/vj_kv_flash_ops.hiph -Wno-pragma-once-outside-header -x hip)
     vj_add_hsaco(vj_ssm_neumann_ops    ops/kernels/vj_ssm_neumann_ops.hiph -Wno-pragma-once-outside-header -x hip)
     vj_add_hsaco(vegajet_megakernel_vm ops/kernels/vegajet_megakernel_vm.hip)
@@ -191,19 +218,56 @@ if(NOT VEGAJET_CPU_ONLY)
         vj_add_hsaco(vj_ornith_ar      ops/kernels/vj_ornith_ar.hip)
         vj_add_hsaco(vj_ornith_gemm    ops/kernels/vj_ornith_gemm.hip)
         vj_add_hsaco(vj_ornith_attn    ops/kernels/vj_ornith_attn.hip)
+        vj_add_hsaco(vj_ornith_gdn_sv8 ops/kernels/vj_ornith_gdn_sv8.hip)
         vj_add_hsaco(vj_ornith_moe     ops/kernels/vj_ornith_moe.hip)
+        vj_add_hsaco(vj_acceptmoe_plain ops/kernels/vj_acceptmoe_plain.hip)
         vj_add_hsaco(vj_ornith_moe_m1  ops/kernels/vj_ornith_moe_m1.hip)
+        vj_add_hsaco(vj_ornith_router_s240 ops/kernels/vj_ornith_router_s240.hip)
         vj_add_hsaco(vj_ornith_vocab   ops/kernels/vj_ornith_vocab.hip)
         vj_add_hsaco(vj_spec_flash     ops/kernels/vj_spec_flash.hip)
         vj_add_hsaco(vj_spec_gdn       ops/kernels/vj_spec_gdn.hip)
+        # Sealed tree-WY verify/commit pair. -fno-unroll-loops is a compile-only flag: with plain
+        # -O3 the 7.12 unroller takes the verify kernel to 124 VGPR (tiled limit 64); without
+        # unrolling it is 26 VGPR / 0 B private with the same source, ABI and arithmetic.
+        vj_add_hsaco(vj_gdn_treewy     ops/kernels/vj_gdn_treewy_verify.hiph -Wno-pragma-once-outside-header -x hip -fno-unroll-loops)
+        # Independent production-input producer for the sealed GDN verifier: a value-preserving
+        # strided copy of the conv kernel's q/k/v + decay/beta and the parent chain into the sealed
+        # token-major planes. Optional module: a missing object keeps the sequential verifier.
+        vj_add_hsaco(vj_gdn_wire_pack  ops/kernels/vj_gdn_wire_pack.hip)
         vj_add_hsaco(vj_moe_dot8       ops/kernels/vj_moe_dot8.hip)
+        # Sealed hot-expert cache refill + hit set (ops/kernels/vj_moe_lru_refill_dot8.hiph): a separate
+        # cache payload from vj_moe_dot8.hip. Gated like every other module; the runtime keeps it
+        # optional so builds without the header keep working.
+        if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/ops/kernels/vj_moe_lru_refill_dot8.hiph")
+            vj_add_hsaco(vj_moe_lru_refill_dot8 ops/kernels/vj_moe_lru_refill_dot8.hiph
+                         -Wno-pragma-once-outside-header -x hip)
+        endif()
         vj_add_hsaco(vj_prefill_fa2    ops/kernels/vj_prefill_fa2.hip)
         vj_add_hsaco(vj_prefill_gemm   ops/kernels/vj_prefill_gemm.hip)
         vj_add_hsaco(vj_prefill_dot8   ops/kernels/vj_prefill_dot8.hip)
+        vj_add_hsaco(vj_prefill_dot8_fwht ops/kernels/vj_prefill_dot8_fwht.hip)
+        vj_add_hsaco(vj_prefill_moe_iq_lds ops/kernels/vj_prefill_moe_iq_lds.hip)
         vj_add_hsaco(vj_prefill_gdn    ops/kernels/vj_prefill_gdn.hip)
         vj_add_hsaco(vj_moe_down_grouped ops/kernels/vj_moe_down_grouped.hip)
         vj_add_hsaco(vj_dflash2        ops/kernels/vj_dflash2.hip)
+        vj_add_hsaco(vj_ornith_gqa_kvq ops/kernels/vj_ornith_gqa_kvq.hip -fno-unroll-loops)
         vj_add_hsaco(vj_ornith_super   ops/kernels/vj_ornith_super.hip)
+        # Avoid hoisting LDS addresses across GU: fused AR otherwise triggers an 8 B Q3 spill.
+        vj_add_hsaco(vj_ornith_super_x ops/kernels/vj_ornith_super_x.hip -mllvm -disable-machine-licm)
+        vj_add_hsaco(vj_ornith_mega    ops/kernels/vj_ornith_mega.hip -mllvm -disable-machine-licm)
+        vj_add_hsaco(vj_w75_vocab_q4a8 ops/kernels/vj_w75_vocab_q4a8.hip)
+    endif()
+    # Sealed Q8_0/Q4_0 Split-KV FlashDecoding pair (host contract:
+    # ops/flash_decode_splitkv_launch.hpp). Built and gated like every other module; the runtime
+    # loader keeps it optional so builds without the sealed header keep working.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/ops/kernels/vj_flash_decode_splitkv.hiph")
+        vj_add_hsaco(vj_flash_decode_splitkv ops/kernels/vj_flash_decode_splitkv.hiph
+                     -Wno-pragma-once-outside-header -x hip)
+    endif()
+    # Normal-engine Q/KV wire producers + attention epilogue for the sealed pair
+    # (host contract: ops/wire_normal_launch.hpp, adapter: core/wire_normal_adapter.*).
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/ops/kernels/vj_wire_normal.hip")
+        vj_add_hsaco(vj_wire_normal ops/kernels/vj_wire_normal.hip)
     endif()
     add_custom_target(vegajet_hsacos DEPENDS ${VEGAJET_HSACO_TARGETS})
 endif()
@@ -215,6 +279,7 @@ set(VEGAJET_MODEL_SOURCES
     models/ornith/ornith_loader.cpp
     models/ornith/ornith_runner.cpp
     models/ornith/ornith_gpu.cpp
+    models/ornith/ornith_treewy.cpp
     models/model_blueprints.cpp
 )
 
@@ -252,8 +317,21 @@ function(vj_test name)
     set_tests_properties(${name} PROPERTIES TIMEOUT 600)
 endfunction()
 
+vj_test(test_ornith_mega)
+vj_test(test_ornith_mega_math)
+set_source_files_properties(tests/test_ornith_mega_math.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
 vj_test(test_tokenizer)
 vj_test(test_gguf_reader)
+# v1.2 parser hardening (AUDIT-parsers.md): malformed GGUF / tokenizer / template inputs.
+vj_test(test_parser_gguf_overflow)
+vj_test(test_parser_gguf_ne)
+vj_test(test_parser_gguf_tensor_count)
+vj_test(test_parser_ornith_nextn)
+vj_test(test_parser_ornith_div0)
+vj_test(test_parser_tok_count)
+vj_test(test_parser_tok_nested)
+vj_test(test_parser_tpl_depth)
+vj_test(test_parser_tpl_loops)
 vj_test(test_quant_repacker)
 # Keep synthetic fixture rounding identical to the golden inputs on FMA-capable hosts.
 target_compile_options(test_quant_repacker PRIVATE -ffp-contract=off)
@@ -266,9 +344,20 @@ vj_test(test_aql_ring_deadlock)
 vj_test(test_quant_unpackers)
 vj_test(test_ornith_loader)
 vj_test(test_sharder)
+vj_test(test_gdn_vshard)
+vj_test(test_raw_token_reference)
+vj_test(test_top8_wg0)
 vj_test(test_topology_planner)
 vj_test(test_grid_planner)
 vj_test(test_hsaco_gate)
+# Sealed tree-WY host launch/scratch/selection reference (CPU only; no device).
+vj_test(test_gdn_treewy_launch)
+# Normal-engine tree-WY caller: S0 slots, conv cursor, reused norm stage, fallbacks and the
+# 36-layer x 2-shard deterministic driver (CPU only; no device).
+vj_test(test_gdn_treewy_engine)
+# Producer part of the same pair: conv-layout -> sealed q/k/v/decay/beta/parent planes, host
+# reference and the sealed WY vs sequential verifier state/output equivalence (CPU only).
+vj_test(test_gdn_wire_pack)
 # ---- Pre-tokenizer families + SPM, Jinja-subset chat templates, full sampler stack (core_tokenizer_samplers) ----
 target_sources(vegajet_core PRIVATE core/pretok_families.cpp core/chat_template.cpp core/sampler_stack.cpp)
 vj_test(test_tokenizer_samplers)
@@ -277,11 +366,16 @@ set_tests_properties(test_tokenizer_samplers PROPERTIES RUN_SERIAL TRUE)
 vj_test(test_spec_engine)
 vj_test(test_fr_spec)
 vj_test(test_spec_policy)
+vj_test(test_spec_governor)
 vj_test(test_spec_flash_ref)
 vj_test(test_hsaco_bundle)
 vj_test(test_dflash_host)
 vj_test(test_spec_gdn_ref)
+vj_test(test_gdn_batch_order)
+vj_test(test_spec_gate)
+target_compile_options(test_gdn_batch_order PRIVATE -ffp-contract=off)
 vj_test(test_q4_dot8)
+vj_test(test_verify_path)
 # ---- Radix prefix cache (KV blocks + recurrent-state snapshots) and B=1..8 continuous batching (serving_prefix_batching) ----
 target_sources(vegajet_core PRIVATE core/prefix_cache.cpp core/cont_batch.cpp)
 vj_test(test_prefix_batching)
@@ -290,8 +384,12 @@ vj_test(test_moe_route_group)
 vj_test(test_prefill_planner)
 vj_test(test_prefill_ref)
 vj_test(test_prefill_dot8_kld)
+vj_test(test_prefill_dot8_fwht_kld)
+vj_test(test_prefill_moe_iq_lds)
 vj_test(test_audit_invariants)
 vj_test(test_tcc_anti_camping)
+vj_test(test_router_s240)
+vj_test(test_super_critical_down)
 vj_test(test_grid_planner_splitk)
 vj_test(test_asymmetric_sharder)
 vj_test(test_opgraph_multi_arch)
@@ -303,18 +401,47 @@ vj_test(test_hsaco_isa_scan)
 vj_test(test_vram_planner)
 vj_test(test_moe_lru_cache)
 vj_test(test_moe_offload)
+# ---- M3: hot-expert DOT8 cache allocation budget (single 2.70 GiB TOTAL headroom policy, 1.1 GiB draft
+#          reserve inside it) + launch interfaces for the active vj_moe_dot8.hip path and the sealed
+#          vj_moe_lru_refill_dot8.hiph path (separate cache layouts) ----
+target_sources(vegajet_core PRIVATE core/moe_slot_budget.cpp core/moe_slot_launch.cpp core/moe_lru_sealed.cpp)
+vj_test(test_moe_slot_budget)
+vj_test(test_moe_slot_launch)
+vj_test(test_moe_lru_sealed)
+# Sealed refill + hit_dot4/hit_dot8 vs the pristine IQ decode, one layer, both hit kinds (CPU model).
+vj_test(test_moe_lru_sealed_hit_parity)
+# Deployed DFlash2 footprint + active/sealed hot-expert cache budget in one per-card plan (CPU only).
+vj_test(test_moe_slot_budget_draft)
+# Production measured draft accounting: no double charge, conservative 21-slot upper bound.
+vj_test(test_moe_slot_budget_production)
+# The CPU model replays the device float chain: fused multiply-adds must stay exactly where they are spelled.
+set_source_files_properties(tests/test_moe_lru_sealed_hit_parity.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
 vj_test(test_suffix_trie)
 vj_test(test_spec_cascade)
+vj_test(test_acceptmoe)
 vj_test(test_fr_spec_lossless)
 vj_test(test_fwht_kld_oracle)
 vj_test(test_gdn_verify_oracle)
+vj_test(test_gdn_conv_splitv8_ref)
 vj_test(test_bpe_tokenizer)
 vj_test(test_paged_kv)
+# ---- v0.1.1 DFlash2 draft -> verify -> commit replay, drafter KV plan, > 32K source policy (v011_spec_replay) ----
+target_sources(vegajet_core PRIVATE core/spec_replay.cpp)
+vj_test(test_spec_replay)
+# ---- v0.1.1 blk.48 MTP chained draft descriptors, MTP cache ledger, suffix bypass, spec stats (v011_mtp_draft) ----
+target_sources(vegajet_core PRIVATE core/mtp_draft.cpp)
+vj_test(test_mtp_draft)
+# ---- v0.1.1 C2 macro-batch prefill scheduler: M = 256/512 dense + MoE, ordered GDN sub-chunks C = 16/32 (v011_prefill_c2) ----
+target_sources(vegajet_core PRIVATE core/prefill_sched.cpp)
+vj_test(test_prefill_sched)
 vj_test(test_ple_pregather)
 vj_test(test_doctor_mock_sysfs)
+vj_test(test_hw_preflight)
 vj_test(test_platform_doctor)
 vj_test(test_kv_quant_oracle)
 vj_test(test_evict_controller)
+vj_test(test_evict_depth)
+vj_test(test_route_union)
 vj_test(test_tp3_plan)
 # ---- GBNF / JSON Schema constrained decoding, multi-format tool-call parser, /v1/messages, swarm router (serving_grammar_api_swarm) ----
 target_sources(vegajet_core PRIVATE core/grammar.cpp core/tool_parser.cpp core/anthropic_shim.cpp core/swarm_router.cpp)
@@ -352,6 +479,8 @@ target_compile_definitions(test_opgraph_multi_arch PRIVATE
 target_include_directories(test_hsaco_isa_scan PRIVATE "${CMAKE_BINARY_DIR}/generated")
 # The CPU model replays the device float chain: fused multiply-adds must stay exactly where the code spells them.
 set_source_files_properties(tests/test_moe_route_group.cpp core/moe_route_group.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+# The 64x64x64 IQ-LDS MoE model replays the device fma chain in K order: no contraction.
+set_source_files_properties(tests/test_prefill_moe_iq_lds.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
 
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_FOUND)
@@ -377,6 +506,10 @@ if(Python3_FOUND)
     add_test(NAME api_stress_test
              COMMAND ${Python3_EXECUTABLE} tools/api_stress_test.py --spawn $<TARGET_FILE:vj_mock_serve>
                      --clients 24 --rounds 3 --spawn-arg=--max-queue --spawn-arg=2 --expect-backpressure
+             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    # v0.1.1 reproducible comparison matrix (raw / speculative code+prose / prefill W4A8+W4A4 / parity / super) from bench logs.
+    add_test(NAME test_v011_bench_matrix_selftest
+             COMMAND ${Python3_EXECUTABLE} tools/v011_bench_matrix.py --self-test
              WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
     # JSON-only diff/regression gate for two `vegajet bench --json-out` scorecards (stdlib, no log parsing).
     add_test(NAME test_bench_compare_selftest
@@ -433,6 +566,7 @@ endif()
 # Captured at configure time: re-run cmake after a commit to refresh it.
 target_compile_definitions(vegajet PRIVATE VEGAJET_GIT_COMMIT="${VJ_GIT_COMMIT}")
 vj_test(test_bench_json)
+vj_test(test_power_telemetry)
 if(Python3_FOUND)
     add_test(NAME test_bench_json_roundtrip
              COMMAND ${Python3_EXECUTABLE} -m unittest discover -s tests -p "test_bench_json_roundtrip*.py"
@@ -485,11 +619,98 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/universal_draft/ops/vj_vm_cpu.cpp")
     endif()
 endif()
 
+# Normal-engine sealed-wire Q/KV producer + adapter (host-only; no device access).
+target_sources(vegajet_core PRIVATE core/wire_normal_adapter.cpp)
+
 # ---- Sealed alpha ISA forge deliverables (CPU contract tests) -----------------------------------
-foreach(_isa_test IN ITEMS flash_decode_splitkv gdn_treewy_verify moe_lru_refill_dot8 ar_tp3_alltoall)
+foreach(_isa_test IN ITEMS flash_decode_splitkv flash_decode_splitkv_launch gdn_treewy_verify moe_lru_refill_dot8 ar_tp3_alltoall)
     add_executable(test_${_isa_test} "tests/test_${_isa_test}.cpp")
     target_include_directories(test_${_isa_test} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     target_link_libraries(test_${_isa_test} PRIVATE Threads::Threads)
     target_compile_options(test_${_isa_test} PRIVATE ${VJ_WARN} -UNDEBUG)
     add_test(NAME test_${_isa_test} COMMAND test_${_isa_test})
 endforeach()
+
+# Normal-engine Q/KV sealed-wire producer + causal consumer reference (CPU only).
+add_executable(test_wire_normal tests/test_wire_normal.cpp)
+target_include_directories(test_wire_normal PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_options(test_wire_normal PRIVATE ${VJ_WARN} -UNDEBUG -ffp-contract=off)
+add_test(NAME test_wire_normal COMMAND test_wire_normal)
+
+vj_test(test_sub4)
+add_executable(vj_sub4_bench tools/vj_sub4_bench.cpp)
+target_link_libraries(vj_sub4_bench PRIVATE vegajet_core Threads::Threads)
+target_include_directories(vj_sub4_bench PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+if(NOT VEGAJET_CPU_ONLY)
+    add_dependencies(vj_sub4_bench hsaco_vj_sub4_dot8 hsaco_vj_quant_ops hsaco_vj_kfd_base)
+    add_test(NAME test_sub4_isa COMMAND Python3::Interpreter
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_sub4_isa.py"
+        "${VEGAJET_LLVM_OBJDUMP}" "${VEGAJET_HSACO_DIR}/vj_sub4_dot8.hsaco")
+endif()
+# Deliberately not a ctest: requires an explicit --run-gpu invocation.
+add_executable(vj_kvq_bench tools/vj_kvq_bench.cpp)
+target_link_libraries(vj_kvq_bench PRIVATE vegajet_core)
+vj_test(test_kvq)
+# Lever 6: model-agnostic host offload and optional dlopen CUDA worker.
+target_sources(vegajet_core PRIVATE core/offload/host.cpp core/offload/engram.cpp
+    core/offload/policies.cpp core/offload/cuda.cpp)
+target_link_libraries(vegajet_core PUBLIC ${CMAKE_DL_LIBS})
+set_source_files_properties(core/offload/host.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+set(VEGAJET_ENABLE_CUDA_OFFLOAD "AUTO" CACHE STRING "CUDA offload: AUTO, ON, OFF")
+set_property(CACHE VEGAJET_ENABLE_CUDA_OFFLOAD PROPERTY STRINGS AUTO ON OFF)
+find_program(VJ_OFFLOAD_NVCC nvcc HINTS /usr/local/cuda/bin)
+if(NOT VEGAJET_ENABLE_CUDA_OFFLOAD MATCHES "^(AUTO|ON|OFF)$")
+    message(FATAL_ERROR "VEGAJET_ENABLE_CUDA_OFFLOAD must be AUTO, ON, or OFF")
+endif()
+if(VEGAJET_ENABLE_CUDA_OFFLOAD STREQUAL "ON" AND NOT VJ_OFFLOAD_NVCC)
+    message(FATAL_ERROR "CUDA offload requested but nvcc unavailable")
+endif()
+if(NOT VEGAJET_ENABLE_CUDA_OFFLOAD STREQUAL "OFF" AND VJ_OFFLOAD_NVCC)
+    set(VJ_OFFLOAD_PTX "${CMAKE_BINARY_DIR}/offload_worker.ptx")
+    add_custom_command(OUTPUT "${VJ_OFFLOAD_PTX}"
+        COMMAND "${VJ_OFFLOAD_NVCC}" --ptx -std=c++17 -arch=compute_70 --fmad=false
+                -I${CMAKE_SOURCE_DIR} "${CMAKE_SOURCE_DIR}/core/offload/cuda_worker.cu" -o "${VJ_OFFLOAD_PTX}"
+        DEPENDS core/offload/cuda_worker.cu core/offload/cuda_wire.hpp VERBATIM)
+    add_custom_target(vj_offload_cuda DEPENDS "${VJ_OFFLOAD_PTX}")
+    add_dependencies(vegajet_core vj_offload_cuda)
+    target_compile_definitions(vegajet_core PRIVATE VJ_OFFLOAD_PTX="${VJ_OFFLOAD_PTX}")
+endif()
+foreach(t IN ITEMS host engram policies cuda_ring)
+    add_executable(test_offload_${t} tests/test_offload_${t}.cpp)
+    target_link_libraries(test_offload_${t} PRIVATE vegajet_core)
+    target_compile_options(test_offload_${t} PRIVATE ${VJ_WARN} -UNDEBUG -ffp-contract=off)
+    add_test(NAME test_offload_${t} COMMAND test_offload_${t})
+    set_tests_properties(test_offload_${t} PROPERTIES TIMEOUT 30)
+endforeach()
+add_executable(vj_offload_bench tools/vj_offload_bench.cpp)
+target_link_libraries(vj_offload_bench PRIVATE vegajet_core)
+
+find_path(VJ_LIBURING_INCLUDE liburing.h)
+find_library(VJ_LIBURING_LIBRARY uring)
+if(VJ_LIBURING_INCLUDE AND VJ_LIBURING_LIBRARY)
+    target_include_directories(vegajet_core PRIVATE "${VJ_LIBURING_INCLUDE}")
+    target_link_libraries(vegajet_core PUBLIC "${VJ_LIBURING_LIBRARY}")
+    target_compile_definitions(vegajet_core PRIVATE VJ_OFFLOAD_LIBURING=1)
+endif()
+
+vj_test(test_ornith_l4)
+# CPU-only sampled quality analysis: never initializes the KFD runtime.
+add_executable(vj_sub4_quality tools/vj_sub4_quality.cpp)
+target_link_libraries(vj_sub4_quality PRIVATE vegajet_core)
+target_include_directories(vj_sub4_quality PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_options(vj_sub4_quality PRIVATE ${VJ_WARN})
+vj_test(test_sub4_integration)
+add_test(NAME test_sub4_quality COMMAND Python3::Interpreter
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_sub4_quality.py" "$<TARGET_FILE:vj_sub4_quality>")
+# L6 physical sequence slots and injectable offload executor (CPU only tests).
+vj_test(test_slot_batch_engine)
+target_sources(vegajet_core PRIVATE core/offload/executor.cpp)
+vj_test(test_offload_executor)
+vj_test(test_batch_layout)
+foreach(t test_slot_batch_engine test_batch_layout test_offload_executor)
+    target_compile_options(${t} PRIVATE -UNDEBUG)
+endforeach()
+vj_test(test_ornith_down_offload)
+target_compile_options(test_ornith_down_offload PRIVATE -UNDEBUG)
+
+add_test(NAME test_ar_fused COMMAND Python3::Interpreter "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_ar_fused.py")

@@ -322,17 +322,24 @@ int main() {
             }
         }
 
+        // Q3 GU_STREAM: exercise the actual split magnitude/sign/scale planes as MUBUF byte
+        // offsets, including nonzero expert bases. Compare against the independent IQ2_S oracle below.
+        const Dot8RowLayout q3 = q3_gu_iq2s_layout(rows, cols);
+        std::vector<uint8_t> q3w(q3.w_plane_bytes()), q3s(q3.s_plane_bytes());
+        VJ_CHECK(q3_repack_gu_iq2s_rows(sg.data(), su.data(), src_stride, 0, q3, 0, rows,
+                                      q3w.data(), q3s.data(), &err));
+        VJ_CHECK(q3.w_row_stride_bytes == 2304u && q3.s_row_stride_bytes == 256u);
         // ---- emulated 9b (gate, up) row sums vs emulated DOT8 tile, bit for bit
         int8_t xq[3072];
         float xd[96];
         for (int8_t& v : xq) v = static_cast<int8_t>(static_cast<int>(rnd(255)) - 127);
         for (float& v : xd) v = static_cast<float>(1 + rnd(5000)) * 2.11e-5f;
         for (uint32_t r = 0; r < rows; ++r) {
-            float ag_ref[16], au_ref[16], ag_new[16], au_new[16];
+            float ag_ref[16], au_ref[16], ag_new[16], au_new[16], ag_stream[16], au_stream[16];
             const uint8_t* row = wp.data() + r * lay.w_row_stride_bytes;
             const uint8_t* sc = row + lay.s_offset_bytes;
             for (uint32_t lane = 0; lane < 16; ++lane) {
-                float ag = 0.f, au = 0.f, bg = 0.f, bu = 0.f;
+                float ag = 0.f, au = 0.f, bg = 0.f, bu = 0.f, cg = 0.f, cu = 0.f;
                 for (uint32_t it = 0; it < 6; ++it) {
                     const uint32_t ib = it * 16 + lane;
                     uint32_t xw[8];
@@ -354,6 +361,31 @@ int main() {
                         acc = std::fma(pd * (0.5f + static_cast<float>(scb & 0xF)), static_cast<float>(dpv[0]), acc);
                         acc = std::fma(pd * (0.5f + static_cast<float>(scb >> 4)), static_cast<float>(dpv[1]), acc);
                     }
+                    // MUBUF SRD = expert base; voffset = row-in-expert stride + lane/block byte offset.
+                    const uint32_t erow = (r / 16u) * 16u, rloc = r % 16u;
+                    const uint8_t* qw = q3w.data() + erow * q3.w_row_stride_bytes;
+                    const uint8_t* qs = q3s.data() + erow * q3.s_row_stride_bytes;
+                    const uint32_t moff = rloc * q3.w_row_stride_bytes + ib * 16u;
+                    const uint32_t goff = rloc * q3.w_row_stride_bytes + nblk * 16u + ib * 8u;
+                    const uint32_t soff = rloc * q3.s_row_stride_bytes + ib * 2u;
+                    const uint32_t qsc = rd16(qs + soff);
+                    const uint32_t qd2 = rd32(qs + rloc * q3.s_row_stride_bytes + nblk * 2u + (ib >> 3) * 4u);
+                    for (uint32_t half = 0; half < 2u; ++half) {
+                        int32_t dp[2] = {0, 0};
+                        for (uint32_t part = 0; part < 2u; ++part) {
+                            const uint32_t mg = rd32(qw + moff + part * 8u + half * 4u);
+                            const uint32_t sign = rd32(qw + goff + part * 4u);
+                            for (uint32_t j = 0; j < 4u; ++j) {
+                                const uint32_t sgshift = half ? (sign >> (2u + j)) : ((j < 2u) ? sign << (2u - j) : sign >> (j - 2u));
+                                const uint32_t sel = ((mg >> (2u * j)) & 0x03030303u) | (sgshift & 0x04040404u);
+                                dp[part] = sdot4(dot8_perm_b32(0x00D5E7F8u, 0x002B1908u, sel), xw[half * 4u + j], dp[part]);
+                            }
+                        }
+                        const float qpg = quant::fp16_to_f32(static_cast<uint16_t>(qd2)) * 0.25f * xda;
+                        const float qpu = quant::fp16_to_f32(static_cast<uint16_t>(qd2 >> 16)) * 0.25f * xda;
+                        cg = std::fma(qpg * (0.5f + static_cast<float>((qsc >> (half * 4u)) & 15u)), static_cast<float>(dp[0]), cg);
+                        cu = std::fma(qpu * (0.5f + static_cast<float>((qsc >> (8u + half * 4u)) & 15u)), static_cast<float>(dp[1]), cu);
+                    }
                     // DOT8 tile body order: (g lo, u lo, g hi, u hi) on two independent chains
                     const uint8_t* gw = row + ib * 32u;
                     const uint8_t* uw = gw + 16;
@@ -374,8 +406,11 @@ int main() {
                     bu = std::fma(pu * (0.5f + static_cast<float>(s16 >> 12)), static_cast<float>(u1), bu);
                 }
                 ag_ref[lane] = ag; au_ref[lane] = au; ag_new[lane] = bg; au_new[lane] = bu;
+                ag_stream[lane] = cg; au_stream[lane] = cu;
+                VJ_CHECK(f2u(ag) == f2u(cg) && f2u(au) == f2u(cu));
                 VJ_CHECK(f2u(ag) == f2u(bg) && f2u(au) == f2u(bu));
             }
+            VJ_CHECK(f2u(sum16(ag_ref)) == f2u(sum16(ag_stream)) && f2u(sum16(au_ref)) == f2u(sum16(au_stream)));
             VJ_CHECK(f2u(sum16(ag_ref)) == f2u(sum16(ag_new)) && f2u(sum16(au_ref)) == f2u(sum16(au_new)));
         }
     }

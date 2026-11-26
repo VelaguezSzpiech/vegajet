@@ -286,7 +286,11 @@ void vj_flash_splitkv_any_partial_kernel(
         return;
     }
 
-    const uint32_t kv_h = (h * n_kv_local) / n_q_local;
+    const uint32_t n_kv_raw = n_kv_local & 0xFFu;
+    const uint32_t gqa_grp  = (n_kv_local >> 24) & 0xFFu;
+    const uint32_t kv_h     = (gqa_grp != 0u)
+        ? ((((n_kv_local >> 8) & 0xFFu) + h) / gqa_grp - ((n_kv_local >> 16) & 0xFFu))
+        : ((h * n_kv_raw) / n_q_local);
     const uint32_t wave = d >> 6;
     const uint32_t lane = d & 63u;
     const uint32_t blk  = d >> 5;
@@ -303,7 +307,7 @@ void vj_flash_splitkv_any_partial_kernel(
         #pragma unroll
         for (uint32_t j = 0u; j < 4u; ++j) {
             const uint32_t t   = min(t0 + j, t_last);
-            const uint64_t off = (static_cast<uint64_t>(t) * n_kv_local + kv_h) * 272ULL;
+            const uint64_t off = (static_cast<uint64_t>(t) * n_kv_raw + kv_h) * 272ULL;
             const uint8_t* kc  = k_cache_q8 + off;
             const uint8_t* vc  = v_cache_q8 + off;
             const float ksc    = fp16_to_f32(reinterpret_cast<const uint16_t*>(kc)[blk]);

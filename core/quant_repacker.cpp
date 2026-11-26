@@ -13,6 +13,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <stdexcept>
 
 namespace vegajet::quant {
 
@@ -20,6 +21,8 @@ namespace T = vegajet::ggml_tables;
 
 const char* native_format_name(NativeFormat f) {
     switch (f) {
+        case NativeFormat::VJ_Q2_DOT8: return "VJ_Q2_DOT8";
+        case NativeFormat::VJ_Q3_DOT8: return "VJ_Q3_DOT8";
         case NativeFormat::VJ_Q8_DP4A: return "VJ_Q8_DP4A";
         case NativeFormat::VJ_Q4_DOT8: return "VJ_Q4_DOT8";
         case NativeFormat::VJ_IQ_PACKED: return "VJ_IQ_PACKED";
@@ -922,7 +925,9 @@ bool HardwareRooflineProfile::save_json(const std::string& path, const HardwareR
     ofs << "{\n  \"gpus\": [\n";
     for (size_t i = 0; i < prof.gpus.size(); ++i) {
         const auto& g = prof.gpus[i];
-        ofs << "    {\"bdf\": \"" << g.id << "\", \"n_cu\": " << g.n_cu << ", \"sclk_ghz\": " << g.sclk_ghz
+        ofs << "    {\"bdf\": \"" << g.id << "\"";
+        if (!g.unique_id.empty()) ofs << ", \"unique_id\": \"" << g.unique_id << "\"";
+        ofs << ", \"n_cu\": " << g.n_cu << ", \"sclk_ghz\": " << g.sclk_ghz
             << ", \"mclk_mhz\": " << g.mclk_mhz << ", \"bw_hbm_gbs\": " << g.bw_hbm_gbs
             << ", \"power_cap_w\": " << g.power_cap_w << ", \"eta\": " << g.eta << ", \"i_star\": " << g.i_star()
             << "}" << (i + 1 < prof.gpus.size() ? "," : "") << "\n";
@@ -943,13 +948,28 @@ bool HardwareRooflineProfile::load_json(const std::string& path, HardwareRooflin
         v = std::atof(s.c_str() + p + 1);
         return true;
     };
+    auto str_field = [](const std::string& s, const char* key, std::string& v) {
+        auto p = s.find(key);
+        if (p == std::string::npos) return false;
+        p = s.find(':', p);
+        if (p == std::string::npos) return false;
+        const auto q1 = s.find('"', p + 1);
+        if (q1 == std::string::npos) return false;
+        const auto q2 = s.find('"', q1 + 1);
+        if (q2 == std::string::npos) return false;
+        v = s.substr(q1 + 1, q2 - q1 - 1);
+        return true;
+    };
     std::string line;
     while (std::getline(ifs, line)) {
         const auto bp = line.find("\"bdf\"");
-        if (bp == std::string::npos) continue;
+        const auto up = line.find("\"unique_id\"");
+        if (bp == std::string::npos && up == std::string::npos) continue;
         GpuRooflineInfo g;
-        const auto q1 = line.find('"', bp + 5), q2 = q1 == std::string::npos ? q1 : line.find('"', q1 + 1);
-        if (q2 != std::string::npos) g.id = line.substr(q1 + 1, q2 - q1 - 1);
+        (void)str_field(line, "\"bdf\"", g.id);
+        if (str_field(line, "\"unique_id\"", g.unique_id)) {
+            for (char& c : g.unique_id) if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+        }
         double v = 0;
         if (num(line, "\"n_cu\"", v)) g.n_cu = static_cast<uint32_t>(v);
         if (num(line, "\"sclk_ghz\"", v)) g.sclk_ghz = v;
@@ -969,6 +989,8 @@ uint64_t VramBudgetPlanner::estimate_bytes(NativeFormat fmt, DiskQuantType disk,
                                            uint64_t experts) {
     const uint64_t elems = rows * cols * experts;
     switch (fmt) {
+        case NativeFormat::VJ_Q2_DOT8: return elems / 4 + elems / 64 * 4 + 16;
+        case NativeFormat::VJ_Q3_DOT8: return elems * 3 / 8 + elems / 64 * 4 + 16;
         case NativeFormat::VJ_Q8_DP4A: return elems + elems / 32 * 2;
         case NativeFormat::VJ_Q4_DOT8: return elems / 2 + elems / 32 * 2;
         case NativeFormat::VJ_Q4_A8:   return elems / 2 + elems / 32 * 4;
@@ -1009,6 +1031,8 @@ double VramBudgetPlanner::format_inst_per_byte(DiskQuantType t) {
 
 double VramBudgetPlanner::native_inst_per_byte(NativeFormat fmt, DiskQuantType disk, bool w4a4) {
     switch (fmt) {
+        case NativeFormat::VJ_Q2_DOT8: return 1.0; // analytical, not measured
+        case NativeFormat::VJ_Q3_DOT8: return 1.5; // analytical, not measured
         case NativeFormat::VJ_Q8_DP4A: return 0.78;
         case NativeFormat::VJ_Q4_DOT8: return w4a4 ? 0.53 : 1.41;
         case NativeFormat::VJ_Q4_A8:   return w4a4 ? 0.65 : 1.35;
@@ -1187,6 +1211,170 @@ uint32_t tcc_channel_spread_count(uint32_t rows, const TccRowLayout& lay, uint32
         seen |= 1u << ((addr / kTccTileBytes) & 15u);
     }
     return static_cast<uint32_t>(__builtin_popcount(seen));
+}
+
+
+namespace {
+uint32_t sub4_bits(NativeFormat f) {
+    if (f == NativeFormat::VJ_Q2_DOT8) return 2;
+    if (f == NativeFormat::VJ_Q3_DOT8) return 3;
+    throw std::invalid_argument("sub4 format must be Q2/Q3 DOT8");
+}
+}
+PackedVjSub4 pack_f32_to_vj_sub4(const float* src, uint32_t rows, uint32_t cols,
+                               NativeFormat format, uint32_t group) {
+    const uint32_t bits = sub4_bits(format), top = (1u<<bits)-1;
+    if (!rows || !cols || (group != 64 && group != 128) || cols%group)
+        throw std::invalid_argument("sub4 requires nonempty rows and cols divisible by group64/128");
+    PackedVjSub4 p; p.format=format; p.rows=rows; p.cols=cols; p.group=group;
+    const size_t n=size_t(rows)*cols;
+    p.qs.assign(n/32*bits+4,0); p.dm.resize(n/group);
+    for (size_t g=0;g<n/group;++g) {
+        float lo=src[g*group], hi=lo;
+        for (uint32_t j=0;j<group;++j) {
+            float v=src[g*group+j];
+            if (!std::isfinite(v)) throw std::invalid_argument("nonfinite sub4 weight");
+            lo=std::min(lo,v); hi=std::max(hi,v);
+        }
+        float d=hi==lo ? 1.f : (hi-lo)/top;
+        uint16_t dh=f32_to_fp16(d);
+        d=fp16_to_f32(dh);
+        if (d==0) { dh=1; d=fp16_to_f32(dh); }
+        uint16_t zh=f32_to_fp16(-lo/d);
+        float z=fp16_to_f32(zh);
+        if (!std::isfinite(d) || !std::isfinite(z))
+            throw std::invalid_argument("sub4 affine metadata exceeds fp16 range");
+        p.dm[g]=uint32_t(dh)|(uint32_t(zh)<<16);
+        for(uint32_t j=0;j<group;++j) {
+            size_t i=g*group+j, b=i/32*bits; uint32_t k=i%32;
+            // Explicit nearest-even rounding, independent of the host rounding mode.
+            float v=std::clamp(src[i]/d+z,0.f,float(top));
+            uint32_t q=uint32_t(std::floor(v));
+            if(v-q>0.5f || (v-q==0.5f && (q&1))) ++q;
+            p.qs[b+k/16] |= (q&3)<<(4*((k%16)/2)+2*(k%2));
+            if(bits==3) p.qs[b+2] |= (q>>2)<<(4*((k%16)/2)+2*(k/16)+k%2);
+        }
+    }
+    return p;
+}
+PackedVjSub4 pack_f16_to_vj_sub4(const uint16_t* src,uint32_t r,uint32_t c,NativeFormat f,uint32_t g) {
+    std::vector<float> v(size_t(r)*c);
+    for(size_t i=0;i<v.size();++i) v[i]=fp16_to_f32(src[i]);
+    return pack_f32_to_vj_sub4(v.data(),r,c,f,g);
+}
+uint32_t sub4_code(const PackedVjSub4& p,size_t i) {
+    uint32_t bits=sub4_bits(p.format), k=i%32; size_t b=i/32*bits;
+    if(p.tcc_xor) b=((i/p.cols)*(p.cols/32)+((i%p.cols/32)^((i/p.cols)&15)))*bits;
+    uint32_t q=(p.qs[b+k/16]>>(4*((k%16)/2)+2*(k%2)))&3;
+    if(bits==3) q|=(((p.qs[b+2]>>(4*((k%16)/2)+2*(k/16)+k%2))&1)<<2);
+    return q;
+}
+void dequantize_vj_sub4(const PackedVjSub4& p,float* out) {
+    for(size_t i=0;i<size_t(p.rows)*p.cols;++i) {
+        uint32_t dm=p.tcc_xor ? p.dm[(i/p.cols)*(p.cols/32)+((i%p.cols/32)^((i/p.cols)&15))] : p.dm[i/p.group];
+        out[i]=fp16_to_f32(dm&65535)*(float(sub4_code(p,i))-fp16_to_f32(dm>>16));
+    }
+}
+void gemv_vj_sub4(const PackedVjSub4& p,const int8_t* x,const float* scales,float* y,uint32_t M) {
+    for(uint32_t m=0;m<M;++m) for(uint32_t r=0;r<p.rows;++r) {
+        float acc=0;
+        for(uint32_t b=0;b<p.cols/32;++b) {
+            int dot=0,sum=0;
+            for(uint32_t j=0;j<32;++j) {
+                int a=x[size_t(m)*p.cols+b*32+j];
+                if(a < -8 || a > 7) throw std::invalid_argument("activation outside int4");
+                dot+=int(sub4_code(p,size_t(r)*p.cols+b*32+j))*a; sum+=a;
+            }
+            uint32_t dm=p.tcc_xor ? p.dm[size_t(r)*(p.cols/32)+(b^(r&15))] : p.dm[size_t(r)*(p.cols/p.group)+b*32/p.group];
+            acc+=fp16_to_f32(dm&65535)*scales[size_t(m)*(p.cols/32)+b]*(dot-fp16_to_f32(dm>>16)*sum);
+        }
+        y[size_t(m)*p.rows+r]=acc;
+    }
+}
+uint32_t sub4_dot8_bits() {
+    const char* e=std::getenv("VEGAJET_SUB4_DOT8");
+    return e && std::strcmp(e,"q2")==0 ? 2 : e && std::strcmp(e,"q3")==0 ? 3 : 0;
+}
+bool tcc_xor_enabled() { const char* e=std::getenv("VEGAJET_TCC_XOR"); return e && std::strcmp(e,"1")==0; }
+PackedVjQ4A8 repack_tcc_xor(const PackedVjQ4A8& p) {
+    if(!p.cols || p.cols%512) throw std::invalid_argument("TCC XOR needs cols multiple of 512");
+    auto q=p;
+    for(uint32_t r=0;r<p.rows;++r) for(uint32_t b=0;b<p.cols/32;++b) {
+        uint32_t phys=b^(r&15);
+        std::memcpy(q.qs.data()+size_t(r)*p.qs_row_stride_bytes+phys*16,
+                    p.qs.data()+size_t(r)*p.qs_row_stride_bytes+b*16,16);
+        q.dm[size_t(r)*p.dm_row_stride_u32+phys]=p.dm[size_t(r)*p.dm_row_stride_u32+b];
+    }
+    return q;
+}
+PackedVjSub4 repack_tcc_xor(const PackedVjSub4& p) {
+    if(p.tcc_xor || !p.cols || p.cols%512) throw std::invalid_argument("TCC XOR needs plain cols multiple of 512");
+    auto q=p; q.tcc_xor=true; q.dm.resize(size_t(p.rows)*p.cols/32);
+    const uint32_t bits=sub4_bits(p.format), nb=p.cols/32;
+    for(uint32_t r=0;r<p.rows;++r) for(uint32_t b=0;b<nb;++b) {
+        uint32_t phys=b^(r&15);
+        for(uint32_t j=0;j<bits;++j) q.qs[(size_t(r)*nb+phys)*bits+j]=p.qs[(size_t(r)*nb+b)*bits+j];
+        q.dm[size_t(r)*nb+phys]=p.dm[size_t(r)*(p.cols/p.group)+b*32/p.group];
+    }
+    return q;
+}
+bool milo_enabled() { const char* e=std::getenv("VEGAJET_MILO"); return e && std::strcmp(e,"1")==0; }
+MiloResidual fit_milo(const float* original,const PackedVjSub4& p,uint32_t rank,uint32_t iterations,MiloStorage storage) {
+    if(!iterations) throw std::invalid_argument("MiLo requires positive iteration count");
+    if(rank!=16 && rank!=32) throw std::invalid_argument("MiLo rank must be 16/32");
+    MiloResidual f; f.rows=p.rows; f.cols=p.cols; f.rank=rank;
+    f.u.assign(size_t(p.rows)*rank,0); f.v.assign(size_t(rank)*p.cols,0);
+    std::vector<float> residual(size_t(p.rows)*p.cols); dequantize_vj_sub4(p,residual.data());
+    for(size_t i=0;i<residual.size();++i) residual[i]=original[i]-residual[i];
+    std::vector<double> u(p.rows),v(p.cols);
+    for(uint32_t k=0;k<rank;++k) {
+        for(uint32_t c=0;c<p.cols;++c) v[c]=std::sin(double((c+1)*(k+1))*1.61803398875);
+        for(uint32_t it=0;it<iterations;++it) {
+            std::fill(u.begin(),u.end(),0);
+            for(uint32_t r=0;r<p.rows;++r) for(uint32_t c=0;c<p.cols;++c) u[r]+=residual[size_t(r)*p.cols+c]*v[c];
+            std::fill(v.begin(),v.end(),0);
+            for(uint32_t r=0;r<p.rows;++r) for(uint32_t c=0;c<p.cols;++c) v[c]+=residual[size_t(r)*p.cols+c]*u[r];
+            double norm=0; for(double a:v) norm+=a*a; norm=std::sqrt(norm);
+            if(norm<1e-30) break;
+            for(double& a:v) a/=norm;
+        }
+        for(uint32_t c=0;c<p.cols;++c) f.v[size_t(k)*p.cols+c]=f32_to_fp16(float(v[c]));
+        for(uint32_t r=0;r<p.rows;++r) {
+            double a=0; for(uint32_t c=0;c<p.cols;++c) a+=residual[size_t(r)*p.cols+c]*fp16_to_f32(f.v[size_t(k)*p.cols+c]);
+            f.u[size_t(r)*rank+k]=f32_to_fp16(float(a));
+            for(uint32_t c=0;c<p.cols;++c) residual[size_t(r)*p.cols+c]-=fp16_to_f32(f.u[size_t(r)*rank+k])*fp16_to_f32(f.v[size_t(k)*p.cols+c]);
+        }
+    }
+    if(storage==MiloStorage::Int3) {
+        auto pack=[](const std::vector<uint16_t>& a,uint32_t rows,uint32_t cols,
+                     std::vector<uint32_t>& q,std::vector<float>& scales) {
+            q.assign((a.size()*3+31)/32+1,0); scales.resize(rows);
+            for(uint32_t r=0;r<rows;++r) {
+                float mx=0; for(uint32_t c=0;c<cols;++c) mx=std::max(mx,std::abs(fp16_to_f32(a[size_t(r)*cols+c])));
+                float d=mx>0?mx/3:1; scales[r]=d;
+                for(uint32_t c=0;c<cols;++c) {
+                    size_t i=size_t(r)*cols+c, bit=i*3;
+                    uint64_t v=uint32_t(std::clamp(int(std::round(fp16_to_f32(a[i])/d)),-3,3))&7;
+                    v<<=bit%32; q[bit/32]|=uint32_t(v); q[bit/32+1]|=uint32_t(v>>32);
+                }
+            }
+        };
+        pack(f.u,f.rows,f.rank,f.u3,f.us); pack(f.v,f.rank,f.cols,f.v3,f.vs);
+        f.u.clear(); f.u.shrink_to_fit(); f.v.clear(); f.v.shrink_to_fit(); f.storage=storage;
+    }
+    return f;
+}
+float milo_factor(const MiloResidual& f,bool u,size_t i) {
+    if(f.storage==MiloStorage::Fp16) return fp16_to_f32((u?f.u:f.v)[i]);
+    const auto& q=u?f.u3:f.v3; size_t bit=i*3;
+    uint32_t v=uint32_t((uint64_t(q[bit/32])|(uint64_t(q[bit/32+1])<<32))>>(bit%32))&7;
+    return float(int(v^4)-4)*(u?f.us[i/f.rank]:f.vs[i/f.cols]);
+}
+void apply_milo(const MiloResidual& f,const float* x,float* y) {
+    for(uint32_t k=0;k<f.rank;++k) {
+        float a=0; for(uint32_t c=0;c<f.cols;++c) a+=milo_factor(f,false,size_t(k)*f.cols+c)*x[c];
+        for(uint32_t r=0;r<f.rows;++r) y[r]+=milo_factor(f,true,size_t(r)*f.rank+k)*a;
+    }
 }
 
 } // namespace vegajet::quant

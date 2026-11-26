@@ -154,6 +154,15 @@ struct Dot8RowLayout {
 //   4j..4j+3), f32 d (exact fp16 -> f32)}. Device: lane for block b loads the uint2 at superblock b >> 3.
 Dot8RowLayout dot8_iq3_layout(uint64_t rows, uint32_t cols);
 
+// Lossless 32-column-aligned IQ3_XXS-sourced tensor (supports arbitrary TP=3 slices such as 320/352/384):
+//   codes per row: (cols/32) * 16 B (same exact 16-level codes as dot8_iq3_layout).
+//   scale region per row: (cols/32) * 4 B of precomputed exact IEEE-754 f32 gdb = d_f32 * (0.5f + s4) * 0.5f.
+//   For cols <= 384 (<= 12 blocks): 192 B codes + 48 B scales = 240 B <= 256 B -> scale_embedded = true (1 odd-256B tile!).
+Dot8RowLayout dot8_iq3_sub32_layout(uint64_t rows, uint32_t cols);
+bool dot8_repack_iq3xxs_rows_sub32(const uint8_t* src, uint64_t src_row_stride_bytes, uint32_t blk32_begin,
+                                   const Dot8RowLayout& lay, uint64_t row_begin, uint64_t row_end,
+                                   uint8_t* w_plane, uint8_t* s_plane, std::string* err = nullptr);
+
 // Merged Gate+Up pair of IQ2_S-sourced tensors with the same shape (row r of gate and row r of up together).
 //   codes per row: per block ib {gate uint4, up uint4} = 32 B.
 //   scale region per row: [nblk x u16 (gate scales byte | up scales byte << 8)] [nsb x u32 (gate d fp16 |

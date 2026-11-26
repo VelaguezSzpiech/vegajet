@@ -124,6 +124,58 @@ Dot8RowLayout dot8_iq3_layout(uint64_t rows, uint32_t cols) {
     return finish_layout(rows, cols, cols / 2u, nsb * 8u);
 }
 
+Dot8RowLayout dot8_iq3_sub32_layout(uint64_t rows, uint32_t cols) {
+    const uint32_t nblk = cols / kDot8BlockElems;
+    return finish_layout(rows, cols, nblk * kDot8BlockBytes, nblk * 4u);
+}
+
+bool dot8_repack_iq3xxs_rows_sub32(const uint8_t* src, uint64_t src_row_stride_bytes, uint32_t blk32_begin,
+                                   const Dot8RowLayout& lay, uint64_t row_begin, uint64_t row_end,
+                                   uint8_t* w_plane, uint8_t* s_plane, std::string* err) {
+    if (lay.cols == 0u || (lay.cols % kDot8BlockElems) != 0u) {
+        set_err(err, "dot8_sub32: cols must be a positive multiple of 32");
+        return false;
+    }
+    if (row_begin > row_end || row_end > lay.rows) {
+        set_err(err, "dot8_sub32: bad row range");
+        return false;
+    }
+    const uint32_t nblk = lay.cols / kDot8BlockElems;
+    if (lay.w_raw_row_bytes != nblk * kDot8BlockBytes || lay.s_raw_row_bytes != nblk * 4u) {
+        set_err(err, "dot8_sub32: layout is not an IQ3_XXS sub32 layout");
+        return false;
+    }
+    if (!src || !w_plane || (!lay.scale_embedded && !s_plane)) {
+        set_err(err, "dot8_sub32: null buffer");
+        return false;
+    }
+    uint8_t codes[32];
+    for (uint64_t r = row_begin; r < row_end; ++r) {
+        const uint8_t* srow = src + r * src_row_stride_bytes;
+        uint8_t* wrow = w_plane + r * lay.w_row_stride_bytes;
+        uint8_t* srow_out = scale_row_ptr(lay, w_plane, s_plane, r);
+        std::memset(wrow + lay.w_raw_row_bytes, 0, lay.w_row_stride_bytes - lay.w_raw_row_bytes);
+        for (uint32_t b = 0u; b < nblk; ++b) {
+            const uint32_t gb = blk32_begin + b;
+            const uint32_t sb = gb >> 3;
+            const uint32_t ib = gb & 7u;
+            const uint8_t* blk = srow + static_cast<uint64_t>(sb) * kIq3xxsBlockBytes;
+            uint8_t s4 = 0;
+            if (!dot8_encode_iq3xxs_sub(blk, ib, codes, &s4)) {
+                set_err(err, "dot8_sub32: IQ3_XXS grid byte outside the level set");
+                return false;
+            }
+            dot8_pack_codes(codes, wrow + static_cast<uint64_t>(b) * kDot8BlockBytes);
+            const float d = half_to_f32(rd16(blk));
+            const float gdb = d * (0.5f + static_cast<float>(s4)) * 0.5f;
+            uint32_t gbits;
+            std::memcpy(&gbits, &gdb, 4);
+            wr32(srow_out + b * 4u, gbits);
+        }
+    }
+    return true;
+}
+
 Dot8RowLayout dot8_gu_iq2s_layout(uint64_t rows, uint32_t cols) {
     const uint32_t nblk = cols / kDot8BlockElems;
     const uint32_t nsb = cols / kDot8SuperElems;

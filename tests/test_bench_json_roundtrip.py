@@ -99,6 +99,32 @@ class RoundTrip(unittest.TestCase):
         rc, out = gate(self.d / "base.json", self.d / "w4a8_then_dot8.json")
         self.assertIn("kld.dot8_prefill_kld", out)
 
+    def test_current_telemetry_formatter_roundtrip(self):
+        log = (self.d / "telemetry.log").read_text().splitlines()
+        doc = json.loads((self.d / "telemetry.json").read_text())
+        from_log = self.sc.parse(log)
+        from_json = self.sc.from_bench_json(doc)
+        a, b = from_log["telem"], from_json["telem"]
+        for key in ("rolling_avg_w", "mean_w", "peak_w", "max_tmem_c", "window_s", "window_kind", "hold", "avg_limit_w", "verdict"):
+            self.assertEqual(a[key], b[key], key)
+        self.assertEqual(b["verdict"], "FAIL")
+        self.assertEqual((b["rolling_avg_w"], b["window_s"], b["window_kind"]), (220, 0.125, "short_observed"))
+        self.assertEqual(len(b["cards"]), 2)
+        for source, encoded in zip(a["cards"], b["cards"]):
+            for key, value in source.items():
+                self.assertEqual(value, encoded[key], key)
+            self.assertTrue(encoded["timestamp_utc"])
+        self.assertIsNone(b["cards"][1]["power_cap_w"])
+        self.assertIsNone(b["cards"][1]["power_mean_w"])
+        self.assertEqual(b["cards"][1]["verdict"], "INCOMPLETE")
+        self.assertNotIn("NaN", json.dumps(doc, allow_nan=False))
+        for record in (from_log, from_json):
+            rendered = self.sc.format_text(record)
+            self.assertIn("cap 150 W", rendered)
+            self.assertIn("short_observed", rendered)
+            self.assertIn("0.125 s", rendered)
+            self.assertIn("INCOMPLETE", rendered)
+
 
 if __name__ == "__main__":
     unittest.main()

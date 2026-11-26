@@ -87,21 +87,26 @@ inline uint16_t make_aql_header(uint16_t type, bool barrier, uint16_t acquire, u
 }
 
 enum class AllReduceTransport {
+    None,
     PeerBarP2P,
     HostPinnedUserptr,
 };
 
 constexpr uint32_t kMaxGpus = 4;
 
+constexpr uint64_t kArFlagPeerBytes = 4096ULL;                    // 64 x 64 B isolated MTYPE_UC flag lines per src_rank
+constexpr uint64_t kArFlagGpuBytes  = kMaxGpus * kArFlagPeerBytes; // 16 KiB per dst_rank (indexed by [src_rank][slot & 63])
+
 struct alignas(4096) AllReduceFlags {
-    volatile uint32_t epoch[kMaxGpus][64][16];  // 4 KiB per dst_rank (64B isolated slots)
+    volatile uint32_t epoch[kMaxGpus][kMaxGpus][64][16];  // 16 KiB per dst_rank (64B isolated slots per src_rank)
 };
 
 constexpr uint64_t kArSlotBytes = 2ULL * 1048576ULL; // 2 MiB per ping-pong slot (fits M=512 INT8 AR in 1 slice!)
-constexpr uint64_t kArGpuBytes  = 2ULL * kArSlotBytes; // 4 MiB per GPU (2 ping-pong slots)
+constexpr uint64_t kArPeerBytes = 2ULL * kArSlotBytes; // 4 MiB per (dst_rank, src_rank) pair (2 ping-pong slots)
+constexpr uint64_t kArGpuBytes  = kMaxGpus * kArPeerBytes; // 16 MiB per dst_rank (4 src slots x 2 pp x 2 MiB)
 
 struct alignas(4096) AllReducePayload {
-    uint8_t rx_rank[kMaxGpus][2][kArSlotBytes];  // 4 MiB per dst_rank (2 ping-pong slots x 2 MiB)
+    uint8_t rx_rank[kMaxGpus][kMaxGpus][2][kArSlotBytes];  // 16 MiB per dst_rank
 };
 
 struct DeviceInfo {
@@ -111,11 +116,16 @@ struct DeviceInfo {
     uint32_t gfx_target_version = 0;  // 90006 for gfx906
     uint32_t n_cu = 0;
     uint32_t simd_count = 0;
+    uint32_t domain = 0;
     uint32_t location_id = 0;
     uint32_t p2p_links_count = 0;
     uint32_t cwsr_size = 0;
     uint32_t ctl_stack_size = 0;
     uint64_t vram_bytes = 0;
+    uint64_t unique_id = 0;
+    std::string unique_id_hex;        // 16-char lowercase hex from sysfs/KFD
+    std::string bdf;                  // dddd:bb:dd.f
+    double   mclk_mhz = 0.0;          // active pp_dpm_mclk MHz (0 if unreadable)
     int      drm_fd = -1;
 };
 
@@ -225,6 +235,7 @@ struct KfdAqlQueue {
     void*     kernarg_host = nullptr;
     size_t    kernarg_capacity = 0;
     uint32_t  kernarg_slot = 0;
+    uint64_t kernarg_fence_end = 0; // write index immediately after the last submitted completion barrier
     uint64_t  forced_flushes = 0;  // ring-full publishes done by aql_wait_space (see below)
 };
 
@@ -304,6 +315,16 @@ public:
     AllReduceTransport allreduce_transport() const { return transport_; }
     uint64_t mailbox_payload_gpu_va() const { return mailbox_payload_buf_.va; }
     uint64_t mailbox_flags_gpu_va() const { return mailbox_flag_buf_.va; }
+    // Base VA of dst's local RX payload mailbox written by src (add (ep & 1) * kArSlotBytes for ping-pong bank).
+    uint64_t ar_rx_base_va(size_t dst, size_t src) const {
+        if (mailbox_payload_buf_.va == 0 || dst >= kMaxGpus || src >= kMaxGpus) return 0;
+        return mailbox_payload_buf_.va + dst * kArGpuBytes + src * kArPeerBytes;
+    }
+    // VA of dst's local MTYPE_UC flag cacheline signaled by src for logical AR slot `slot`.
+    uint64_t ar_flag_va(size_t dst, size_t src, uint32_t slot) const {
+        if (mailbox_flag_buf_.va == 0 || dst >= kMaxGpus || src >= kMaxGpus) return 0;
+        return mailbox_flag_buf_.va + dst * kArFlagGpuBytes + src * kArFlagPeerBytes + (slot & 63u) * 64ULL;
+    }
     // GPU VA and size of the peer-mapped payload slice owned by `gpu_idx` (0 when the transport is not PEER_BAR_P2P).
     uint64_t p2p_payload_slice_va(size_t gpu_idx) const { return gpu_idx < p2p_payload_slices_.size() ? p2p_payload_slices_[gpu_idx].va : 0; }
     uint64_t p2p_payload_slice_bytes(size_t gpu_idx) const { return gpu_idx < p2p_payload_slices_.size() ? p2p_payload_slices_[gpu_idx].size : 0; }

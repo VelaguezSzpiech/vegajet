@@ -1,0 +1,18 @@
+{
+  "schema": "vegajet.v011_matrix_manifest.v1",
+  "model": {"name": "<model file name>", "bytes": 0, "fingerprint": "sha256-16M:<from tools/v011_bench_matrix.py --fingerprint>"},
+  "parity_reference": {
+    "golden": "32-token golden: models/ornith/ornith_golden.hpp kCodeRef32 vs Tier-1 llama.cpp ([PARITY code vs Tier-1 llama.cpp])",
+    "oracle": "129-token release oracle: raw M=1 greedy of the same run on the same prompt (lossless=n/129 on every speculative line)"
+  },
+  "runs": [
+    {"label": "w4a8 super-on", "log": "w4a8_super_on.log", "evidence": "live", "quant": "w4a8", "super": "on",
+     "commit": "<sha>", "flags": "bench <model> --draft <dflash> --fr-spec 32768 --mtp-k 4 --dflash-k 7",
+     "prompts": {"code": "p_rep_code", "prose": "p_base"}},
+    {"label": "w4a8 super-off", "log": "w4a8_super_off.log", "evidence": "live", "quant": "w4a8", "super": "off",
+     "commit": "<sha>", "flags": "VEGAJET_ENABLE_SUPER=0 bench <model> ...", "prompts": {"code": "p_rep_code", "prose": "p_base"}},
+    {"label": "w4a4 super-on", "log": "w4a4_super_on.log", "evidence": "live", "quant": "w4a4", "super": "on",
+     "commit": "<sha>", "flags": "bench <model> --prefill-dot8 ...", "prompts": {"code": "p_rep_code", "prose": "p_base"}},
+    {"label": "host replay B=8 K=7", "log": "test_spec_replay.log", "evidence": "host-replay"}
+  ]
+}

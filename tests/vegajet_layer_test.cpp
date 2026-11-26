@@ -9,6 +9,8 @@
 #include "core/vj_check.hpp"
 #include "core/warm_bench.hpp"
 #include "ops/kernels/vj_ornith_super_desc.hpp"
+#include "models/ornith/ornith_router_s240.hpp"
+#include "core/router_s240_pack.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -32,7 +34,9 @@ constexpr uint32_t kGdnRingSlots = 17u;
 void usage() {
     std::printf("Usage: vegajet_layer_test [--golden-dir DIR] [--hsaco-dir DIR]\n"
                 "                          [--stage gdn|gqa|moe|ar|prefill|all]\n"
-                "                          [--m 1,5,16,128,512] [--iters N] [--json]\n"
+                "                          [--m 1,5,16,128,512] [--iters N] [--json] [--gdn-splitv8]\n"
+                "  --gdn-splitv8: run the Split-V=8 GDN ConvRec (two ordered dispatches) for M=1 and\n"
+                "                 A/B it bit-exactly against the default Split-V=4 kernel in-process.\n"
                 "  Defaults: DIR=$VEGAJET_GOLDEN_DIR, --stage all, --m 1,5,16,128,512, --iters 5.\n"
                 "  Exits 77 (CTest skip) if built CPU-only or if golden fixture directory is not set.\n");
 }
@@ -128,7 +132,7 @@ struct StageResult {
 int main(int argc, char** argv) {
     std::string golden_dir, hsaco_dir, stage_arg = "all", m_arg = "1,5,16,128,512";
     int iters = 5;
-    bool json_only = false;
+    bool json_only = false, gdn_sv8 = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string { return (i + 1 < argc) ? argv[++i] : std::string(); };
@@ -139,6 +143,7 @@ int main(int argc, char** argv) {
         else if (a == "--m") m_arg = next();
         else if (a == "--iters") iters = std::max(1, std::atoi(next().c_str()));
         else if (a == "--json") json_only = true;
+        else if (a == "--gdn-splitv8") gdn_sv8 = true;
         else { std::fprintf(stderr, "vegajet_layer_test: unknown option %s\n", a.c_str()); return 2; }
     }
     if (golden_dir.empty()) {
@@ -148,6 +153,7 @@ int main(int argc, char** argv) {
 #ifdef VEGAJET_CPU_ONLY
     (void)iters;
     (void)json_only;
+    (void)gdn_sv8;
     std::printf("vegajet_layer_test: SKIP (VEGAJET_CPU_ONLY=ON)\n");
     return kSkipCode;
 #else
@@ -320,7 +326,8 @@ int main(int argc, char** argv) {
     const uint64_t conv_ring_va = a0.alloc(kGdnRingSlots * 3ULL * 6144ULL * 4ULL, 4096);
     const uint64_t ssm_ring_va  = a0.alloc(kGdnRingSlots * 32ULL * 128ULL * 128ULL * 4ULL, 4096);
     const uint64_t gdn_bar_va  = a0.alloc(8192u, 256);
-    const uint64_t gdn_sq_va   = a0.alloc(32u * 64u * 4u, 256);
+    // 192 f32/head: [0..127] pre-norm fo + [128..191] pair-squares for --gdn-splitv8.
+    const uint64_t gdn_sq_va   = a0.alloc(32u * 192u * 4u, 256);
     const uint64_t pf_fo_va    = a0.alloc(static_cast<uint64_t>(max_M) * 32ULL * 128ULL * 4ULL, 4096);
     const uint64_t pf_sq_va    = a0.alloc(static_cast<uint64_t>(max_M) * 32ULL * 64ULL * 4ULL, 4096);
     const uint64_t pf_bar_va   = a0.alloc(256u, 256);
@@ -365,12 +372,12 @@ int main(int argc, char** argv) {
             const M1KA ka{wq, wdm, xq, xds, y, rows, cols, stride, cols >> 5, 0ULL};
             VJ_CHECK(rt.enqueue_kernel(0, *k_w32, ((rows + 7u) / 8u) * 256u, 1, 1, 256, 1, 1, &ka, sizeof(ka), true));
         } else if (M <= 8u) {
-            struct M8KA { uint64_t wq, wdm, xq, xds, y; uint32_t rows, cols, M, stride; uint64_t ptx; };
-            const M8KA ka{wq, wdm, xq, xds, y, rows, cols, M, stride, 0ULL};
+            struct M8KA { uint64_t wq, wdm, xq, xds, y; uint32_t rows, cols, M, stride; uint64_t ptx, ptx2; };
+            const M8KA ka{wq, wdm, xq, xds, y, rows, cols, M, stride, 0ULL, 0ULL};
             VJ_CHECK(rt.enqueue_kernel(0, *k_m8, ((rows + 7u) / 8u) * 256u, 1, 1, 256, 1, 1, &ka, sizeof(ka), true));
         } else if (M <= 16u) {
-            struct M16KA { uint64_t wq, wdm, xq, xds, y; uint32_t rows, cols, M, stride; uint64_t ptx; };
-            const M16KA ka{wq, wdm, xq, xds, y, rows, cols, M, stride, 0ULL};
+            struct M16KA { uint64_t wq, wdm, xq, xds, y; uint32_t rows, cols, M, stride; uint64_t ptx, ptx2; };
+            const M16KA ka{wq, wdm, xq, xds, y, rows, cols, M, stride, 0ULL, 0ULL};
             VJ_CHECK(rt.enqueue_kernel(0, *k_m16, ((rows + 7u) / 8u) * 256u, 1, 1, 256, 1, 1, &ka, sizeof(ka), true));
         } else {
             struct PfKA { uint64_t wq, wdm, xq, xds, y; uint32_t rows, cols, M, stride; };
@@ -407,6 +414,25 @@ int main(int argc, char** argv) {
     // ---- STAGE 1: GDN (Layer 0) ----
     if (do_gdn && !do_super) {
         const auto* k_conv_m1 = need_k(0, "ornith_gdn_conv_recur_splitv_quant_m1_kernel");
+        const auto* k_conv_m1_sv8 = gdn_sv8 ? need_k(0, "ornith_gdn_conv_recur_splitv8_recur_m1_kernel") : nullptr;
+        const auto* k_conv_m1_sv8q = gdn_sv8 ? need_k(0, "ornith_gdn_conv_recur_splitv8_quant_m1_kernel") : nullptr;
+        auto enq_gdn_m1 = [&](const vegajet::kfd::LoadedKernel* k, uint32_t blocks, uint32_t sense) {
+            struct CRKA { uint64_t qkv, cw, cr, dt, sa, sr, nw, oq, od, bar, sq; uint32_t nk, nv, cdim, strd, zoff, aoff, boff, cin, cout, sh, ur, sense; float eps; };
+            const CRKA ka{gdn_qkv_va, l0_ssm_cw, conv_ring_va, l0_ssm_dt, l0_ssm_a, ssm_ring_va, l0_ssm_nw,
+                          mid_q8_va, mid_ds_va, gdn_bar_va, gdn_sq_va, 8u, 32u, 6144u, 10304u, 6144u, 10240u, 10272u, 0u, 1u, 0u, 0u, sense, eps};
+            VJ_CHECK(rt.enqueue_kernel(0, *k, blocks * 256u, 1, 1, 256, 1, 1, &ka, sizeof(ka), true));
+        };
+        // A2 Split-V=8: two ordered dispatches. Stage 1 publishes fo/pair-squares into gdn_sq_va; stage 2
+        // consumes only that scratch. Both packets carry the AQL barrier bit, so stage 2 waits for stage 1.
+        auto enq_gdn_m1_sv8 = [&](const vegajet::kfd::LoadedKernel* k1, const vegajet::kfd::LoadedKernel* k2, uint32_t blocks) {
+            struct SV8R { uint64_t qkv, cw, cr, dt, sa, sr, sq; uint32_t nk, nv, cdim, strd, aoff, boff, cin, cout, sh, ur; float eps; };
+            const SV8R r1{gdn_qkv_va, l0_ssm_cw, conv_ring_va, l0_ssm_dt, l0_ssm_a, ssm_ring_va, gdn_sq_va,
+                          8u, 32u, 6144u, 10304u, 10240u, 10272u, 0u, 1u, 0u, 0u, eps};
+            VJ_CHECK(rt.enqueue_kernel(0, *k1, blocks * 256u, 1, 1, 256, 1, 1, &r1, sizeof(r1), true));
+            struct SV8Q { uint64_t qkv, nw, oq, od, sq; uint32_t zoff; float eps; };
+            const SV8Q r2{gdn_qkv_va, l0_ssm_nw, mid_q8_va, mid_ds_va, gdn_sq_va, 6144u, eps};
+            VJ_CHECK(rt.enqueue_kernel(0, *k2, blocks * 256u, 1, 1, 256, 1, 1, &r2, sizeof(r2), true));
+        };
         const auto* k_conv    = need_k(0, "ornith_gdn_conv_l2_gate_kernel");
         const auto* k_rec     = need_k(0, "ornith_gdn_recur_quant_kernel");
         const auto* k_pf_conv = need_k(0, "vj_prefill_gdn_conv_l2_gate_kernel");
@@ -438,10 +464,8 @@ int main(int argc, char** argv) {
                     enq_q4(l0_gdn_qkv_qs, l0_gdn_qkv_dm, gdn_qkv_rows, gdn_qkv_cols, gdn_qkv_stride, xq8_va, xds_va, gdn_qkv_va, M);
                     if (M == 1u) {
                         ++gdn_sense;
-                        struct CRKA { uint64_t qkv, cw, cr, dt, sa, sr, nw, oq, od, bar, sq; uint32_t nk, nv, cdim, strd, zoff, aoff, boff, cin, cout, sh, ur, sense; float eps; };
-                        const CRKA ka{gdn_qkv_va, l0_ssm_cw, conv_ring_va, l0_ssm_dt, l0_ssm_a, ssm_ring_va, l0_ssm_nw,
-                                      mid_q8_va, mid_ds_va, gdn_bar_va, gdn_sq_va, 8u, 32u, 6144u, 10304u, 6144u, 10240u, 10272u, 0u, 1u, 0u, 0u, gdn_sense, eps};
-                        VJ_CHECK(rt.enqueue_kernel(0, *k_conv_m1, 128u * 256u, 1, 1, 256, 1, 1, &ka, sizeof(ka), true));
+                        if (gdn_sv8) enq_gdn_m1_sv8(k_conv_m1_sv8, k_conv_m1_sv8q, 8u * 32u);   // nv * 8 WGs, stage 1 -> stage 2
+                        else         enq_gdn_m1(k_conv_m1,     4u * 32u, gdn_sense);   // nv * 4 WGs
                     } else if (M <= 16u) {
                         struct CLKA { uint64_t qkv, cw, cr, cout, dt, sa, dec, bs; uint32_t M, nk, nv, cdim, strd, aoff, boff, rh, ur; float eps; };
                         const CLKA cl{gdn_qkv_va, l0_ssm_cw, conv_ring_va, gdn_conv_va, l0_ssm_dt, l0_ssm_a, gdn_dec_va, gdn_bsig_va,
@@ -471,6 +495,42 @@ int main(int argc, char** argv) {
             const bool ok = !ps.nan_found && ps.max_abs_err <= 2e-4 && ps.cosine_sim >= 0.999999;
             const double gbs = (us > 0.0) ? (static_cast<double>(l0_gdn_bytes) / (us * 1e3)) : 0.0;
             results.push_back({"gdn", M, ok, us, gbs, ps.max_abs_err, ps.cosine_sim, ""});
+
+            // --gdn-splitv8 A/B: the timed run produced Split-V=8 outputs. Snapshot them, restore the
+            // inputs, run the default Split-V=4 kernel once and require every stage buffer to match.
+            if (M == 1u && gdn_sv8) {
+                const size_t q8_b = 32u * 128u, ds_b = 32u * 4u * 8u, cr_b = 3u * 6144u * 4u, ss_b = 32u * 128u * 128u * 4u;
+                std::vector<uint8_t> q8a, dsa, cra, ssa, q8b, dsb, crb, ssb;
+                std::vector<float> pa, pb;
+                auto snap = [&](std::vector<uint8_t>& q8, std::vector<uint8_t>& ds, std::vector<uint8_t>& cr,
+                                std::vector<uint8_t>& ss, std::vector<float>& part) {
+                    q8.resize(q8_b); ds.resize(ds_b); cr.resize(cr_b); ss.resize(ss_b); part.resize(D);
+                    VJ_CHECK(rt.download_from_vram(0, q8.data(), mid_q8_va, q8.size()));
+                    VJ_CHECK(rt.download_from_vram(0, ds.data(), mid_ds_va, ds.size()));
+                    VJ_CHECK(rt.download_from_vram(0, cr.data(), conv_ring_va + 3ULL * 6144ULL * 4ULL, cr.size()));
+                    VJ_CHECK(rt.download_from_vram(0, ss.data(), ssm_ring_va, ss.size()));
+                    VJ_CHECK(rt.download_from_vram(0, part.data(), partial_va, part.size() * 4u));
+                };
+                snap(q8a, dsa, cra, ssa, pa);
+                VJ_CHECK(rt.upload_to_vram(0, conv_ring_va, b_cin.data(), b_cin.size()));
+                VJ_CHECK(rt.upload_to_vram(0, ssm_ring_va, b_sin.data(), b_sin.size()));
+                zero_gpu0(gdn_bar_va, 8192u);
+                ++gdn_sense;
+                enq_q4(l0_gdn_qkv_qs, l0_gdn_qkv_dm, gdn_qkv_rows, gdn_qkv_cols, gdn_qkv_stride, xq8_va, xds_va, gdn_qkv_va, 1u);
+                enq_gdn_m1(k_conv_m1, 4u * 32u, gdn_sense);
+                enq_q4(l0_ssm_out_qs, l0_ssm_out_dm, ssm_out_rows, ssm_out_cols, ssm_out_stride, mid_q8_va, mid_ds_va, partial_va, 1u);
+                VJ_CHECK(rt.submit_batch(0) && rt.wait_idle(0));
+                snap(q8b, dsb, crb, ssb, pb);
+                const bool exact =
+                    std::memcmp(q8a.data(), q8b.data(), q8_b) == 0 &&
+                    std::memcmp(dsa.data(), dsb.data(), ds_b) == 0 &&
+                    std::memcmp(cra.data(), crb.data(), cr_b) == 0 &&
+                    std::memcmp(ssa.data(), ssb.data(), ss_b) == 0 &&
+                    std::memcmp(pa.data(), pb.data(), pa.size() * 4u) == 0;
+                results.push_back({"gdn-ab", 1u, exact, 0.0, 0.0, 0.0, exact ? 1.0 : 0.0,
+                                   exact ? "splitv4==splitv8 bit-exact (q8, d/bsum, conv ring, S, partial)"
+                                         : "splitv4/splitv8 differ"});
+            }
         }
     }
 
@@ -536,6 +596,60 @@ int main(int argc, char** argv) {
         const auto* k_pf_gu    = need_k(0, "vj_prefill_moe_gu_iq2s_tiled_kernel");
         const auto* k_pf_dn    = need_k(0, "vj_prefill_moe_down_iq3_tiled_kernel");
         const auto* k_pf_comb  = need_k(0, "vj_moe_down_combine_all_f32_kernel");
+        static const vegajet::ornith::RouterS240Options rs240_opt = vegajet::ornith::router_s240_options_from_env();
+        const auto* k_rtr240   = rt.get_kernel(0, "ornith_moe_router_shgu_s240_kernel");
+        const auto* k_rtr240r  = rt.get_kernel(0, "ornith_moe_router_shgu_s240_reduce_kernel");
+        const bool use_rtr240  = rs240_opt.enabled && k_rtr240 != nullptr && k_rtr240r != nullptr;
+        const vegajet::router_s240::ScratchPlan r240_plan =
+            vegajet::router_s240::make_scratch_plan(sh_gu_rows, rs240_opt.split_k);
+        const uint64_t r240_scratch =
+            use_rtr240 ? rt.vram_arena(0).alloc(std::max<uint64_t>(64u * 1024u, r240_plan.bytes), 4096) : 0u;
+        // VEGAJET_ROUTER_S240_XOR (bit0 router FP16, bit1 shared Gate/Up qs) repacks the fixture weights with
+        // the same host packer the kernel addressing is defined by, so the device run exercises the XOR reader.
+        vegajet::router_s240::PlaneLayout r240_rl, r240_ql;
+        uint32_t r240_rstride = 0u, r240_qstride = 0u, r240_rmask = 0u, r240_qmask = 0u;
+        const bool r240_xor_m1 = (m_list.size() == 1u && m_list[0] == 1u);
+        if (use_rtr240 && (rs240_opt.xor_bits & 3u) != 0u && !r240_xor_m1)
+            std::fprintf(stderr, "router_s240: VEGAJET_ROUTER_S240_XOR needs --m 1; ignoring XOR bits\n");
+        if (use_rtr240 && (rs240_opt.xor_bits & 3u) != 0u && r240_xor_m1) {
+            const uint32_t router_stride = (D == 3072u) ? 3200u : D;
+            const uint32_t qs_stride = sh_gu_stride;
+            VJ_CHECK(qs_stride != 0u);
+            // The engine's PadOdd256 qs rows are natural inside the row; a select_tcc_layout XorTileSwizzle
+            // (raw row bytes a multiple of 4096) would need a different extraction, so reject it here.
+            VJ_CHECK((sh_gu_cols / 2u) % 4096u != 0u);
+            if ((rs240_opt.xor_bits & 1u) != 0u) {
+                std::vector<uint8_t> src;
+                VJ_CHECK(read_bin_file(wdir + "/l0_router_f16.bin", src, &err));
+                VJ_CHECK(src.size() >= static_cast<size_t>(256u) * router_stride * 2u);
+                std::vector<uint8_t> nat(static_cast<size_t>(256u) * D * 2u);
+                for (uint32_t r = 0; r < 256u; ++r)
+                    std::memcpy(nat.data() + static_cast<size_t>(r) * D * 2u,
+                                src.data() + static_cast<size_t>(r) * router_stride * 2u, static_cast<size_t>(D) * 2u);
+                r240_rl = vegajet::router_s240::make_plane_layout(D * 2u, 0u, 1u);
+                const std::vector<uint8_t> pk = vegajet::router_s240::pack_plane_rows(nat.data(), 256u, r240_rl);
+                l0_rtr = rt.vram_arena(0).alloc(pk.size(), 4096);
+                VJ_CHECK(l0_rtr != 0u && rt.upload_to_vram(0, l0_rtr, pk.data(), pk.size()));
+                r240_rstride = r240_rl.stride_bytes / 2u;
+                r240_rmask = r240_rl.xor_mask;
+            }
+            if ((rs240_opt.xor_bits & 2u) != 0u) {
+                std::vector<uint8_t> src;
+                VJ_CHECK(read_bin_file(wdir + "/l0_sh_gu_qs.bin", src, &err));
+                VJ_CHECK(src.size() >= static_cast<size_t>(sh_gu_rows) * qs_stride);
+                const uint32_t raw = sh_gu_cols / 2u;
+                std::vector<uint8_t> nat(static_cast<size_t>(sh_gu_rows) * raw);
+                for (uint32_t r = 0; r < sh_gu_rows; ++r)
+                    std::memcpy(nat.data() + static_cast<size_t>(r) * raw,
+                                src.data() + static_cast<size_t>(r) * qs_stride, raw);
+                r240_ql = vegajet::router_s240::make_plane_layout(raw, 0u, 1u);
+                const std::vector<uint8_t> pk = vegajet::router_s240::pack_plane_rows(nat.data(), sh_gu_rows, r240_ql);
+                l0_sh_gu_qs = rt.vram_arena(0).alloc(pk.size(), 4096);
+                VJ_CHECK(l0_sh_gu_qs != 0u && rt.upload_to_vram(0, l0_sh_gu_qs, pk.data(), pk.size()));
+                r240_qstride = r240_ql.stride_bytes;
+                r240_qmask = r240_ql.xor_mask;
+            }
+        }
         for (uint32_t M : m_list) {
             if (prefill_only && M < 16u) continue;
             const std::string pfx = golden_dir + "/m" + std::to_string(M) + "_moe_";
@@ -564,11 +678,49 @@ int main(int argc, char** argv) {
                     }
                 },
                 [&]() {
-                    struct RtrKA { uint64_t wr, ws, xn, log, sc; uint32_t M, D; };
-                    const RtrKA rka{l0_rtr, l0_sh_g, xnorm_va, rtr_log_va, sh_sc_va, M, D};
-                    if (M >= 32u) VJ_CHECK(rt.enqueue_kernel(0, *k_pf_rtr, 9u * 128u, (M + 31u) / 32u, 1, 128, 1, 1, &rka, sizeof(rka), true));
-                    else          VJ_CHECK(rt.enqueue_kernel(0, *k_rtr, 33u * 256u, (M + 7u) / 8u, 1, 256, 1, 1, &rka, sizeof(rka), true));
-                    enq_q4(l0_sh_gu_qs, l0_sh_gu_dm, sh_gu_rows, sh_gu_cols, sh_gu_stride, xq8_va, xds_va, sh_gu_va, M);
+                    if (M == 1u && use_rtr240) {
+                        // One-layer A/B: the opt-in 240-WG Split-K router + shared Gate/Up pair replaces the
+                        // 33-WG router and the shared Gate/Up GEMM for this single decode layer.
+                        vegajet::ornith::RouterS240Scratch sc{};
+                        std::string serr;
+                        VJ_CHECK(vegajet::ornith::router_s240_scratch(r240_scratch, r240_plan.bytes, sh_gu_rows,
+                                                                      rs240_opt.split_k, &sc, &serr));
+                        vegajet::router_s240::Phase1Args pa{};
+                        pa.w_router_f16       = l0_rtr;
+                        pa.w_sh_gate          = l0_sh_g;
+                        pa.x_norm             = xnorm_va;
+                        pa.sh_w_qs            = l0_sh_gu_qs;
+                        pa.sh_w_dm            = l0_sh_gu_dm;
+                        pa.x_q8               = xq8_va;
+                        pa.x_ds               = xds_va;
+                        pa.rtr_part           = sc.rtr_part;
+                        pa.sh_part            = sc.sh_part;
+                        pa.gate_part          = sc.gate_part;
+                        pa.D                  = D;
+                        pa.sh_rows            = sh_gu_rows;
+                        pa.wr_stride_elems    = r240_rstride ? r240_rstride : ((D == 3072u) ? 3200u : D);
+                        pa.sh_qs_stride_bytes = r240_qstride ? r240_qstride : sh_gu_stride;
+                        pa.sh_dm_stride_u32   = sh_gu_cols / 32u;
+                        pa.split_k            = rs240_opt.split_k;
+                        pa.wr_xor_mask        = r240_rmask;
+                        pa.sh_xor_mask        = r240_qmask;
+                        vegajet::router_s240::ReduceArgs ra{};
+                        ra.rtr_part   = sc.rtr_part;
+                        ra.sh_part    = sc.sh_part;
+                        ra.gate_part  = sc.gate_part;
+                        ra.logits     = rtr_log_va;
+                        ra.sh_gu      = sh_gu_va;
+                        ra.sh_gate_sc = sh_sc_va;
+                        ra.sh_rows    = sh_gu_rows;
+                        ra.split_k    = rs240_opt.split_k;
+                        VJ_CHECK(vegajet::ornith::launch_router_s240(rt, 0, *k_rtr240, *k_rtr240r, pa, ra, &serr));
+                    } else {
+                        struct RtrKA { uint64_t wr, ws, xn, log, sc; uint32_t M, D; };
+                        const RtrKA rka{l0_rtr, l0_sh_g, xnorm_va, rtr_log_va, sh_sc_va, M, D};
+                        if (M >= 32u) VJ_CHECK(rt.enqueue_kernel(0, *k_pf_rtr, 9u * 128u, (M + 31u) / 32u, 1, 128, 1, 1, &rka, sizeof(rka), true));
+                        else          VJ_CHECK(rt.enqueue_kernel(0, *k_rtr, 33u * 256u, (M + 7u) / 8u, 1, 256, 1, 1, &rka, sizeof(rka), true));
+                        enq_q4(l0_sh_gu_qs, l0_sh_gu_dm, sh_gu_rows, sh_gu_cols, sh_gu_stride, xq8_va, xds_va, sh_gu_va, M);
+                    }
                     struct T8KA { uint64_t log, tids, tw; uint32_t M; };
                     const T8KA t8{rtr_log_va, top_ids_va, top_w_va, M};
                     VJ_CHECK(rt.enqueue_kernel(0, *k_top8, M * 256u, 1, 1, 256, 1, 1, &t8, sizeof(t8), true));
@@ -651,6 +803,8 @@ int main(int argc, char** argv) {
         uint32_t ep = 1u;
         const uint64_t pay_base = rt.mailbox_payload_gpu_va();
         const uint64_t flg_base = rt.mailbox_flags_gpu_va();
+        (void)pay_base;
+        (void)flg_base;
         for (uint32_t M : m_list) {
             if (prefill_only && M < 64u) continue;
             const bool use_i8 = (M >= 64u);
@@ -664,9 +818,9 @@ int main(int argc, char** argv) {
                 for (size_t g = 0; g < 2; ++g) {
                     const size_t peer = 1u - g;
                     struct ArKA { uint64_t xp, ptx, lrx, pfl, lfl, bar, h, w, xn, xq, xd; uint32_t M, D, ep, dn; float eps; };
-                    const ArKA aka{p_va[g], pay_base + peer * vegajet::kfd::kArGpuBytes + pp * vegajet::kfd::kArSlotBytes,
-                                   pay_base + g * vegajet::kfd::kArGpuBytes + pp * vegajet::kfd::kArSlotBytes,
-                                   flg_base + peer * 4096ULL, flg_base + g * 4096ULL,
+                    const ArKA aka{p_va[g], rt.ar_rx_base_va(peer, g) + pp * vegajet::kfd::kArSlotBytes,
+                                   rt.ar_rx_base_va(g, peer) + pp * vegajet::kfd::kArSlotBytes,
+                                   rt.ar_flag_va(peer, g, 0u), rt.ar_flag_va(g, peer, 0u),
                                    bar_va[g], h_va[g], w_va[g], xn_va[g], xq_va[g], xd_va[g], M, D, cur_ep, 1u, eps};
                     const uint32_t nwg = use_i8 ? std::min<uint32_t>(M, 128u) : M;
                     VJ_CHECK(rt.enqueue_kernel(g, *(use_i8 ? k_ar_i8[g] : k_ar_fp16[g]), nwg * 256u, 1, 1, 256, 1, 1, &aka, sizeof(aka), true));

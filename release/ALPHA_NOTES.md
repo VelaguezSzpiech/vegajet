@@ -1,3 +1,33 @@
+# VegaJet v0.1.1
+
+v0.1.1 is a source release on top of `v0.1.0-alpha.1`. It runs the Ornith backend on **three** MI50 32 GB cards
+(`--tp 3`) and makes three lossless speculative-decode changes the default. The `v0.1.0-alpha.1` notes below still
+describe the two-card alpha and its downloadable bundle. This release has no binary bundle; build it from source.
+
+- **Binary version string:** `vegajet 0.1.1`; the CMake project version is `0.1.1`.
+- **Rig:** 3× Instinct MI50 32 GB (gfx906), TheRock / ROCm 7.12.0, BAR0 P2P, 150 W cap.
+- **Measured** (development build `226d3eb`, same defaults as this release, resident `vegajet bench --tp 3` engine,
+  no environment overrides): raw `M=1` **174.25 tok/s** (`100 disp/tok`); Hybrid **390.50 / 383.96 tok/s** for
+  128 / 512 tokens, matching raw decode 129/129 on repeated code. DFlash2 K=7 reached **262.85 tok/s**, or
+  **382.43 tok/s** with Hybrid. Four batched sequences reached **213.66 tok/s** in aggregate
+  (`VEGAJET_GPU_BATCH=4`, rows agree 4/4). All six RAS blocks recorded **0 UE / 0 DE**, and the memory temperature
+  peaked at 57 °C.
+- **New defaults** (each can be turned off):
+  - zero-tax suffix cascade: `--no-zero-tax-catchup`;
+  - LumoTree GDN verifier: `VEGAJET_GDN_VERIFY=ring`, which is selected automatically when `VEGAJET_GPU_BATCH>=2`
+    is set at launch;
+  - `VERIFY_FAST` verify-step expert reuse: `VEGAJET_VERIFY_FAST=0`.
+
+  On the same cards they took Hybrid from 338.9 to 390.5 tok/s.
+- **Measured and left off:** `AR_FUSED` (-38% raw), `AR_TILE_PIPE` (-5.85%), `TOP8_WG0` (-1.1%), `MEGA` (-13%),
+  `SUB4_DOT8=q3` (-47%, lossy), `SPEC_ACCEPTMOE` (lossy), `VERIFY_N3`. KV quantization (`VEGAJET_KV_QUANT`) runs at
+  full speed for `q8_0` at short context. Long contexts were not benchmarked.
+- **Not re-qualified:** `vegajet serve` at `TP=3`, prefill throughput and long-context decode.
+
+See [`../CHANGELOG.md`](../CHANGELOG.md) and the three-card scorecard in the README.
+
+---
+
 # VegaJet v0.1.0-alpha.1
 
 I ran Ornith-122B on the two **32 GB AMD Instinct MI50s** in my machine. My raw fast-path runs reached **165.22 tok/s for 128 output tokens** and **156.41 for 512** (`69ca5eb`). With FR-Spec 64K, `--spec-gdn` and suffix drafting, Hybrid reached **357.07 / 346.27 tok/s** on repeated code (`d7bc240`). Those are development-build measurements, not a benchmark of the shipped binary. That’s the machine I built VegaJet for. This alpha lets you point your own streaming client at it.

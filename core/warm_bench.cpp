@@ -31,6 +31,29 @@ std::string trim(const std::string& s) {
 
 } // namespace
 
+bool make_decode_prompt(std::string_view context, const std::vector<int32_t>& seed,
+                        uint32_t max_ctx, uint32_t timed_steps,
+                        std::vector<int32_t>& prompt, std::string* err) {
+    prompt.clear();
+    if (err) err->clear();
+    uint64_t n = 0;
+    for (char c : context) {
+        if (c < '0' || c > '9' || n > (UINT32_MAX - uint32_t(c - '0')) / 10u) {
+            if (err) *err = "VEGAJET_BENCH_CONTEXT must be a decimal token count";
+            return false;
+        }
+        n = n * 10u + uint32_t(c - '0');
+    }
+    if (n == 0) n = seed.size();
+    if (seed.empty() || n + timed_steps > max_ctx || timed_steps == 0) {
+        if (err) *err = "VEGAJET_BENCH_CONTEXT needs a nonempty prompt and prompt + timed decode <= max_ctx";
+        return false;
+    }
+    prompt.resize(static_cast<size_t>(n));
+    for (size_t i = 0; i < prompt.size(); ++i) prompt[i] = seed[i % seed.size()];
+    return true;
+}
+
 bool tokenize_line(const std::string& line, std::vector<std::string>& out, std::string* err) {
     out.clear();
     std::string cur;

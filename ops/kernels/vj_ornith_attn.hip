@@ -38,18 +38,25 @@ void ornith_gdn_conv_l2_gate_kernel(
         const uint32_t ch = grp * 128u + tid;
         const float4 w = reinterpret_cast<const float4*>(conv_w)[ch];
         const uint64_t slot_stride = 3ULL * conv_dim;
-        const float* r_in = conv_ring + static_cast<uint64_t>(ring_head) * slot_stride;
+        const float* r_in = conv_ring + static_cast<uint64_t>(use_ring == 2u ? 0u : ring_head) * slot_stride;
         float s0 = r_in[0ULL * conv_dim + ch];
         float s1 = r_in[1ULL * conv_dim + ch];
         float s2 = r_in[2ULL * conv_dim + ch];
         __shared__ float sm_sq[2];
 
+        // use_ring == 2 (VEGAJET_GPU_BATCH): row m is an independent sequence whose conv state lives in slot
+        // the 3-bit row entry packed in ring_head and is updated in place (no carry between rows).
+        const bool per_row = (use_ring == 2u);
         for (uint32_t m = 0u; m < M; ++m) {
+            const uint32_t slot = per_row ? ((ring_head >> (3u * m)) & 7u) : ring_head + m;
+            float* r_row = conv_ring + static_cast<uint64_t>(slot) * slot_stride;
+            if (per_row) { s0 = r_row[0ULL * conv_dim + ch]; s1 = r_row[1ULL * conv_dim + ch]; s2 = r_row[2ULL * conv_dim + ch]; }
             const float x = qkv_gab_in[static_cast<uint64_t>(m) * stride_in + ch];
             const float acc = fmaf(w.x, s0, fmaf(w.y, s1, fmaf(w.z, s2, w.w * x)));
             float y = acc / (1.0f + __expf(-acc));
             s0 = s1; s1 = s2; s2 = x;
-            if (use_ring != 0u && m < VJ_GDN_RING_SLOTS - 1u) {
+            if (per_row) { r_row[0ULL * conv_dim + ch] = s0; r_row[1ULL * conv_dim + ch] = s1; r_row[2ULL * conv_dim + ch] = s2; }
+            if (use_ring == 1u && m < VJ_GDN_RING_SLOTS - 1u) {
                 const uint32_t dst_slot = (ring_head + m + 1u) % VJ_GDN_RING_SLOTS;
                 float* r_out = conv_ring + static_cast<uint64_t>(dst_slot) * slot_stride;
                 r_out[0ULL * conv_dim + ch] = s0;
@@ -88,8 +95,8 @@ void ornith_gdn_conv_l2_gate_kernel(
 }
 
 // ============================================================================
-// 5b. 1024-Thread SINGLE-READ Register-Cached GDN Recurrence + Gated RMSNorm + Quant (<=64 VGPRs, 0 B spill!)
-//     16 Wave64s per head (8 rows/wave -> float2 s_reg[8] = 16 VGPRs) x 32 heads = 512 waves across 60 CUs!
+// 5b. 1024-thread GDN recurrence. Ring verification follows production super M=1;
+//     non-ring prefill/fallback retains its original eight-row arithmetic.
 // ============================================================================
 extern "C" __global__ __launch_bounds__(1024, 1)
 void ornith_gdn_recur_quant_kernel(
@@ -110,39 +117,171 @@ void ornith_gdn_recur_quant_kernel(
     uint32_t ring_head,
     uint32_t use_ring,
     float    eps) {
+    // Non-ring calls also build the raw reference's prompt state. Do not change
+    // that state while fixing verifier order; the M=1 split/super kernels are unchanged.
+    // use_ring == 2 (VEGAJET_GPU_BATCH): row m is an independent sequence; its state slot is packed in the 3-bit row entry of ring_head,
+    // loaded and stored in place around that row's step (same per-step arithmetic as the use_ring == 0 path).
+    if (use_ring == 0u) {
+        const bool per_row = (use_ring == 2u);
+        const uint32_t hv = blockIdx.x, tid = threadIdx.x;
+        const uint32_t wave = tid >> 6, lane = tid & 63u;
+        if (hv >= nv) return;
+        const uint32_t hk = hv % nk, i_beg = wave * 8u, j0 = lane * 2u;
+        const uint64_t slot_elems = static_cast<uint64_t>(nv) * 128u * 128u;
+        float* S_base = ssm_ring + static_cast<uint64_t>(ring_head) * slot_elems
+                       + static_cast<uint64_t>(hv) * 128u * 128u;
+        __shared__ float sm_q[128], sm_k[128], sm_red[16 * 128], sm_dv[128];
+        float2 s_reg[8];
+        const float2* S_src2 = reinterpret_cast<const float2*>(S_base) + (i_beg + 4u) * 64u + lane;
+        if (!per_row) {
+            #pragma unroll
+            for (uint32_t r = 0u; r < 8u; ++r)
+                s_reg[r] = S_src2[(static_cast<int32_t>(r) - 4) * 64];
+        }
+        #pragma nounroll
+        for (uint32_t m = 0u; m < M; ++m) {
+            uint32_t mo = __builtin_amdgcn_readfirstlane(m);
+            asm volatile("" : "+s"(mo));
+            float2* S_row2 = reinterpret_cast<float2*>(S_base + static_cast<uint64_t>(mo) * slot_elems) + (i_beg + 4u) * 64u + lane;
+            if (per_row) {
+                #pragma unroll
+                for (uint32_t r = 0u; r < 8u; ++r)
+                    s_reg[r] = S_row2[(static_cast<int32_t>(r) - 4) * 64];
+            }
+            const float* base = conv_qkv + static_cast<uint64_t>(mo) * conv_dim;
+            if (tid < 128u) {
+                sm_q[tid] = base[hk * 128u + tid];
+                sm_k[tid] = base[(nk + hk) * 128u + tid];
+            }
+            __syncthreads();
+            const float g_exp = decay_in[static_cast<uint64_t>(mo) * nv + hv];
+            const float beta = beta_in[static_cast<uint64_t>(mo) * nv + hv];
+            float p0 = 0.0f, p1 = 0.0f;
+            #pragma unroll
+            for (uint32_t r = 0u; r < 8u; ++r) {
+                const float ki = sm_k[i_beg + r];
+                p0 = fmaf(s_reg[r].x, ki, p0);
+                p1 = fmaf(s_reg[r].y, ki, p1);
+            }
+            sm_red[wave * 128u + j0] = p0;
+            sm_red[wave * 128u + j0 + 1u] = p1;
+            __syncthreads();
+            if (tid < 128u) {
+                float pred = 0.0f;
+                #pragma nounroll
+                for (uint32_t w = 0u; w < 16u; ++w) pred += sm_red[w * 128u + tid];
+                const float vj = base[(2u * nk + hv) * 128u + tid];
+                sm_dv[tid] = beta * (vj - g_exp * pred);
+            }
+            __syncthreads();
+            const float dv0 = sm_dv[j0], dv1 = sm_dv[j0 + 1u];
+            float o0 = 0.0f, o1 = 0.0f;
+            #pragma unroll
+            for (uint32_t r = 0u; r < 8u; ++r) {
+                const float ki = sm_k[i_beg + r], qi = sm_q[i_beg + r];
+                s_reg[r].x = fmaf(ki, dv0, g_exp * s_reg[r].x);
+                s_reg[r].y = fmaf(ki, dv1, g_exp * s_reg[r].y);
+                o0 = fmaf(s_reg[r].x, qi, o0);
+                o1 = fmaf(s_reg[r].y, qi, o1);
+            }
+            sm_red[wave * 128u + j0] = o0;
+            sm_red[wave * 128u + j0 + 1u] = o1;
+            __syncthreads();
+            if (wave == 0u) {
+                float fo0 = 0.0f, fo1 = 0.0f;
+                #pragma nounroll
+                for (uint32_t w = 0u; w < 16u; ++w) {
+                    fo0 += sm_red[w * 128u + j0];
+                    fo1 += sm_red[w * 128u + j0 + 1u];
+                }
+                const float total_sq = vegajet::ornith_dev::wave64_sum(fo0 * fo0 + fo1 * fo1);
+                const float inv_r = rsqrtf(total_sq * (1.0f / 128.0f) + eps);
+                const float* zp = qkv_gab_in + static_cast<uint64_t>(mo) * stride_in + z_off + hv * 128u;
+                const float z0 = zp[j0], z1 = zp[j0 + 1u];
+                const float y0 = (fo0 * inv_r * ssm_norm_w[j0]) * (z0 / (1.0f + __expf(-z0)));
+                const float y1 = (fo1 * inv_r * ssm_norm_w[j0 + 1u]) * (z1 / (1.0f + __expf(-z1)));
+                float amax = fmaxf(fabsf(y0), fabsf(y1));
+                amax = fmaxf(amax, __shfl_xor(amax, 8, 16));
+                amax = fmaxf(amax, __shfl_xor(amax, 4, 16));
+                amax = fmaxf(amax, __shfl_xor(amax, 2, 16));
+                amax = fmaxf(amax, __shfl_xor(amax, 1, 16));
+                float bsum = y0 + y1;
+                bsum += __shfl_xor(bsum, 8, 16);
+                bsum += __shfl_xor(bsum, 4, 16);
+                bsum += __shfl_xor(bsum, 2, 16);
+                bsum += __shfl_xor(bsum, 1, 16);
+                const float d = amax * (1.0f / 127.0f);
+                const float inv_d = amax > 0.0f ? 127.0f / amax : 0.0f;
+                int8_t* oq = out_q8 + (static_cast<uint64_t>(mo) * nv + hv) * 128u;
+                oq[j0] = static_cast<int8_t>(max(-127, min(127, __float2int_rn(y0 * inv_d))));
+                oq[j0 + 1u] = static_cast<int8_t>(max(-127, min(127, __float2int_rn(y1 * inv_d))));
+                if ((lane & 15u) == 0u)
+                    out_ds[(static_cast<uint64_t>(mo) * nv + hv) * 4u + (lane >> 4)] = make_float2(d, bsum);
+            }
+            if (per_row) {
+                #pragma unroll
+                for (uint32_t r = 0u; r < 8u; ++r)
+                    S_row2[(static_cast<int32_t>(r) - 4) * 64] = s_reg[r];
+            }
+            __syncthreads();
+        }
+        if (per_row) return;
+        float2* S_dst2 = reinterpret_cast<float2*>(S_base) + (i_beg + 4u) * 64u + lane;
+        #pragma unroll
+        for (uint32_t r = 0u; r < 8u; ++r)
+            S_dst2[(static_cast<int32_t>(r) - 4) * 64] = s_reg[r];
+        return;
+    }
+
     const uint32_t hv   = blockIdx.x;
-    const uint32_t tid  = threadIdx.x; // 0..1023
-    const uint32_t wave = tid >> 6;    // 0..15 (each wave owns 8 rows of S!)
-    const uint32_t lane = tid & 63u;   // 0..63 (each lane owns float2 cols 2*lane, 2*lane+1)
+    const uint32_t tid  = threadIdx.x; // 0..1023: four M=1 superkernel parts in one WG
+    const uint32_t wave = tid >> 6;
+    const uint32_t lane = tid & 63u;
+    const uint32_t rg4  = (tid & 255u) >> 3;
+    const uint32_t col4 = (tid >> 8) * 8u + (tid & 7u);
+    const uint32_t wv   = (tid >> 6) & 3u;
     if (hv >= nv) return;
 
     const uint32_t hk = hv % nk;
     const uint64_t head_elems = 128ULL * 128ULL;
     const uint64_t slot_elems = static_cast<uint64_t>(nv) * head_elems;
-    const float*   S_base     = ssm_ring + static_cast<uint64_t>(ring_head) * slot_elems + static_cast<uint64_t>(hv) * head_elems;
+    const float*   S_base     = ssm_ring + static_cast<uint64_t>(use_ring == 2u ? 0u : ring_head) * slot_elems + static_cast<uint64_t>(hv) * head_elems;
 
     __shared__ float sm_q[128];
     __shared__ float sm_k[128];
-    __shared__ float sm_red[16 * 128]; // 8 KiB cross-wave reduction buffer
+    __shared__ float sm_red[4 * 128]; // four balanced wave partials per column
     __shared__ float sm_dv[128];
 
-    const uint32_t i_beg = wave * 8u;
+    const uint32_t i_beg = rg4 * 4u;
     const uint32_t j0    = lane * 2u;
 
-    // Load S ONCE into registers (16 VGPRs/thread, all offsets [-4..+3]*512 B fit signed 13-bit immediate).
-    float2 s_reg[8];
-    {
-        const float2* S_src2 = reinterpret_cast<const float2*>(S_base) + (i_beg + 4u) * 64u + lane;
-        #pragma unroll
-        for (uint32_t r = 0u; r < 8u; ++r) {
-            s_reg[r] = S_src2[(static_cast<int32_t>(r) - 4) * 64];
-        }
-    }
+    float4 s_reg[4];
+    const float4* S_src4 = reinterpret_cast<const float4*>(S_base) + (i_beg + 2u) * 32u + col4;
+    #pragma unroll
+    for (uint32_t r = 0u; r < 4u; ++r)
+        s_reg[r] = S_src4[(static_cast<int32_t>(r) - 2) * 32];
+
+    // Match ornith_m1_gdn_super_kernel: XOR 32,16,8 within each wave, then
+    // (wave0 + wave1) + (wave2 + wave3). Eight-/sixteen-row FMA chains differ.
+    auto wave_red8 = [](float v) -> float {
+        v += __shfl_xor(v, 32, 64);
+        v += __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(v), 0x401F));
+        v += __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(v), 0x201F));
+        return v;
+    };
 
     #pragma nounroll
     for (uint32_t m = 0u; m < M; ++m) {
         uint32_t mo = __builtin_amdgcn_readfirstlane(m);
         asm volatile("" : "+s"(mo));
+        // L6: independent rows use the production M=1 reduction tree, loading
+        // their own state before each row and committing to that same slot.
+        if (use_ring == 2u) {
+            const float4* row_state = reinterpret_cast<const float4*>(S_base + static_cast<uint64_t>((ring_head >> (3u * mo)) & 7u) * slot_elems)
+                                     + (i_beg + 2u) * 32u + col4;
+            #pragma unroll
+            for (uint32_t r = 0u; r < 4u; ++r) s_reg[r] = row_state[(static_cast<int32_t>(r) - 2) * 32];
+        }
         const float* base = conv_qkv + static_cast<uint64_t>(mo) * conv_dim;
         if (tid < 128u) {
             sm_q[tid] = base[hk * 128u + tid];
@@ -153,58 +292,65 @@ void ornith_gdn_recur_quant_kernel(
         const float g_exp = decay_in[static_cast<uint64_t>(mo) * nv + hv];
         const float beta  = beta_in[static_cast<uint64_t>(mo) * nv + hv];
 
-        float p0 = 0.0f, p1 = 0.0f;
+        const float k0 = sm_k[i_beg];
+        float4 p = make_float4(s_reg[0].x * k0, s_reg[0].y * k0,
+                              s_reg[0].z * k0, s_reg[0].w * k0);
         #pragma unroll
-        for (uint32_t r = 0u; r < 8u; ++r) {
+        for (uint32_t r = 1u; r < 4u; ++r) {
             const float ki = sm_k[i_beg + r];
-            p0 = fmaf(s_reg[r].x, ki, p0);
-            p1 = fmaf(s_reg[r].y, ki, p1);
+            p.x = fmaf(s_reg[r].x, ki, p.x);
+            p.y = fmaf(s_reg[r].y, ki, p.y);
+            p.z = fmaf(s_reg[r].z, ki, p.z);
+            p.w = fmaf(s_reg[r].w, ki, p.w);
         }
-        sm_red[wave * 128u + j0]      = p0;
-        sm_red[wave * 128u + j0 + 1u] = p1;
+        p.x = wave_red8(p.x); p.y = wave_red8(p.y);
+        p.z = wave_red8(p.z); p.w = wave_red8(p.w);
+        if ((tid & 56u) == 0u) reinterpret_cast<float4*>(sm_red)[wv * 32u + col4] = p;
         __syncthreads();
 
         if (tid < 128u) {
-            float pred = 0.0f;
-            #pragma nounroll
-            for (uint32_t w = 0u; w < 16u; ++w) pred += sm_red[w * 128u + tid];
+            const float pred = (sm_red[tid] + sm_red[128u + tid])
+                             + (sm_red[256u + tid] + sm_red[384u + tid]);
             const float vj = base[(2u * nk + hv) * 128u + tid];
             sm_dv[tid] = beta * (vj - g_exp * pred);
         }
         __syncthreads();
 
-        const float dv0 = sm_dv[j0];
-        const float dv1 = sm_dv[j0 + 1u];
-
-        float o0 = 0.0f, o1 = 0.0f;
+        const float4 dv = reinterpret_cast<const float4*>(sm_dv)[col4];
+        const uint64_t out_slot = use_ring == 2u ? ((ring_head >> (3u * mo)) & 7u)
+            : static_cast<uint64_t>((ring_head + mo + 1u) % VJ_GDN_RING_SLOTS);
+        float4* S_out4 = reinterpret_cast<float4*>(ssm_ring + out_slot * slot_elems
+                             + static_cast<uint64_t>(hv) * head_elems) + (i_beg + 2u) * 32u + col4;
+        float4 o;
         #pragma unroll
-        for (uint32_t r = 0u; r < 8u; ++r) {
+        for (uint32_t r = 0u; r < 4u; ++r) {
             const float ki = sm_k[i_beg + r];
             const float qi = sm_q[i_beg + r];
-            s_reg[r].x = fmaf(ki, dv0, g_exp * s_reg[r].x);
-            s_reg[r].y = fmaf(ki, dv1, g_exp * s_reg[r].y);
-            o0 = fmaf(s_reg[r].x, qi, o0);
-            o1 = fmaf(s_reg[r].y, qi, o1);
-        }
-        if (use_ring != 0u) {
-            const uint64_t out_slot = static_cast<uint64_t>((ring_head + mo + 1u) % VJ_GDN_RING_SLOTS);
-            float2* S_out2 = reinterpret_cast<float2*>(ssm_ring + out_slot * slot_elems + static_cast<uint64_t>(hv) * head_elems) + (i_beg + 4u) * 64u + lane;
-            #pragma unroll
-            for (uint32_t r = 0u; r < 8u; ++r) {
-                S_out2[(static_cast<int32_t>(r) - 4) * 64] = s_reg[r];
+            s_reg[r].x = fmaf(ki, dv.x, g_exp * s_reg[r].x);
+            s_reg[r].y = fmaf(ki, dv.y, g_exp * s_reg[r].y);
+            s_reg[r].z = fmaf(ki, dv.z, g_exp * s_reg[r].z);
+            s_reg[r].w = fmaf(ki, dv.w, g_exp * s_reg[r].w);
+            S_out4[(static_cast<int32_t>(r) - 2) * 32] = s_reg[r];
+            if (r == 0u) {
+                o = make_float4(s_reg[r].x * qi, s_reg[r].y * qi,
+                                s_reg[r].z * qi, s_reg[r].w * qi);
+            } else {
+                o.x = fmaf(s_reg[r].x, qi, o.x);
+                o.y = fmaf(s_reg[r].y, qi, o.y);
+                o.z = fmaf(s_reg[r].z, qi, o.z);
+                o.w = fmaf(s_reg[r].w, qi, o.w);
             }
         }
-        sm_red[wave * 128u + j0]      = o0;
-        sm_red[wave * 128u + j0 + 1u] = o1;
+        o.x = wave_red8(o.x); o.y = wave_red8(o.y);
+        o.z = wave_red8(o.z); o.w = wave_red8(o.w);
+        if ((tid & 56u) == 0u) reinterpret_cast<float4*>(sm_red)[wv * 32u + col4] = o;
         __syncthreads();
 
         if (wave == 0u) {
-            float fo0 = 0.0f, fo1 = 0.0f;
-            #pragma nounroll
-            for (uint32_t w = 0u; w < 16u; ++w) {
-                fo0 += sm_red[w * 128u + j0];
-                fo1 += sm_red[w * 128u + j0 + 1u];
-            }
+            const float fo0 = (sm_red[j0] + sm_red[128u + j0])
+                            + (sm_red[256u + j0] + sm_red[384u + j0]);
+            const float fo1 = (sm_red[j0 + 1u] + sm_red[128u + j0 + 1u])
+                            + (sm_red[256u + j0 + 1u] + sm_red[384u + j0 + 1u]);
             const float total_sq = vegajet::ornith_dev::wave64_sum(fo0 * fo0 + fo1 * fo1);
             const float inv_r = rsqrtf(total_sq * (1.0f / 128.0f) + eps);
             const float* zp = qkv_gab_in + static_cast<uint64_t>(mo) * stride_in + z_off + hv * 128u;
@@ -236,14 +382,6 @@ void ornith_gdn_recur_quant_kernel(
         __syncthreads();
     }
 
-    // Write final S back ONCE if not using ring (e.g., normal M=1 decode or short prompt!)
-    if (use_ring == 0u) {
-        float2* S_dst2 = reinterpret_cast<float2*>(const_cast<float*>(S_base)) + (i_beg + 4u) * 64u + lane;
-        #pragma unroll
-        for (uint32_t r = 0u; r < 8u; ++r) {
-            S_dst2[(static_cast<int32_t>(r) - 4) * 64] = s_reg[r];
-        }
-    }
 }
 
 // ============================================================================
@@ -625,7 +763,7 @@ void ornith_gdn_conv_recur_splitv_quant_m1_kernel(
 // ============================================================================
 // 5c. GDN Chunked WY/Neumann Prefill (C=16, ZERO SOLVE_TRI, 0 B spill!)
 // ============================================================================
-extern "C" __global__ __launch_bounds__(256, 3)
+extern "C" __global__ __launch_bounds__(256, 3) __attribute__((amdgpu_num_vgpr(60)))
 void ornith_gdn_wy_prefill_quant_kernel(
     float*       __restrict__ S_all,
     const float* __restrict__ conv_qkv,
@@ -667,6 +805,7 @@ void ornith_gdn_wy_prefill_quant_kernel(
         const uint32_t clen = min(C, M - m0);
         if (tid == 0u) {
             float acc = 1.0f;
+            #pragma nounroll
             for (uint32_t t = 0u; t < C; ++t) {
                 if (t < clen) acc *= decay_in[static_cast<uint64_t>(m0 + t) * nv + hv];
                 sm_cum_g[t] = acc;
@@ -697,7 +836,7 @@ void ornith_gdn_wy_prefill_quant_kernel(
         sm_QK[tid] = (valid_rc && r >= c) ? (ratio_rc * qk) : 0.0f;
         __syncthreads();
 
-        #pragma unroll
+        #pragma nounroll
         for (uint32_t s = 0u; s < 3u; ++s) {
             float p2 = 0.0f;
             if (r > c) {
@@ -720,7 +859,7 @@ void ornith_gdn_wy_prefill_quant_kernel(
         for (uint32_t j0 = 0u; j0 < 128u; j0 += 16u) {
             const uint32_t j = j0 + c;
             // Cooperatively load 128x16 tile of Sh ONCE into LDS!
-            #pragma unroll
+            #pragma nounroll
             for (uint32_t i = r; i < 128u; i += C) {
                 sm_S[i * 16u + c] = Sh[i * 128u + j];
             }
@@ -921,7 +1060,11 @@ void ornith_attn_flash_quant_kernel(
     const uint32_t d    = threadIdx.x;
     if (h >= n_q_local || m >= M) return;
 
-    const uint32_t kv_h   = (h * n_kv_local) / n_q_local;
+    const uint32_t n_kv_raw = n_kv_local & 0xFFu;
+    const uint32_t gqa_grp  = (n_kv_local >> 24) & 0xFFu;
+    const uint32_t kv_h     = (gqa_grp != 0u)
+        ? ((((n_kv_local >> 8) & 0xFFu) + h) / gqa_grp - ((n_kv_local >> 16) & 0xFFu))
+        : ((h * n_kv_raw) / n_q_local);
     const uint32_t seqlen = pos0 + m + 1u;
     const uint32_t wave   = d >> 6;
     const uint32_t lane   = d & 63u;
@@ -942,7 +1085,7 @@ void ornith_attn_flash_quant_kernel(
         #pragma unroll
         for (uint32_t j = 0u; j < 8u; ++j) {
             const uint32_t t   = min(t0 + j, t_last); // tail positions re-read the last row and are ignored below
-            const uint64_t off = (static_cast<uint64_t>(t) * n_kv_local + kv_h) * 272ULL;
+            const uint64_t off = (static_cast<uint64_t>(t) * n_kv_raw + kv_h) * 272ULL;
             const uint8_t* kc  = k_cache_q8 + off;
             const uint8_t* vc  = v_cache_q8 + off;
             const float ksc    = vegajet::ornith_dev::fp16_to_f32(reinterpret_cast<const uint16_t*>(kc)[blk]);
@@ -1015,9 +1158,14 @@ void ornith_attn_prep_flash_m1_kernel(
     const uint32_t lane   = d & 63u;
     const uint32_t blk    = d >> 5;
     const uint32_t sub    = d & 31u;
-    const uint32_t kv_h   = (h * n_kv_local) / n_q_local;
+    const uint32_t n_kv_raw = n_kv_local & 0xFFu;
+    const uint32_t gqa_grp  = (n_kv_local >> 24) & 0xFFu;
+    const uint32_t q_off_p  = (n_kv_local >> 8) & 0xFFu;
+    const uint32_t kv_off_p = (n_kv_local >> 16) & 0xFFu;
+    const uint32_t kv_h     = (gqa_grp != 0u) ? ((q_off_p + h) / gqa_grp - kv_off_p) : ((h * n_kv_raw) / n_q_local);
+    const uint32_t kv_prev  = (h > 0u) ? ((gqa_grp != 0u) ? ((q_off_p + h - 1u) / gqa_grp - kv_off_p) : (((h - 1u) * n_kv_raw) / n_q_local)) : 0xFFFFFFFFu;
     const uint32_t qg_tot = n_q_local * 512u;
-    const uint32_t kv_tot = n_kv_local * 256u;
+    const uint32_t kv_tot = n_kv_raw * 256u;
     const uint32_t half_r = rope_dims >> 1;
     const float    pos_f  = static_cast<float>(pos0);
 
@@ -1042,8 +1190,8 @@ void ornith_attn_prep_flash_m1_kernel(
             k_rot = (d < half_r) ? (sm_v[p] * c_th - sm_v[p + half_r] * s_th)
                                  : (sm_v[p] * s_th + sm_v[p + half_r] * c_th);
         }
-        const uint64_t slot_off = (static_cast<uint64_t>(pos0) * n_kv_local + kv_h) * 272ULL;
-        const bool write_kv = (h == kv_h * (n_q_local / n_kv_local));
+        const uint64_t slot_off = (static_cast<uint64_t>(pos0) * n_kv_raw + kv_h) * 272ULL;
+        const bool write_kv = (h == 0u) || (kv_h != kv_prev);
         {
             const float amax = vegajet::ornith_dev::block32_max(fabsf(k_rot));
             const float sc   = amax * (1.0f / 127.0f);
@@ -1106,7 +1254,7 @@ void ornith_attn_prep_flash_m1_kernel(
             #pragma unroll
             for (uint32_t j = 0u; j < 8u; ++j) {
                 const uint32_t t   = min(t0 + j, t_last);
-                const uint64_t off = (static_cast<uint64_t>(t) * n_kv_local + kv_h) * 272ULL;
+                const uint64_t off = (static_cast<uint64_t>(t) * n_kv_raw + kv_h) * 272ULL;
                 const uint8_t* kc  = k_cache_q8 + off;
                 const uint8_t* vc  = v_cache_q8 + off;
                 const float ksc    = vegajet::ornith_dev::fp16_to_f32(reinterpret_cast<const uint16_t*>(kc)[blk]);

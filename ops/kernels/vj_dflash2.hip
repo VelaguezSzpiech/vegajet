@@ -4,7 +4,8 @@
 //   - Block embedding init (slot 0 from Q8_0 token_embd, slots 1..B-1 from exact BF16->FP32 mask_embedding)
 //   - Dynamic grouped causal depthwise conv (K=2, G=16, side=0 with fused Q8 quant, side=1 with fused residual add)
 //   - Context KV projection norm + NeoX RoPE (HD=128, theta=1e7) + FP16 sliding-window ring write (W=2048)
-//   - Non-causal sliding-window GQA (32Q/8KV, HD=128) over [K_ctx, K_blk] & [V_ctx, V_blk] + fused Q8 quant
+//   - Sliding-window GQA (32Q/8KV, HD=128) over [K_ctx, K_blk] & [V_ctx, V_blk] + fused Q8 quant; the block is
+//     bidirectional unless the launch passes blk_causal = 1 (causal block; host decides per layer, default off)
 //   - SwiGLU + block-32 Q8 quant ([B, 9216]) & standalone FP32 -> block-32 Q8 quant
 //   - TP=2 single-pass LM-head Top-16 over output.weight for slots 1..B-1 (M <= 15)
 #include <hip/hip_runtime.h>
@@ -224,9 +225,14 @@ void vj_dflash2_kv_inject_kernel(
     v_cache_f16[dst] = __half_as_ushort(__float2half(vr[d]));
 }
 
-// 6. DFlash2 Non-Causal Sliding-Window GQA (32Q/8KV, HD=128) over [K_ctx(lo..s-1), K_blk(0..B-1)] + Q8 quant.
+// 6. DFlash2 Sliding-Window GQA (32Q/8KV, HD=128) over [K_ctx(lo..s-1), K_blk(0..B-1)] + Q8 quant.
 //    qkv_f32 [B, 6144]: per token [Q(4096) | K_blk(1024) | V_blk(1024)].
 //    grid = (n_q=32, B), block = 128.
+//    blk_causal = 0: bidirectional block on THIS layer (the shipped mask and the default of every call).
+//    blk_causal = 1: block key jb is visible to query slot i only when jb <= i (causal block, z-lab).
+//    The host owns the per-layer decision (`core/dflash_host` plan_draft_block_mask: z-lab is causal on the
+//    sliding_attention layers and bidirectional on the full layer) and only enables it inside the short-context
+//    region of the global SWA window; this kernel applies the flag it is given to this launch's layer only.
 extern "C" __global__ __launch_bounds__(128, 4)
 void vj_dflash2_attn_kernel(
     const float*    __restrict__ qkv_f32,
@@ -242,7 +248,8 @@ void vj_dflash2_attn_kernel(
     uint32_t n_kv,
     uint32_t swa_win,    // 2048
     float    rope_base,
-    float    eps) {
+    float    eps,
+    uint32_t blk_causal) {
     const uint32_t qh = blockIdx.x;
     const uint32_t i  = blockIdx.y;
     const uint32_t d  = threadIdx.x; // 0..127
@@ -298,9 +305,11 @@ void vj_dflash2_attn_kernel(
         __syncthreads();
     }
 
-    // 3. Bidirectional block keys jb in [0 .. B - 1] (ephemeral, never written to KV cache!).
+    // 3. Block keys jb in [0 .. blk_end) (ephemeral, never written to KV cache!). blk_end = B is the shipped
+    //    bidirectional block; a launch with blk_causal = 1 stops at the query's own slot (causal block).
+    const uint32_t blk_end = blk_causal ? i + 1u : B;
     #pragma nounroll
-    for (uint32_t jb = 0u; jb < B; ++jb) {
+    for (uint32_t jb = 0u; jb < blk_end; ++jb) {
         const float* kr = qkv_f32 + static_cast<uint64_t>(jb) * qkv_str + q_dim + kh * 128u;
         const float* vr = kr + kv_dim;
         const float k_raw = kr[d];

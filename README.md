@@ -12,6 +12,10 @@ I had two 32 GB AMD Instinct MI50s and wanted to know how fast they could run a 
 
 These tuned results are from development builds, not a benchmark of the downloadable binary. The speculative run used an external drafter, `--fr-spec 65536 --spec-gdn --zero-tax-catchup --suffix-max-draft 15`, and `VEGAJET_NO_AUTO_DOT8=1`. The tuned code comparisons reported **129/129 greedy tokens matching raw decode** (`first_diff=-1`). That is a token comparison, not a guarantee for every prompt or a 512-token parity test. In the separate zero-override run (`496e61b`), Hybrid accepted 100% of the draft on the repeated-code prompt and measured **311.04 / 295.43 tok/s**. The qualification recorded **0 UE / 0 DE** across the six monitored RAS blocks. The [full scorecard](#full-benchmarks) keeps the other parity oracles and ECC counts separate.
 
+### New in v0.1.1: three cards
+
+v0.1.1 is a source release that adds a third MI50 32 GB card (`--tp 3`). On three cards with the new defaults, Ornith-122B decodes at **174.25 tok/s raw** and **390.50 tok/s with Hybrid** on repeated code (**383.96 tok/s** over 512 tokens). The Hybrid output matched raw decode on all 129 compared tokens, and the six RAS blocks recorded **0 UE / 0 DE**. Three lossless speculative-decode changes are now on by default: the zero-tax suffix cascade, the LumoTree GDN verifier and `VERIFY_FAST` expert-weight reuse in the verify step. On the same three cards they took Hybrid from 338.9 to 390.5 tok/s. The [three-card scorecard](#recorded-3-mi50-32-gb-scorecard-v011) lists the commands, ablations and the levers that were measured and left off. The downloadable binary below is still `v0.1.0-alpha.1` (two cards); build v0.1.1 [from source](#build-from-source).
+
 **[Download the Linux bundle](https://github.com/VelaguezSzpiech/vegajet/releases/download/v0.1.0-alpha.1/vegajet-0.1.0-alpha.1-linux-x86_64.tar.gz) · [Two-command quickstart](#quickstart-install-and-serve-a-local-bundle) · [Full benchmarks and parity](#full-benchmarks)**
 
 ## Why I built it
@@ -26,7 +30,7 @@ I came to this through PC hardware, then 3D and software, then local inference. 
 
 | Component | Alpha support |
 | :--- | :--- |
-| GPU execution & serving | Exactly 2 × Instinct MI50 32 GB (gfx906), tensor parallel (`TP=2`) |
+| GPU execution & serving | 2 × Instinct MI50 32 GB (gfx906), tensor parallel (`TP=2`); v0.1.1 adds 3 × MI50 32 GB (`TP=3`, benchmarked with `vegajet bench`; `serve` at `TP=3` is not re-qualified in this release) |
 | GPU memory | 32 GB HBM2 per card; the runner reserves up to 30.5 GiB per GPU |
 | Host link | 32 GiB BAR0 per card and PCIe P2P between them |
 | Model | Ornith hybrid-MoE backend (`qwen35moe` / `qwen3_5_moe` / `ornith` architecture string) only |
@@ -145,6 +149,46 @@ release/linux/make-bundle.sh --no-build --build-dir build-gpu --gpu-build --rocm
 
 <a id="full-benchmarks"></a>
 
+## Recorded 3× MI50 32 GB scorecard (`v0.1.1`)
+
+Measured on three AMD Instinct MI50 32 GB cards (`gfx906`, TheRock / ROCm 7.12.0, `TP=3` with bandwidth-proportional
+shards, 150 W cap, BAR0 P2P). The scorecard runs used development build `226d3eb`, which has the same defaults as
+v0.1.1. The engine stayed resident (`vegajet bench <model-file> --tp 3 --gpu 0,1,2 --interactive-fifo <fifo>`, with
+`--draft-model <DFlash2 drafter> --mask-embedding <mask>` loaded) and each line is one warm `run` variant with no
+environment overrides. Every run in the session recorded **0 UE / 0 DE**, and the memory temperature peaked at
+**57 °C**.
+
+| Metric | 3× MI50 32 GB (Measured) | Notes |
+| :--- | :--- | :--- |
+| Decode `tg128` raw `M=1` | **174.25 tok/s** (`5.74 ms/tok`, `100 disp/tok`) | `vs_base=129/129`, short prompt 32/32; `real_read = 6.283 GB/tok`, `1,093.9 GB/s` (46.3% of calibrated) |
+| Speculative `Hybrid` `tg128` / `tg512` | **390.50 / 383.96 tok/s** (`2.24×` vs raw) | MTP K=4 plus suffix drafting on repeated code; 129/129 vs raw, 117/117 drafts accepted; repeat run 388.78 / 381.49 |
+| Same, `VEGAJET_VERIFY_FAST=0` | 376.76 / 370.71 tok/s | Same engine, between the two default runs |
+| DFlash2 K=7 alone / with Hybrid (code) | **262.85 / 382.43 tok/s** | 129/129; K=11 alone reached 283.47 tok/s on build `0282b20` |
+| Batched decode, 4 independent sequences | **213.66 tok/s aggregate** (53.4 per sequence, `1.23×` raw) | `VEGAJET_GPU_BATCH=4` at launch (keeps the ring verifier); rows agree 4/4, row 0 vs raw 129/129; B=2 is slower than raw (164.49 aggregate) |
+
+How the Hybrid default moved on the same three cards (repeated code, `tg128`, 129/129 each):
+
+| Step | Hybrid `tg128` | Default since |
+| :--- | ---: | :--- |
+| Start of the v0.1.1 cycle | 338.9 tok/s | |
+| + zero-tax suffix cascade (skip the neural drafter while the suffix trie has >= 4 confident tokens) | ~368 tok/s | v0.1.1 (`--no-zero-tax-catchup` opts out) |
+| + LumoTree GDN verifier (single-write Split-V verify with recompute-on-reject, ~783 MiB/GPU less state) | ~382 tok/s | v0.1.1 (`VEGAJET_GDN_VERIFY=ring` opts out; batch rows keep ring) |
+| + `VERIFY_FAST` (Q3 Gate+Up reuses each expert's weights across verify rows routed to it) | **390.5 tok/s** | v0.1.1 (`VEGAJET_VERIFY_FAST=0` opts out) |
+
+These levers were measured on the same rig and stay **off** by default. Each is documented in
+[`release/docs/CLI_REFERENCE.md`](release/docs/CLI_REFERENCE.md):
+
+| Opt-in lever | Measured result |
+| :--- | :--- |
+| `VEGAJET_AR_FUSED=1` (in-band epoch FP16 AllReduce wire) | raw 107.7 tok/s (-38%): per-dword polling over BAR0 costs more than one flag |
+| `VEGAJET_AR_TILE_PIPE=force` | raw -5.85% |
+| `VEGAJET_TOP8_WG0=1` | raw 172.4 tok/s (-1.1%): the serial top-8 delays Gate+Up |
+| `VEGAJET_MEGA=1` (fused persistent megakernel, 27 disp/tok) | raw 151.6 tok/s (-13%): every fused MoE stage is slower |
+| `VEGAJET_SUB4_DOT8=q3` | raw 92.0 tok/s and lossy (32-token parity 6/32): forces standalone launches |
+| `VEGAJET_SPEC_ACCEPTMOE=1` | Hybrid 275 tok/s, lossy (122/129) |
+| `VEGAJET_VERIFY_N3=1` | MTP K=4 drops from 153 to 92 tok/s |
+| `VEGAJET_KV_QUANT=q8_0` / `q4_0` / `turbo3` (short context) | 173.7 / 162.4 / 47.7 tok/s; turbo3 is lossy (122/129). Long contexts were not benchmarked in this release |
+
 ## Recorded 2× MI50 32 GB scorecard (`v0.1.0-alpha.1`)
 
 The zero-override scorecard below is from benchmark build `496e61b`, not a new benchmark of the release binary.
@@ -227,11 +271,13 @@ The optimistic raw-decode scenarios for three cards reach 530+ tok/s for Qwen3.8
 
 ## What I’m working on next
 
-For v0.1.1 I’m aiming for **~200 tok/s raw decode** and **2,000+ tok/s prefill**. Those are targets, not measurements. Three-card scaling is still unmeasured. Other work ahead:
+v0.1.1 got the three-card engine to **174.25 tok/s raw** and **390.50 tok/s Hybrid**. That is short of the ~200 tok/s raw target I set for this release. This release didn't touch prefill, so the 2,000+ tok/s prefill target is still open. Next:
 
-- Intra-superkernel barrier/L2-cache refinement (Step 3B, deferred to `v0.1.1`).
-- GPU executor support for 1, 3 and 4 cards (including TP=3 using the sealed `vj_ar_tp3_alltoall` ISA header and
-  single-GPU multi-worker serving).
+- Raw `M=1` decode on three cards. The critical path is about 5.7 ms/token: MoE Gate+Up ~0.8 ms, MoE Down ~0.7 ms
+  and about 0.9 ms of AllReduce across the 48 layers.
+- The speculative verify step. A 12-row verify still costs about 30 ms/cycle, and routed-expert weight traffic
+  dominates it.
+- Single-GPU multi-worker serving, and re-qualifying `vegajet serve` at `TP=3`.
 - Wiring multi-slot GPU continuous batching, host temperature/top-p sampling, GBNF grammar constraints, and
   multi-format tool parsers from `core/` into live GPU `vegajet serve`.
 

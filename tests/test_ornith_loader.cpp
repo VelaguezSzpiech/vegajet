@@ -164,6 +164,21 @@ void test_synthetic() {
     VJ_CHECK(model && model->name() == "ornith");
     auto& m = static_cast<OrnithModel&>(*model);
 
+    // The real loader consumes the override before sizing recurrent state, with no GPU access.
+    const char* old_vshard = std::getenv("VEGAJET_GDN_VSHARD");
+    const bool had_vshard = old_vshard != nullptr;
+    const std::string saved_vshard = old_vshard ? old_vshard : "";
+    setenv("VEGAJET_GDN_VSHARD", "2,2", 1);
+    auto split_rep = m.load(f, mi50s(2, 2048));
+    VJ_CHECK(split_rep.ok && m.gdn_shards()[1].k_groups.begin == 1);
+    VJ_CHECK(m.gdn_shards()[0].v_heads.size() == 2 && m.gdn_shards()[1].v_heads.size() == 2);
+    VJ_CHECK(split_rep.state_bytes_per_gpu[0] == split_rep.state_bytes_per_gpu[1]);
+    setenv("VEGAJET_GDN_VSHARD", "1,3", 1);
+    split_rep = m.load(f, mi50s(2, 2048));
+    VJ_CHECK(!split_rep.ok && split_rep.error.find("VEGAJET_GDN_VSHARD") == 0);
+    if (had_vshard) setenv("VEGAJET_GDN_VSHARD", saved_vshard.c_str(), 1);
+    else unsetenv("VEGAJET_GDN_VSHARD");
+
     for (size_t tp : {1, 2, 3}) {
         LoadOptions o = mi50s(tp, 2048);
         o.gpus.assign(tp, GpuTarget{60, 800.0, 1.725, 1 * GiB});
@@ -218,15 +233,51 @@ void test_synthetic() {
         VJ_CHECK(m.repack_shard_for_test(f, "blk.0.attn_qkv.weight", 0, 64, nat, ref, &err));
         VJ_CHECK(cosine(ref, nat) >= 0.995);
     }
-    // Suffix drafting with the governor warmed to high acceptance.
-    for (int i = 0; i < 40; ++i) m.governor().observe(4, 4);
-    VJ_CHECK(m.governor().k_star() > 0);
+    // EVICT prefix-depth controller drives draft_step.  Cold start still drafts; first-token rejections put the
+    // controller on the target-only path; probes recover it; full acceptance restores the configured maximum.
     std::vector<int32_t> ctx = {1, 2, 3, 4, 5, 6, 1, 2, 3};
     m.suffix_tree().extend(ctx);
-    auto dr = m.draft_step(ctx, 4);
-    VJ_CHECK(m.draft_source() == DraftSource::Suffix && dr.draft_tokens > 0 && dr.graph.empty());
+    m.evict_depth().reset();
+    const auto cold = m.draft_step(ctx, 8);
+    VJ_CHECK(m.draft_source() == DraftSource::Suffix && cold.draft_tokens > 0 && cold.graph.empty());
+    VJ_CHECK(m.evict_depth().last_choice().depth > 0 && !m.evict_depth().last_choice().target_only);
+    VJ_CHECK(m.evict_depth().last_choice().unique_experts == 0);  // cold: unknown, not top_k*layers
+    for (int i = 0; i < 4; ++i) m.evict_depth().observe(8, 0);
+    uint32_t zero_steps = 0, probes = 0;
+    for (int i = 0; i < 8; ++i) {
+        const auto d = m.draft_step(ctx, 8);
+        if (d.draft_tokens == 0) ++zero_steps;
+        else { ++probes; m.evict_depth().observe(d.draft_tokens, 0); }
+    }
+    VJ_CHECK(zero_steps > 0 && probes > 0);
+    // Depth zero is not a stall: the ordinary target decode still plans exactly one real token.
+    const auto dec_one = m.decode_step(7, 1);
+    VJ_CHECK(dec_one.tokens_in == 1 && !dec_one.graph.empty());
+    for (int i = 0; i < 20; ++i) m.evict_depth().observe(8, 8);
+    const auto full = m.draft_step(ctx, 8);
+    VJ_CHECK(full.draft_tokens > 0 && m.evict_depth().last_choice().depth == 8);
+    // A completed target pass can publish the exact distinct routed-(layer, expert) union.  The mini model has
+    // 4 MoE trunk layers, 8 experts and top-2 routing: this trace touches all 8 experts in every layer (32 keys),
+    // while a repeated trace with identical top-k/layers/token metadata would touch only 8 keys.
+    std::vector<int32_t> routes(static_cast<size_t>(4) * 16u, 0);
+    for (uint32_t layer = 0; layer < 4; ++layer)
+        for (uint32_t tok = 0; tok < 4; ++tok)
+            for (uint32_t j = 0; j < 2; ++j) routes[layer * 16u + tok * 2u + j] = static_cast<int32_t>(tok * 2u + j);
+    VJ_CHECK(m.note_route_ids(routes.data(), 4u, 4u, 2u, 16u));
+    const auto routed = m.draft_step(ctx, 8);
+    VJ_CHECK(routed.draft_tokens > 0);
+    VJ_CHECK(m.evict_depth().last_choice().unique_experts == 32);  // measured, not 4*2 metadata
+    const auto routed2 = m.draft_step(ctx, 8);
+    VJ_CHECK(routed2.draft_tokens > 0);
+    VJ_CHECK(m.evict_depth().last_choice().unique_experts == 0);  // one-shot: no stale reuse
+    VJ_CHECK(!m.note_route_ids(nullptr, 4u, 4u, 2u, 16u));       // deferred readback clears the signal
+    VJ_CHECK(!m.note_route_union(0, 4));                         // zero is unknown, never an observation
+    VJ_CHECK(m.route_feedback().take() == 0);
+    // The legacy K* governor remains available for compatibility, but draft_step now follows EVICT.
+    for (int i = 0; i < 40; ++i) m.governor().observe(4, 4);
+    VJ_CHECK(m.governor().k_star() > 0);
     std::printf("[PASS] synthetic qwen35moe: TP=1/2/3 dry-run load, Q8_0 paged KV, ReplaySSM, decode/prefill/verify graphs, "
-                "GQA boundary KV replication, suffix drafting\n");
+                "GQA boundary KV replication, suffix drafting, EVICT depth (cold/reject/probe/full)\n");
 }
 
 void test_real(const char* path, const char* draft) {
@@ -305,11 +356,14 @@ void test_real(const char* path, const char* draft) {
                     d.block_size, d.n_head, d.n_head_kv, d.head_dim, d.n_ff, d.target_layers.size(), (unsigned long long)d.mask_token);
         print_report("TP=3 + DFlash draft", m, rep);
         for (int i = 0; i < 40; ++i) m.governor().observe(8, 7);
+        for (int i = 0; i < 20; ++i) m.evict_depth().observe(8, 8);
         auto dr = m.draft_step({1, 2, 3}, 8);
         check_graph(m, dr.graph);
         VJ_CHECK(dr.draft_tokens > 0 && !dr.graph.empty());
-        std::printf("  draft_step: K*=%u -> %u draft tokens, %zu ops (alpha=%.2f)\n", m.governor().k_star(), dr.draft_tokens,
-                    dr.graph.size(), m.governor().alpha());
+        VJ_CHECK(m.evict_depth().last_choice().depth == 8 && !m.evict_depth().last_choice().target_only);
+        std::printf("  draft_step: EVICT depth %u (alpha=%.2f), K*=%u -> %u draft tokens, %zu ops\n",
+                    m.evict_depth().last_choice().depth, m.evict_depth().acceptance(), m.governor().k_star(),
+                    dr.draft_tokens, dr.graph.size());
     }
     std::printf("[PASS] real Ornith GGUF dry-run plan, sharding, graphs and repack parity\n");
 }

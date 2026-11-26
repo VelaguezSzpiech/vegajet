@@ -9,17 +9,16 @@ namespace vegajet {
 namespace ornith_super {
 
 struct GdnSuperDesc {
-    // Stage 0: Optional previous Post-MoE P2P AllReduce + RMSNorm + Q8 Quant
+    // Stage 0: Optional previous Post-MoE P2P AllReduce + RMSNorm + Q8 Quant (N=1..4)
     uint64_t x_partial;
-    uint64_t ar_local_rx_base;   // pay_base + g * kArGpuBytes
-    uint64_t ar_peer_flag;       // flg_base + peer * 4096 + (prev_slot & 63) * 64
-    uint64_t ar_local_flag;      // flg_base + g    * 4096 + (prev_slot & 63) * 64
+    uint64_t ar_local_rx_base[4]; // pay_base + g * kArGpuBytes + src * kArPeerBytes
+    uint64_t ar_local_flag[4];    // flg_base + g * kArFlagGpuBytes + src * 4096 + (prev_slot & 63) * 64
     uint64_t h_io;
     uint64_t w_attn_norm;
     uint64_t x_q8;
     uint64_t x_ds;
 
-    // Stage 1: w_gdn_qkv_gab GEMV [10304, 3072] VJ_Q4_A8
+    // Stage 1: w_gdn_qkv_gab GEMV [qkv_rows, 3072] VJ_Q4_A8
     uint64_t w_qkv_qs;
     uint64_t w_qkv_dm;
     uint64_t gdn_qkv_gab;
@@ -40,10 +39,11 @@ struct GdnSuperDesc {
     uint64_t gdn_bar;
     uint64_t gdn_sq;
 
-    // Stage 3: w_ssm_out GEMV [3072, 4096] VJ_Q4_A8 + FP16 BAR0 prepush
+    // Stage 3: w_ssm_out GEMV [3072, nv*128] VJ_Q4_A8 + 1-hop Dual-BAR0 FP16 prepush to all peers
     uint64_t w_out_qs;
     uint64_t w_out_dm;
-    uint64_t out_peer_tx_base;   // pay_base + peer * kArGpuBytes
+    uint64_t out_peer_tx_base[4]; // pay_base + dst * kArGpuBytes + g * kArPeerBytes
+    uint64_t out_peer_flag[4];    // flg_base + dst * kArFlagGpuBytes + g * 4096 + (attn_slot & 63) * 64
     uint32_t out_rows;
     uint32_t out_cols;
     uint32_t out_qs_stride;
@@ -59,21 +59,21 @@ struct GdnSuperDesc {
     uint32_t alpha_off;
     uint32_t beta_off;
     float    eps;
-    uint64_t out_peer_flag;
+    uint32_t rank;
+    uint32_t n_ranks;
 };
 
 struct GqaSuperDesc {
-    // Stage 0: Optional previous Post-MoE P2P AllReduce + RMSNorm + Q8 Quant
+    // Stage 0: Optional previous Post-MoE P2P AllReduce + RMSNorm + Q8 Quant (N=1..4)
     uint64_t x_partial;
-    uint64_t ar_local_rx_base;
-    uint64_t ar_peer_flag;
-    uint64_t ar_local_flag;
+    uint64_t ar_local_rx_base[4];
+    uint64_t ar_local_flag[4];
     uint64_t h_io;
     uint64_t w_attn_norm;
     uint64_t x_q8;
     uint64_t x_ds;
 
-    // Stage 1: w_attn_qkv GEMV [8704, 3072] VJ_Q4_A8
+    // Stage 1: w_attn_qkv GEMV [qkv_rows, 3072] VJ_Q4_A8
     uint64_t w_qkv_qs;
     uint64_t w_qkv_dm;
     uint64_t attn_qkv;
@@ -94,13 +94,17 @@ struct GqaSuperDesc {
     uint64_t mid_ds;
     uint32_t n_q_local;
     uint32_t n_kv_local;
+    uint32_t q_head_off;
+    uint32_t kv_head_off;
+    uint32_t gqa_group;
     uint32_t rope_dims;
     float    rope_base;
 
-    // Stage 3: w_o GEMV [3072, 4096] VJ_Q4_A8 + FP16 BAR0 prepush
+    // Stage 3: w_o GEMV [3072, n_q_local*256] VJ_Q4_A8 + 1-hop Dual-BAR0 FP16 prepush to all peers
     uint64_t w_o_qs;
     uint64_t w_o_dm;
-    uint64_t out_peer_tx_base;
+    uint64_t out_peer_tx_base[4];
+    uint64_t out_peer_flag[4];
     uint32_t o_rows;
     uint32_t o_cols;
     uint32_t o_qs_stride;
@@ -109,15 +113,15 @@ struct GqaSuperDesc {
     uint64_t super_bar;
     uint32_t D;
     float    eps;
-    uint64_t out_peer_flag;
+    uint32_t rank;
+    uint32_t n_ranks;
 };
 
 struct MoeSuperDesc {
-    // Stage 0: Post-Mixer Prepush FP16 P2P AllReduce + Residual + RMSNorm + Q8 Quant
+    // Stage 0: Post-Mixer Prepush FP16 P2P AllReduce + Residual + RMSNorm + Q8 Quant (N=1..4)
     uint64_t x_partial;
-    uint64_t ar_local_rx_base;
-    uint64_t ar_peer_flag;
-    uint64_t ar_local_flag;
+    uint64_t ar_local_rx_base[4];
+    uint64_t ar_local_flag[4];
     uint64_t h_io;
     uint64_t w_post_attn_norm;
     uint64_t x_norm;
@@ -141,7 +145,7 @@ struct MoeSuperDesc {
     uint32_t local_ff;
     uint32_t D;
 
-    // Stage 3-4: 4-KiB sm_grid32 IQ2_S Gate+Up (in-place Q8 quant) + Shared Down + Routed DOT8 Down + FP16 BAR0 Prepush
+    // Stage 3-4: 4-KiB sm_grid32 IQ2_S Gate+Up (or DOT8/Q3) + Shared Down + Routed DOT8 Down + Dual-BAR0 Prepush
     uint64_t w_gu_iq2s;
     uint64_t mid_q8;
     uint64_t mid_d;
@@ -150,19 +154,56 @@ struct MoeSuperDesc {
     uint64_t sh_down_out;
     uint64_t w_dn_d8_w;
     uint64_t w_dn_d8_s;
-    uint64_t out_peer_tx_base;
+    uint64_t out_peer_tx_base[4];
+    uint64_t out_peer_flag[4];
     uint32_t sh_dn_stride;
     uint32_t dn_w_stride;
     uint32_t dn_s_stride;
     float    eps;
 
     uint64_t super_bar;
-    uint64_t out_peer_flag;
     uint64_t w_gu_d8_w;
     uint64_t w_gu_d8_s;
     uint32_t gu_d8_w_stride;
     uint32_t gu_d8_s_stride;
     uint64_t mid_f32;
+    uint32_t rank;
+    uint32_t n_ranks;
+    uint32_t dn_is_sub32;
+    uint32_t pad0;
+};
+
+struct Mega48Desc {
+    uint64_t gdn_descs;          // [36] GdnSuperDesc
+    uint64_t gqa_descs;          // [12] GqaSuperDesc
+    uint64_t moe_descs;          // [48] MoeSuperDesc
+    uint64_t emb_qs;
+    uint64_t emb_ds;
+    uint64_t tok_ids;
+    uint64_t h_io;
+    uint64_t x_norm;
+    uint64_t x_q8;
+    uint64_t x_ds;
+    uint64_t x_partial;
+    uint64_t w_layer0_norm;
+    uint64_t w_out_norm;
+    uint64_t final_ar_rx[4];     // ar_rx_base_va(g, r)
+    uint64_t final_ar_flag[4];   // ar_flag_va(g, r, 95)
+    uint64_t voc_qs;
+    uint64_t voc_ds;
+    uint64_t argmax_val;
+    uint64_t argmax_id;
+    uint64_t super_bar;          // 4096 B
+    uint64_t ssm_layer_bytes;    // gdn_nv[g] * 128 * 128 * 4
+    uint64_t gdn_mask;           // bit il = 1 if layer il is GDN, 0 if GQA
+    uint32_t voc_rows;
+    uint32_t voc_off;
+    uint32_t voc_stride;
+    uint32_t D;
+    uint32_t rank;
+    uint32_t n_ranks;
+    float    eps;
+    uint32_t pad0;
 };
 
 } // namespace ornith_super

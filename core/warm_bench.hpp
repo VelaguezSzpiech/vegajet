@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -35,6 +36,12 @@ struct EnvAssignment {
     std::string key;
     std::string value;
 };
+
+// Builds a repeated-prompt raw decode workload. Empty/"0" retains the seed prompt.
+// timed_steps counts M=1 forwards after prefill (the prefill prediction is untimed).
+bool make_decode_prompt(std::string_view context, const std::vector<int32_t>& seed,
+                        uint32_t max_ctx, uint32_t timed_steps,
+                        std::vector<int32_t>& prompt, std::string* err = nullptr);
 
 // Tokenizes a command line respecting single/double quotes and '#' comments.
 bool tokenize_line(const std::string& line, std::vector<std::string>& out, std::string* err = nullptr);

@@ -119,7 +119,32 @@ static void test_hot_reload_lifecycle_invariants() {
     VJ_ASSERT(!err.empty());
 }
 
+static void test_long_context_decode_prompt() {
+    const std::vector<int32_t> seed{7, 8, 9};
+    std::vector<int32_t> prompt;
+    std::string err;
+    VJ_ASSERT(make_decode_prompt("", seed, 32768, 128, prompt, &err));
+    VJ_ASSERT(prompt == seed);
+    VJ_ASSERT(make_decode_prompt("0", seed, 32768, 128, prompt, &err));
+    VJ_ASSERT(prompt == seed);
+    VJ_ASSERT(make_decode_prompt("16384", seed, 32768, 128, prompt, &err));
+    VJ_ASSERT(prompt.size() == 16384 && prompt.back() == 7);
+    for (size_t i = 0; i < prompt.size(); ++i) VJ_ASSERT(prompt[i] == seed[i % seed.size()]);
+    VJ_ASSERT(make_decode_prompt("32640", seed, 32768, 128, prompt, &err));
+    VJ_ASSERT(prompt.size() == 32640);
+    VJ_ASSERT(!make_decode_prompt("32641", seed, 32768, 128, prompt, &err));
+    VJ_ASSERT(!err.empty() && prompt.empty());
+    VJ_ASSERT(!make_decode_prompt("32768", seed, 32768, 128, prompt, &err));
+    for (const char* bad : {"-1", "1x", " 16", "1.0", "4294967296", "999999999999999999999"})
+        VJ_ASSERT(!make_decode_prompt(bad, seed, 32768, 128, prompt, &err));
+    VJ_ASSERT(!make_decode_prompt("16", {}, 32768, 128, prompt, &err));
+    VJ_ASSERT(!make_decode_prompt("16", seed, 32768, 0, prompt, &err));
+    VJ_ASSERT(make_decode_prompt("16", seed, 32768, 128, prompt, &err));
+    VJ_ASSERT(err.empty() && prompt.size() == 16);
+}
+
 int main() {
+    test_long_context_decode_prompt();
     test_command_parsing();
     test_scoped_env_overrides();
     test_sweep_formatting();

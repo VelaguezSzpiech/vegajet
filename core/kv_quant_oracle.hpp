@@ -24,6 +24,7 @@
 // absmax formats suffer and a rotation helps).
 #pragma once
 
+#include "ops/kvq_launch.hpp"
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -71,6 +72,14 @@ void turbo3_unpack_rotated(const uint32_t* codes, const uint16_t* scales, uint32
 void turbo3_unpack(const uint32_t* codes, const uint16_t* scales, uint32_t dim, const int8_t* signs, float* out);
 float turbo3_dot_rotated(const float* q_rot, const uint32_t* codes, const uint16_t* scales, uint32_t dim);
 
+// Device cache layout reference. Input/output dimensions must be 128 or 256.
+// Signs are turbo3_signs(dim, 0x5455524230u), shared by append and attention.
+void pack_device_vector(const float* x, uint32_t dim, DeviceFormat fmt, uint8_t* out);
+void unpack_device_vector(const uint8_t* x, uint32_t dim, DeviceFormat fmt, float* out);
+// Independent two-pass CPU attention, one KV head; Q4 includes int4 query error.
+std::vector<float> device_attention_reference(const float* q, const uint8_t* k,
+    const uint8_t* v, uint32_t dim, uint32_t tokens, DeviceFormat fmt);
+
 // ---- oracles
 enum class KvFormat : uint8_t { F32 = 0, Q4Dot8 = 1, Turbo3 = 2 };
 enum class QueryPath : uint8_t { F32 = 0, I8 = 1, I4 = 2 };  // I8 / I4 only apply to Q4Dot8 keys
@@ -94,6 +103,7 @@ struct OracleStats {
     double score_rel_rms = 0;   // rms(s - s_ref) / rms(s_ref)
     double kld_mean = 0, kld_max = 0;  // KL(p_ref || p) of the softmax over keys, nats
     double top1_agree = 0;      // fraction of queries with the same argmax key
+    double out_max_abs = 0;
     double out_rel_err = 0;     // mean ||o - o_ref|| / ||o_ref||, o = softmax . V (V in v_fmt)
     double k_rel_mse = 0;       // ||k - k_ref||^2 / ||k_ref||^2 over all keys
 };

@@ -269,6 +269,7 @@ std::string to_json(const Profile& in) {
         o << "    {\"index\": " << g.index;
         o << ", \"id\": " << json::quote(g.id);
         o << ", \"bdf\": " << json::quote(g.bdf);
+        if (!g.unique_id.empty()) o << ", \"unique_id\": " << json::quote(g.unique_id);
         o << ", \"cu\": " << g.cu << ", \"n_cu\": " << g.cu;
         o << ", \"vram_bytes\": " << g.vram_bytes;
         o << ", \"mem\": " << json::quote(mem_kind_name(g.mem));
@@ -345,6 +346,9 @@ bool from_json(const std::string& text, Profile& out, std::string* err) {
         }
         if (e.get("bdf")) {
             if (!want_str(e, "bdf", g.bdf)) return set_err(err, tag + "invalid \"bdf\"");
+        }
+        if (e.get("unique_id")) {
+            if (!want_str(e, "unique_id", g.unique_id)) return set_err(err, tag + "invalid \"unique_id\"");
         }
         uint64_t u = 0;
         const bool has_cu = e.get("cu") != nullptr;

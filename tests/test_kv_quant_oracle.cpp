@@ -233,6 +233,7 @@ int main() {
                 std::printf("  %-4u %-8u %-10s %-4s %5.2f %10.5f %10.5f %10.2e %10.2e %7.3f %9.5f\n", D, outl,
                             format_name(rows[r].k), query_path_name(rows[r].qp), bits_per_value(rows[r].k), st[r].k_rel_mse,
                             st[r].score_rel_rms, st[r].kld_mean, st[r].kld_max, st[r].top1_agree, st[r].out_rel_err);
+                std::printf("    score max abs=%.7g output max abs=%.7g\n", st[r].score_max_abs, st[r].out_max_abs);
             }
             const OracleStats &q4 = st[0], &q4i8 = st[1], &q4i4 = st[2], &t3 = st[3];
             // Regression bounds on this synthetic data (roughly 2x the values measured when the oracle was written).

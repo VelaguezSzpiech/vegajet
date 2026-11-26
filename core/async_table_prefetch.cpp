@@ -18,6 +18,10 @@
 #include <cstring>
 #include <limits>
 
+#ifdef VJ_OFFLOAD_LIBURING
+#include <liburing.h>
+#endif
+
 namespace vegajet::prefetch {
 
 uint32_t row_bytes_for(RowFormat f, uint32_t elems) {
@@ -179,6 +183,7 @@ struct IoUringBackend::Pending {
 #define VJ_HAVE_IO_URING 1
 struct IoUringBackend::Ring {
     int fd = -1;
+    bool registered = false;
     void* sq_ptr = MAP_FAILED;
     size_t sq_size = 0;
     void* cq_ptr = MAP_FAILED;
@@ -204,6 +209,30 @@ struct IoUringBackend::Ring {
 #endif
 
 namespace {
+#ifdef VJ_OFFLOAD_LIBURING
+int syscall_result(int r) { if(r<0) { errno=-r; return -1; } return r; }
+#endif
+long setup_ring(unsigned entries, io_uring_params* p) {
+#ifdef VJ_OFFLOAD_LIBURING
+    return syscall_result(io_uring_setup(entries,p));
+#else
+    return syscall(__NR_io_uring_setup,entries,p);
+#endif
+}
+long register_ring(int fd, unsigned op, const void* arg, unsigned n) {
+#ifdef VJ_OFFLOAD_LIBURING
+    return syscall_result(io_uring_register(fd,op,arg,n));
+#else
+    return syscall(__NR_io_uring_register,fd,op,arg,n);
+#endif
+}
+long enter_ring(int fd,unsigned count) {
+#ifdef VJ_OFFLOAD_LIBURING
+    return syscall_result(io_uring_enter(fd,count,0,0,nullptr));
+#else
+    return syscall(__NR_io_uring_enter,fd,count,0u,0u,nullptr,0);
+#endif
+}
 template <class T> inline T load_acquire(const T* p) { return __atomic_load_n(p, __ATOMIC_ACQUIRE); }
 template <class T> inline void store_release(T* p, T v) { __atomic_store_n(p, v, __ATOMIC_RELEASE); }
 }  // namespace
@@ -215,7 +244,7 @@ IoUringBackend::IoUringBackend(IoUringOptions opt) : opt_(opt) {
     p.flags = IORING_SETUP_CLAMP | IORING_SETUP_CQSIZE;
     p.cq_entries = 2 * std::max<uint32_t>(1, opt_.entries);
     auto r = std::make_unique<Ring>();
-    r->fd = static_cast<int>(syscall(__NR_io_uring_setup, std::max<uint32_t>(1, opt_.entries), &p));
+    r->fd = static_cast<int>(setup_ring(std::max<uint32_t>(1, opt_.entries), &p));
     if (r->fd < 0) { error_ = std::string("io_uring_setup: ") + std::strerror(errno); return; }
     r->sq_size = p.sq_off.array + p.sq_entries * sizeof(uint32_t);
     r->cq_size = p.cq_off.cqes + p.cq_entries * sizeof(io_uring_cqe);
@@ -243,6 +272,10 @@ IoUringBackend::IoUringBackend(IoUringOptions opt) : opt_(opt) {
     r->cq_entries = *reinterpret_cast<uint32_t*>(cb + p.cq_off.ring_entries);
     r->cqes = reinterpret_cast<io_uring_cqe*>(cb + p.cq_off.cqes);
     for (uint32_t i = 0; i < r->sq_entries; ++i) r->sq_array[i] = i;  // identity: SQE slot = ring index
+    if (!opt_.registered_buffers.empty()) {
+        r->registered = register_ring(r->fd, IORING_REGISTER_BUFFERS,
+                                opt_.registered_buffers.data(), opt_.registered_buffers.size()) == 0;
+    }
     ring_ = std::move(r);
 #else
     error_ = "io_uring is not available on this platform";
@@ -281,6 +314,13 @@ IoUringStats IoUringBackend::stats() const {
     return st_;
 }
 
+bool IoUringBackend::buffers_registered() const {
+#ifdef VJ_HAVE_IO_URING
+    return ring_ && ring_->registered;
+#else
+    return false;
+#endif
+}
 uint32_t IoUringBackend::sq_entries() const { return ring_ ? ring_->sq_entries : 0; }
 
 void IoUringBackend::complete_inline(Pending& p) {
@@ -358,6 +398,19 @@ void IoUringBackend::pump() {
         s->off = p->offset + p->done;
         s->addr = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p->sqe_iov.data()));
         s->len = static_cast<uint32_t>(p->sqe_iov.size());
+        if (r.registered && p->sqe_iov.size() == 1) {
+            const auto& v = p->sqe_iov[0];
+            const auto addr = reinterpret_cast<uintptr_t>(v.iov_base);
+            for (size_t i=0; i<opt_.registered_buffers.size() && i<=UINT16_MAX; ++i) {
+                const auto& reg = opt_.registered_buffers[i];
+                const auto base = reinterpret_cast<uintptr_t>(reg.iov_base);
+                if (addr >= base && addr-base <= reg.iov_len && v.iov_len <= reg.iov_len-(addr-base)) {
+                    s->opcode = IORING_OP_READ_FIXED;
+                    s->addr = addr; s->len = static_cast<uint32_t>(v.iov_len);
+                    s->buf_index = static_cast<uint16_t>(i); break;
+                }
+            }
+        }
         s->user_data = tag;
         ++tail;
         ++st_.sqes;
@@ -375,7 +428,7 @@ void IoUringBackend::pump() {
             opt_.simulate_enter_errno = 0;
             ret = -1;
         } else {
-            ret = syscall(__NR_io_uring_enter, r.fd, static_cast<unsigned>(unsubmitted_.size()), 0u, 0u, nullptr, 0);
+            ret = enter_ring(r.fd, static_cast<unsigned>(unsubmitted_.size()));
         }
         if (ret >= 0) {
             const size_t took = std::min<size_t>(static_cast<size_t>(ret), unsubmitted_.size());

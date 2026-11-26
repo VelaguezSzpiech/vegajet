@@ -102,6 +102,10 @@ validation failure, 2 usage error.
 | `--ar-wire fp16\|int8` | All-reduce wire format. |
 | `--fuse-router`, `--no-fuse-router` | Fused MoE router kernel (default on). |
 | `--gdn-splitv`, `--no-gdn-splitv` | Split-V GatedDeltaNet decode (default on). |
+| `--gdn-splitv8`, `--no-gdn-splitv8` | Opt in or out of the ordered Split-V=8 GDN pair (off by default). |
+| `--no-dot8-fwht` | Disable the FWHT weight and activation rotation. |
+| `--pf-moe-iq-lds N`, `--pf-moe-iq-lds32 N` | Routed IQ prefill: 0 off, 1 Gate+Up, 2 also Down. First selects 64 rows, second the 32-row diagnostic. |
+| `--pf-moe-iq-lds-layer N` | Restrict the IQ prefill candidate to layer N. |
 | `--fuse-back`, `--no-fuse-back` | Fused MoE down/combine back end (default on). |
 | `--back-wgs N` | Workgroups for the fused back end, 1..240. |
 | `--gu-dot8-layers N` | Gate+Up layers promoted to DOT8, 0..48 (0 = automatic). |
@@ -116,12 +120,15 @@ validation failure, 2 usage error.
 | `--prefill-ar-int8` | int8 all-reduce in prefill. |
 | `--no-fast-prefill` | Disable every fast-prefill option (chunk 128, no FA2 / GEMM / GDN / tiling). |
 | `--prefill-dot8` | DOT8 prefill path (scorecard `pp*_dot8_tok_s` and `dot8_prefill_kld`). |
+| `--dot8-fwht` | With `--prefill-dot8`: block-64 orthonormal FWHT tile on the dense attention/GDN projections (rotated VJ_Q4_A8 weight copies + rotated INT4 activations; still lossy W4A4, extra ~1.3 GiB VRAM/GPU). Default off. |
+| `--dot8-fwht-layers N` | With `--dot8-fwht`: rotate only layers `0..N-1` (0 = all 48; `N=1` isolates one layer for an A/B). |
+| `--prefill-dot8 --dot8-fwht` (measured) | Two 150 W MI50s, 48 layers: pp512/pp2048 1,413.86/1,493.45 tok/s; first tokens 314/9338. Mean KL(W4A8 ∥ W4A4) 0.000939 on four 256-token prompts. Lossy, opt-in. |
 | `--dot8-clip A` | DOT8 activation clip. |
 | `--dot8-scope N` | DOT8 scope: 0 all, 1 dense only, 2 MoE Gate+Up only. |
 | `--suffix-decode` | Suffix-tree speculative decoding. |
 | `--suffix-max-draft N` | Suffix draft length, 1..15. |
 | `--spec-gdn` | Speculative GatedDeltaNet state handling. |
-| `--zero-tax-catchup` | Zero-tax catch-up after rejected drafts. |
+| `--zero-tax-catchup` / `--no-zero-tax-catchup` | Deferred draft catch-up, **default on since v0.1.1** (TP=3 Hybrid tg128 code: 338.90 -> 367.24-368.89 tok/s, tg512 323.09 -> 361.36-361.89, 129/129 lossless). Earlier opt-in measurement: On the two-card 150 W Hybrid tg128 code benchmark: 290.21 / **311.87** / 290.00 tok/s (off/on/off), all 129/129 tokens matched. Not a prose parity or general serving claim. |
 | `--fr-spec N` | FR-Spec LM-head shortlist size: 0 or a multiple of 512 up to 131072. |
 | `--mtp-k N` | MTP draft length, 1..6. |
 | `--gu-grp-verify` | Grouped Gate+Up in verify. |
@@ -280,39 +287,104 @@ Exit codes: 0 ok (end of input or `/quit`), 1 server unreachable (`GET /health` 
 | `VJ_GPU_DEVICES` | CLI, KFD runtime | GPU selection, same syntax as `--gpu` (`--gpu` wins). |
 | `VJ_SYSFS_ROOT` | `--gpu list`, GPU selection | Alternative root for the KFD topology scan (tests use a synthetic tree). |
 | `VJ_IO_URING` | table prefetch | `0` forces the thread-pool `preadv` backend instead of io_uring. |
+| `VEGAJET_MILO` | SUB4 load / offline API | `0` (default) off; `1` fits rank-16 INT3 residual factors at load, only when SUB4 is on. Adds V*x and y+=U*tmp GPU launches for M=1..8 using original Q8 activations. Offline fit_milo also supports rank32 and FP16 storage. Lossy; potentially expensive load-time CPU fit. |
+| `VEGAJET_SUB4_DOT8` | Ornith load / standalone dense dispatch | Unset (default) off; `q3` / `q2` decode source Q4_K to float via DecoderRegistry and pack VJ_Q3_DOT8 / VJ_Q2_DOT8, group64. M=1..8 uses non-FWHT Q8-to-Q4 activations. Forces the existing VEGAJET_ENABLE_SUPER=0 behavior and disables peer epilogue prepush. Loses persistent fusion; Q4 fallback remains for larger batches and fused consumers, so sidecars increase arena VRAM (reported per matrix). Load-time option: reload engine to change. |
+| `VEGAJET_TCC_XOR` | Ornith load / standalone GEMV | `0` (default) off; `1` stores/reads physical block = logical block XOR (row & 15), on both weight and scale planes. Requires K multiple of512; Q4 K=512 keeps its original W16 kernel; other unsupported shapes use original layout. Standalone Q4 M=1 or SUB4 M=1..8; forces VEGAJET_ENABLE_SUPER=0 behavior. SUB4 metadata expands to one word/block32. Logical FP32 accumulation order unchanged; Q4 fallback copy retained for larger batches/fused consumers. Load-time option: reload engine to change. |
+| `VEGAJET_BENCH_CONTEXT` | Warm Ornith `--bench-mode raw` | Decimal prompt token count; unset/`0` preserves the short prompt. Repeats the code prompt to exactly this length, prefills normally, then times decode only. Requires context + timed decode steps <= `max_ctx`; invalid counts fail before the raw measurement. Use `16384` or `32640` for 16K / near-32K with default tg128 and `max_ctx=32768`. Short golden parity remains unchanged; raw `vs_base` is scoped to context and generation length. Default off. |
+| `VEGAJET_KV_QUANT` | Ornith GPU executor, Lever 4 | `q8_0` (default, existing layout/launches), `q4_0`, or `turbo3`. Compressed tiers append prepared FP32 KV directly, then grouped attention + LSE merge for all main-model rows. Disables persistent M=1/ring super paths; extra dispatches and slower prefill are expected. Unknown values (including `fp16`) fail. Process/cache lifetime selection; MTP draft stays Q8. |
+| `VEGAJET_SPLIT_KV` | Ornith GPU executor, Lever 4 | `1` enables sealed Q8 Split-KV with one padded 16-slot tile per local KV group, including TP straddling. All main-model row counts are handled as M=1 launches. Lossless KV wire copy, lossy Q8 query quantization. Default off. Compressed KV takes priority if both toggles are set; incompatible with `VEGAJET_WIRE_ATTN`. |
+| `VEGAJET_KV_CHRONOLOGICAL` | Ornith Lever 4 attention | `1` forces S=1 chronological processing in either opt-in path. Otherwise S=1 below 1920 tokens; above that grouped KVQ uses ceil(60/local KV heads), and sealed per-group launches use S=60, giving at least 240 launched waves per rank/partition. Default off. Does not remove quantization error. |
+| `VEGAJET_SPEC_HOBBIT` | `1` enables `MoeOffload::fetch_spec` selection of an already staged lower-precision expert table for cold draft rows (rank > 0). Row 0, hot experts and top-1 use Full; absent low data falls back to Full, never Skip. Default off. Caller supplies low-format table and interprets returned precision using the selected table's `expert_bytes()`. In-place Ornith IQ2_S→DOT8 promotion retains one copy; resident Ornith currently prints a limitation and keeps its exact path. IQ2_S and DOT8 recodings in the TP=2 LRU are mathematically equivalent, not distinct precision levels. |
+| `VEGAJET_OFFLOAD_L3_CPU` | `1` enables AVX2 (scalar fallback) expert miss GEMV in `ExpertExecutor` and experimental Ornith routed Down offload; default off. |
+| `VEGAJET_OFFLOAD_L2_CUDA` | `1` enables the existing dlopen CUDA worker on NVIDIA device 0 for expert misses, with a fixed bounded matrix-session pool and CPU fallback when enabled; default off. |
+| `VEGAJET_ENGRAM_IOURING` | `1` selects io_uring registered O_DIRECT table reads in `TableExecutor`; default off; preadv/buffered fallback when unavailable. Ornith has no Engram table and does not issue table reads. |
+| `VEGAJET_BORROWED_KV` | `1` enables fixed-capacity expert hot-set ranking with decay and refresh every eight steps in `ExpertExecutor`; default off. The GPU hot callback and actual KV-space leases remain caller-owned; Ornith does not borrow its KV allocation. |
 | `VEGAJET_ENABLE_SUPER` | Ornith GPU bench | Ornith M=1 super-kernels. On by default since `950c137`; `0` turns them off. At `b74f820` and earlier they were opt-in with `1`. |
+| `VEGAJET_DECODE_FABRIC` | Ornith GPU engine | `1`: at engine init print read-only host fabric warnings (PCIe link below max or 2.5 GT/s, ACS ReqRedir on upstream bridges, Relaxed Ordering off, MaxPayload < 256, DPM clock latched <= 859 MHz under `high`, single NUMA node on a multi-die CPU). Checks needing root-only config space report `unknown`. |
+| `VEGAJET_DISPATCH_CPUS` | Ornith GPU engine | Linux cpulist (for example `0-7,16-23`): pin the host dispatch thread to these CPUs at engine init (unprivileged `sched_setaffinity`). With `VEGAJET_DECODE_FABRIC=1` and no list, the thread is pinned to the NUMA node shared by all GPUs; on a single-node (UMA) host affinity is left unchanged. |
+| `VEGAJET_GEMV_STAGGER` | Ornith GPU bench | `1` (opt-in, not bit-identical): standalone M=1 W32 GEMVs rotate each workgroup's starting 32-block tile (k_start = blockIdx*16 mod tiles) for TCC anti-camping. Super-kernel paths are unaffected. |
 | `VEGAJET_HSACO_DIR` | KFD runtime | Code-object directory when `--hsaco-dir` is not given. |
 | `VEGAJET_DISPATCH_LOG` | KFD runtime | Appends one line per kernel dispatch to this file. |
 | `VEGAJET_VRAM_QUARANTINE` | KFD runtime | `<gpu>:<offset_mib>+<len_mib>[,...]` VRAM ranges the allocator never hands out. |
 | `VEGAJET_TELEM_MS` | Ornith GPU bench | Telemetry sampling period in ms; `0` disables sampling. |
-| `VEGAJET_MOE_LRU` | Ornith GPU bench | MoE expert LRU cache slots (default 44 with `--spec-gdn`, else 0). |
+| `VEGAJET_MOE_LRU` | Ornith GPU bench | Requested maximum hot-expert slots per layer, capped at 21 and at both measured card budgets. Draft/MTP bytes already in arena use consume the 1.1 GiB reserve once; only its remainder stays free. The 2.70 GiB envelope remains a ceiling. Startup reports the actual grant, which may be lower or zero. |
 | `VEGAJET_NO_AUTO_DOT8` | Ornith GPU bench | `1` disables automatic Gate+Up DOT8 promotion. |
 | `VEGAJET_EVICT_ADAPT` | Ornith GPU bench | `1` enables the adaptive draft-length / eviction controller. |
+| `VEGAJET_ROUTER_S240` | Ornith GPU bench | Select the 240-WG router front on the nonsuper path. |
+| `VEGAJET_ROUTER_S240_SPLIT` | Ornith GPU bench | Deterministic Split-K factor, 1–8. |
+| `VEGAJET_ROUTER_S240_XOR` | One-layer fixture | Repack router and/or Gate+Up planes with matching XOR masks (0–3); production shared planes stay natural. |
+| `VEGAJET_EVICT_TRACE` | Ornith GPU bench | `1` enables verified-prefix and route provenance tracing. |
+| `VEGAJET_EVICT_ROUTE_IDS` | Ornith GPU bench | `0` disables route-ID capture for overhead comparison. |
+| `VEGAJET_V12_SPEC_GOV` | Ornith GPU bench | `1`: drive the draft depth from the measured per-M verify time (`t_ver[M]`) and the live accepted length. Default off (off = unchanged behaviour). |
+| `VEGAJET_V12_BATCH_CATCHUP` | Ornith GPU bench | `1`: ingest consecutive MTP drafter prompt and catch-up rows in one M-row forward (`M <= 16`) across all TP ranks instead of per-token M=1 forwards. Default off. |
 | `VEGAJET_SPEC_CASCADE` | speculative cascade router | `1`: route a draft cycle to the suffix-trie draft when it has enough confident tokens, else to the neural drafter (verification unchanged, lossless). `0` or unset: off. |
 | `VEGAJET_SPEC_CASCADE_MIN` | speculative cascade router | Confident suffix tokens needed for a suffix-only draft, 1..64 (default 4; other values ignored). |
+| `VEGAJET_MTP_SUFFIX_MIN4` | Ornith GPU bench | `1`: require up to four continuation tokens (bounded by MTP depth) before a suffix replaces the neural draft. Unset or any other value preserves the alpha threshold: one continuation token normally, up to four in `--zero-tax-catchup`. Default off; target verification is unchanged. |
 | `VEGAJET_PREFILL_CODEX_FA2` | Ornith GPU bench | `1`: use the 53-VGPR Codex GQA FlashAttention-2 prefill kernel (`vj_prefill_gqa_fa2`) on `M >= 16` prefill batches (default off). |
 | `VEGAJET_PREFILL_CODEX_GDN` | Ornith GPU bench | `1`: use the 128-WG Codex WY/Neumann GDN prefill pair (`vj_prefill_gdn_128wg` + `vj_prefill_gdn_128wg_normq`) on `M >= 16` prefill batches (default off). |
+| `VEGAJET_PREFILL_C2` | Ornith GPU bench | C2 macro-batch prefill: `256` or `512` (dense + MoE macro batch M), optionally `:16` or `:32` (planned GDN sub-chunk C, default 32). Runtime GDN still consumes the whole macro batch; sub-chunk device dispatch and MTP/DFlash2 prefill scheduling are not integrated or qualified. Shapes whose scratch does not fit the rows allocated for `--prefill-chunk` keep the current path. Unset, `0` or `off`: current path (default). |
 | `VEGAJET_AB_W64` | Ornith GPU bench | `1`: A/B wave64 GEMV variant. |
 | `VEGAJET_AB_NO_SPLITKV` | Ornith GPU bench | `1`: A/B without split-KV attention. |
+| `VEGAJET_AB_NO_FUSED_ATTN` | Ornith GPU bench | A/B control: `1` disables fused M=1 prep+flash on the nonsuper path. Default off. |
+| `VEGAJET_WIRE_ATTN` | Ornith GPU engine | Opt-in normal decode/verify sealed attention. `1` selects Q8; `q4` selects lossy Q4. Unset or `0`: unchanged production path (including default-on super). Selecting wire attention disables super/fused/automatic split/spec-flash attention for that arm; M >= 16 prefill stays on FlashAttention-2. Q8 also quantizes Q: model parity is not established. |
+| `VEGAJET_WIRE_ATTN_Q4` | Ornith GPU engine | `1` allows lossy Q4 wire format when wire attention is selected; default off. |
+| `VEGAJET_WIRE_ATTN_STRICT` | Ornith GPU engine | `1` aborts on a requested decode/verify fallback, including unsupported batch widths. Default off. Only fully enqueued producer/partition/merge/epilogue sequences count as engaged, not fallbacks or device parity. |
+| `VEGAJET_WIRE_ATTN_EXERCISE` | Ornith GPU engine | `1` relaxes the production short-context split floor for explicit diagnostic exercise. Default off. |
+| `VEGAJET_WIRE_ATTN_MAX_SPLITS` | Ornith GPU engine | Split ceiling for selected wire attention, 2..64 (default 64). |
+| `VEGAJET_TREEWY` | Ornith GPU engine | `1` opts into the sealed GDN tree-WY verifier with `--spec-gdn` for ring verification widths 5, 8 or 12 (context token included). Default off; unset, empty, `0`, `off`, `false` or `no` disables it. Requires both shards' verify/commit, existing norm/quant and independent GDN input-pack modules. Missing modules or unsupported cycles retain sequential verification; a selected-cycle enqueue/commit failure is fatal. CPU/ISA qualification is not device parity or speed acceptance. |
+| `VEGAJET_TREEWY_FORCE_WIDTH` | Ornith GPU engine | Diagnostic only: 5, 8 or 12 pads/truncates the draft to width minus one with `--spec-gdn`. Default 0 (no override). Applies to both sequential and TreeWY arms, even with `VEGAJET_TREEWY=0`; omit for natural-use measurements. |
+| `VEGAJET_TREEWY_FORCE_ACCEPT` | Ornith GPU engine | Diagnostic only with `--spec-gdn`: `natural` (default), `reject` (zero accepted drafts, context still committed), or `prefix:N` (at most N naturally accepted drafts). `full` is a compatibility alias for natural, never forced acceptance. Applies to both arms and never changes target predictions; omit for parity/timing. |
+| `VEGAJET_TREEWY_VERBOSE` | Ornith GPU engine | `1` prints TreeWY configuration, cycle/fallback and acceptance-clamp diagnostics; default off. Final counters describe host dispatch, not verified device execution. |
 | `VEGAJET_AB_F2_FRONT` | Ornith GPU bench | `1`: A/B fused front-end variant. |
 | `VEGAJET_AB_B2_BACK` | Ornith GPU bench | `1`: A/B fused back-end variant. |
 | `VEGAJET_DFLASH2_GPU0` | Ornith GPU bench | Run the DFlash2 drafter on GPU 0 instead of GPU 1. |
 | `VEGAJET_DFLASH2_TAP_SHIFT` | Ornith GPU bench | Integer shift of the drafter's target-layer taps (diagnostic). |
 | `VEGAJET_DFLASH2_NO_SEL` | Ornith GPU bench | Skip the DFlash2 selector walk (diagnostic). |
 | `VEGAJET_DFLASH2_DEBUG` | Ornith GPU bench | Verbose DFlash2 draft / accept logging. |
+| `VEGAJET_DFLASH2_BLOCK_MASK` | Ornith GPU bench | DFlash2 drafter block mask. `bidir` or unset: the shipped mask, a bidirectional block on every drafter layer. `zlab`: the reference's per-layer mask (causal block on the `sliding_attention` layers, bidirectional on the full-attention layer) as an opt-in short-context arm; `causal`: causal block on every layer (control). Both arms apply only while `s_pos + B <= attention.sliding_window` (the global window, never a per-layer ring) and refuse to start (`zlab`/`causal`) when the draft GGUF has no `dflash.attention.sliding_window_pattern`; any other value is refused. |
 | `VEGAJET_DF_FULL_VOCAB` | Ornith GPU bench | DFlash2 LM head over the full vocabulary instead of the FR-Spec shortlist. |
 | `VEGAJET_FR_SPEC_ROWS` | FR-Spec draft head | Draft-vocabulary rows: `32k`, `64k`, `<n>k` or a row count, rounded up to 256 rows per rank and clamped to the vocabulary. `0`, `off` or unset: full vocabulary. Not wired into a runner yet. |
 | `VEGAJET_DF_SWEEP` | Ornith GPU bench | Sweep DFlash2 (k, p_min) settings after the bench. |
 | `VEGAJET_VA_CLUSTER` | KFD runtime | `1`: map the always-read (HOT) tensors into the first arena chunks (default 5 x 512 MiB) for TLB locality. Off by default. |
 | `VEGAJET_VA_HOT_MIB` | KFD runtime | HOT-tier size in MiB with `VEGAJET_VA_CLUSTER` (overrides the default 2560); `0` turns clustering off. |
 | `VEGAJET_VOCAB_MUBUF` | Ornith GPU bench | `1`: M=1 greedy vocab argmax through the MUBUF kernel variant. Off by default. |
+| `VEGAJET_HEAD_Q4` | Ornith GPU bench, serve | `1`: greedy argmax (all M, so speculative verify agrees with plain steps) through a Q4 copy of the LM head (lossy, full-vocab KL 0.011 vs Q8; raw decode ~+2.5 %, speculative throughput unchanged; ~+1 GiB/GPU). Off by default. |
+| `VEGAJET_MEGA` | Ornith M=1 GPU decode | `1` enables the Wave 2 persistent Q3 megakernels at TP=3 (default off). Requires the normal super path, 240 WGs, 60+ CUs/rank, MoE local FF 384/320/320, Q3 GU and sub32 Down on every layer. Incompatible super experiments (`VEGAJET_DN_K4=1`, `VEGAJET_GU_PAIR=1`, forced AR tile tags), route capture, and other unsupported configurations retain the existing path. Three GDN+MoE layers and one GQA+MoE layer use two dispatches per four layers; final AR is folded into layer 47. Embedding, initial RMS and per-rank LM head stay separate: 100 → 27 dispatches/token with logits. Intended lossless; GPU token parity must be checked against the default path. Reserves 4 KiB barrier scratch and a disjoint diagnostic region (20 KiB total/rank). Local Top8 removes 48 full-grid barriers/token; lane-zero generation updates remove one WG barrier per grid handoff. The ordinary super stage replay is suppressed; use `VEGAJET_MEGA_PROFILE=1` for fused stage endpoints and unprofiled A/B for throughput. Warm-switchable. Measured in v0.1.1: raw 151.6 vs 174.4 tok/s (-13%), parity 129/129. |
+| `VEGAJET_MEGA_PROFILE` | Ornith raw benchmark diagnostic | `1` with `VEGAJET_MEGA=1` enables critical-path `s_memrealtime` endpoints for one additional fused decode token after the throughput measurement (default `0`, off). Replays the same prompt and the first half of the generated tokens, then profiles the middle context position. Uses 97 disjoint 17-u64 records at scratch offset 4096, the `VEGAJET_SUPER_PROFILE=2` slot ordering, max over all 240 WGs per endpoint, and a separate final-AR record. Prints per-rank GDN/GQA/MoE buckets, record coverage and stage sum; timestamp/barrier/atomic overhead perturbs the diagnostic, which is excluded from tok/s. Ordinary super profiling now uses the same middle context position for comparisons. Unsupported mega configurations print a fallback notice. Warm-switchable; requires the rebuilt host binary and mega module. |
 | `VEGAJET_SUPER_WGS` | Ornith GPU bench | Workgroups per M=1 super-kernel launch, 192..240 (default 240; other values ignored). |
+| `VEGAJET_SPEC_GATE` | Ornith GPU bench | `0` disables the DFlash2/Hybrid acceptance gate (core/spec_gate.hpp), which runs exact raw single steps while speculation emits fewer tokens per ms than raw. On by default; lossless. |
 | `VEGAJET_MOE_Q3_FAST` | Ornith GPU bench | `0` turns off the dedicated Q3 MoE super-kernel. On by default; it is used only at 240 workgroups on layers whose Gate+Up is in the VJ_Q3_IQ2S layout (`VEGAJET_GU_Q3`). |
-| `VEGAJET_SUPER_PROFILE` | Ornith GPU bench | `1`: after the raw bench, a per-stage `s_memrealtime` profile of the super-kernels (diagnostic). |
+| `VEGAJET_VERIFY_PROFILE` | Ornith GPU speculative verify | `1`: timestamp the first eligible ring verify for each M (2..16) with queue-boundary `kfd_stamp_clock_u64` on every rank; print stage ms and rank-0 per-layer expert union/pair counts. Default off. Disable between warm runs to re-arm; excluded from `--pp-stages`. Instrumentation adds dispatches and serializes overlapping stage boundaries; use unprofiled A/B for throughput. |
+| `VEGAJET_VERIFY_FAST` | Ornith GPU TP=3 speculative verify | `1`: Q3 Gate+Up pairs consecutive routes to each expert, sharing weight loads between two rows with unchanged per-row arithmetic order. **Default on** since 2026-11-27 (W11: Hybrid tg128 378.4 -> 389.6, tg512 371.5 -> 383.0, 129/129); `0` disables. M=2..16 ring only; missing optional `vj_verify_moe.hsaco` or non-Q3 layers retain existing kernels. CPU oracle/gates only; GPU parity and performance pending. |
+| `VEGAJET_VERIFY_N3` | Ornith standalone MoE front | `1`: allow N-agnostic F2 and s240 router/shared-GU kernels at TP=3 after checking all ranks. Default off. Existing F2/s240 selectors still required; these are M=1 standalone paths, so this does not change persistent M=1 or M>1 verify. Single-peer AR and fixed-512 Down guards remain. GPU parity pending. Measured in v0.1.1: MTP K=4 drops from 153 to 92 tok/s; Hybrid unchanged. |
+| `VEGAJET_SUPER_PROFILE` | Ornith GPU bench | `1`: WG0 stage profile after the raw bench. `2`: select all four `_x` super-kernels even with feature bits clear; additionally print `[SUPER-PROFILE critical-path ...]`, using per-dispatch maximum stage-end `s_memrealtime` over WGs and WG0 start (diagnostic overhead included). Off by default. |
+| `VEGAJET_TOP8_WG0` | Ornith M=1 GPU bench | `1`: experimental MoE `_x` kernels compute Top-8 only in WG0 and publish the existing 64-byte ids/weights slot through the existing router rendezvous (opaque entry bit 24). No extra grid barrier or LDS allocation. Default off; same arithmetic. Measured in v0.1.1: raw 172.4 vs 174.3 tok/s (-1.1%), parity 129/129. Compare critical-path `Rtr+ShGU` plus `Top8` and TOTAL: the router stamp moves before the fused rendezvous. Applies to the Q3 MoE super kernel (the decode default) in decode and SUPER_PROFILE; compiled out of the standard MoE `_x` kernel for the code-size cap; other paths unchanged. |
+| `VEGAJET_GDN_VSHARD` | Ornith load-time | Unset/empty/`0`: existing BW-proportional GDN split. `a,b,c` (one count per TP rank) overrides V-head counts: positive multiples of model V/K, sum exactly V, no empty K shards. `auto` minimizes max(K-groups/rank bandwidth), retaining the existing split on ties. K groups, physical V-head maps, weight rows and recurrent states follow the same plan. Rejects splits exceeding the persistent Split-V grid. Needs an engine restart; FIFO `run` cannot repartition loaded weights. Boundaries change local projection/AR rounding; require 129/129 code and 32/32 parity. Default off. |
+| `VEGAJET_RAW_TOKEN_REFERENCE` | Ornith warm raw bench | `save:PATH` writes the raw code token IDs (129 for tg128); `check:PATH` checks against that file across engine restarts. Missing/malformed references fail the variant, and token mismatches fail parity. Off when unset; otherwise replaces the process-local `vs_base` oracle, retaining the 32-token golden check. Save only from the baseline, then use check for all variants. |
 | `VEGAJET_RAW_TG512` | Ornith GPU bench | `1`: also measure raw M=1 over 512 tokens after tg128. |
+| `VEGAJET_TP3_EP` | Ornith GPU bench | `0` turns off the TP=3 speculative-verify (M = 2..16) epilogue prepush: the GDN / GQA out-projection GEMMs and the sub32 MoE Down then leave the FP16 peer push to the N-way AllReduce. On by default. |
+| `VEGAJET_GU_STREAM` | Ornith GPU bench | `1`: Q3 MoE super-kernel Gate+Up uses MUBUF magnitude/sign/scale loads with uniform descriptors and immediate batch offsets (opaque bit 26 in `vj_ornith_super_x`). Keeps single-tile workgroups and the original FMA/reduction order; intended bit-identical output. Selects only the Q3 experimental kernel in decode and SUPER_PROFILE. Off by default. |
+| `VEGAJET_GU_PAIR` | Ornith GPU bench | `1` (TP >= 3): the Q3 MoE super-kernel Gate+Up stage runs in pair mode (one workgroup computes both 16-row tiles of a 32-row quant block and quantizes from LDS: no `mid_f32` round trip, no `pair_cnt` atomic) using the `vj_ornith_super_x` kernels; bit-identical `mid_q8` / `mid_d`. Off by default. |
+| `VEGAJET_DN_K4` | Ornith GPU bench | `1` (TP >= 3): the `_x` Q3 MoE Down stage (sub-32 layers) balances 3072 rows over 240 WGs (192 x 13 + 48 x 12), replacing the 8-slot prefetch experiment. A grid handoff preserves aligned 8-row FP16 prepush packets and tags; same slot order 0..7 and FMA chain, bit-identical output expected. Off by default. |
+| `VEGAJET_AR_FUSED` | Ornith GPU bench | `1` (default off): TP >= 3, M=1 `_x` super-kernels use per-dword FP16 + 16-bit epoch wire readiness (opaque bit 25), final AR mode 4; doubles wire bytes, skips grid-counted flag/fences. Takes precedence over AR_TILE_PIPE and disables MEGA. Entire steps fall back to flags when epoch + 96 >= 65536 to prevent tag alias. Measured in v0.1.1: raw M=1 107.7 vs 174.3 tok/s (-38%), parity 129/129; stays off. |
+| `VEGAJET_AR_TILE_PIPE` | Ornith GPU bench | `force` (TP >= 3, M=1 super-kernel path, A/B only): super-kernel epilogues post one ready tag per 16-byte FP16 packet and consumers wait per chunk instead of on the grid-counted peer flag; uses the `vj_ornith_super_x` kernels. Measured slower at M=1 (-5.9 %, 6 KiB payload, no producer skew), and the multi-row paths do not use super-kernels, so `1` is ignored (one-time note) and the flag path stays. |
+| `VEGAJET_TRUST_HW_PROFILE` | Ornith GPU bench | `1`: on TP >= 3, skip the ~3 ms live HBM bandwidth probe and shard from the cached hardware profile (deterministic split). |
+| `VEGAJET_GDN_VERIFY` | Ornith GPU engine | Load-time GDN speculative-verify mode: `lumotree` = single-write Split-V verify with recompute-on-reject (same as `--spec-gdn`; **default** since 2026-11-27 unless `VEGAJET_GPU_BATCH>=2` is set at load: Hybrid +3.3 %, lossless, ~783 MiB/GPU less state), `treewy` = that plus the sealed tree-WY verifier (`VEGAJET_TREEWY=1`, TP=2 only), `ring` = per-token ring states (opt-out; required for independent batch rows). |
+| `VEGAJET_SPEC_CASCADE` | Ornith GPU engine | `1`/`0` forces the zero-tax suffix cascade on/off (same as `--zero-tax-catchup` / `--no-zero-tax-catchup`): the neural drafter is skipped while the CPU suffix trie returns at least 4 confident tokens. |
+| `VEGAJET_SPEC_EVICT` | Ornith GPU engine | `1` turns on lossless EVICT expert-union adaptation for DFlash2 drafting (sets `VEGAJET_EVICT_ADAPT=1` unless already set). |
+| `VEGAJET_SPEC_ACCEPTMOE` | Ornith GPU engine | `1` (opt-in, lossy): speculative verify uses historical union-biased routing. Default off. Eligible ring-super batches (M=2..8) retain exact routing in both modes, as before agent F; only standalone verify batches use AcceptMoE. Prefill and independent batch rows are unchanged. |
+| `VEGAJET_ACCEPTMOE_MODE` | Ornith GPU engine | `plain` (default) or `commit` (explicit experiment). Plain uses the pre-F kernel and ignores acceptance/recency controls. Commit enables commitment weighting and cold-expert pruning on standalone verify batches. `ACCEPTANCE=1` plus `COLD_PENALTY=1` or `LRU_WINDOW=0` dispatches the identical plain kernel. Re-read every warm step; unknown values fall back to plain. |
+| `VEGAJET_ACCEPTMOE_LEGACY_PREFILL` | Ornith GPU engine | `1` (default off): plain or plain-equivalent commit also biases prompt prefill, reproducing the pre-F scope. Diagnostic only: the benchmark raw reference then shares lossy prompt state, so its parity counter is not parity against AcceptMoE-off decoding. Independent batch rows remain exact. |
+| `VEGAJET_ACCEPTMOE_KEEP` | Ornith GPU engine | Own top experts kept per draft token, 1..8 (default 2). |
+| `VEGAJET_ACCEPTMOE_PENALTY` | Ornith GPU engine | Nonunion multiplier, 0..1 (default 0.25). In commit mode position m uses `1 - acceptance^m * (1 - penalty)`. Ranking bias never becomes an output weight. |
+| `VEGAJET_ACCEPTMOE_ACCEPTANCE` | Ornith GPU engine | Commit mode only: conditional acceptance estimate, 0..1 (default 0.75); position m has commitment `acceptance^m`. One restores plain union preference. Zero disables union preference but does not disable cold bias. This is a model parameter, not measured acceptance. |
+| `VEGAJET_ACCEPTMOE_COLD_PENALTY` | Ornith GPU engine | Commit mode only: cold-expert multiplier on unprotected ranks, 0..1 (default 0.5); one disables pruning. Own top-KEEP and row 0 are protected. |
+| `VEGAJET_ACCEPTMOE_LRU_WINDOW` | Ornith GPU engine | Commit mode only: recency horizon in verify cycles (default 8); zero disables pruning. Frozen per-layer/per-rank metadata resets per request and records the entire proposed union, including rejected drafts. Never-seen experts start cold. No HBM eviction or weight deletion. |
+| `VEGAJET_GPU_BATCH` | Ornith bench and serve | `1..8`, unset/`1` keeps single-slot serving. `2..8` enables the request scheduler and fixed physical slots, one batched decode call over active rows (including singleton tails), greedy streaming, per-sequence context `--ctx/8`. Prompt chunks use scratch recurrent state and copy back into the physical slot; KV pointers rebase to that sequence segment. Serve selects the full state arena (`VEGAJET_RAW_ONLY=0`). Bench reports aggregate throughput and raw greedy parity; incompatible with `--spec-gdn` and raw-only allocation. |
+| `VEGAJET_OFFLOAD_EXPERT_FRAC` | Ornith load | Fraction `0..1`, default `0` preserves all-resident allocation. Experimental TP=3 sub32 routed **Down slices only**: lowest-frequency experts (startup frequencies tie, id order) remain on host, compact resident Down weights plus one zero expert, misses execute via L2 CUDA or L3 CPU and merge before TP reduction. Gate/Up remains resident. Requires one execution tier enabled. Load-time setting: restart to change; not a warm-run mutation. Floating-point reduction differs; tolerance parity, not bit-exact. |
 | `VEGAJET_RAW_ONLY` | Ornith GPU bench | `1`: raw M=1 only; skips the MTP head and uses the smaller raw-only VRAM budget for DOT8 promotion. |
 | `VEGAJET_GU_DOT8_LAYERS` | Ornith GPU bench | Number of Gate+Up layers to promote to DOT8 (overrides the automatic choice; `0` = automatic). |
-| `VEGAJET_GU_Q3` | Ornith GPU bench | `1` (any value > 0): routed Gate+Up as lossless 3-bit VJ_Q3_IQ2S in place on all 48 layers. Off by default. |
+| `VEGAJET_GU_Q3` | Ornith GPU bench | `1` (any value > 0): routed Gate+Up as 3-bit VJ_Q3_IQ2S in place on all 48 layers (~+1.5 % raw). **Lossy** in practice: decode-trace max KL 3.5 vs the IQ2_S path, code parity 15/129. Off by default, including `serve`. |
 | `HOME` | doctor, roofline profile | Location of `~/.config/vegajet/hw_profile.json` (unset: a file under `/tmp`). |
 
 ## Exit codes
@@ -323,3 +395,40 @@ Exit codes: 0 ok (end of input or `/quit`), 1 server unreachable (`GET /health` 
 | 1 | No subcommand given; model / tokenizer unreadable; plan does not fit; a doctor check, validation or soak pattern check failed. |
 | 2 | Usage error: unknown subcommand or option, bad value, invalid GPU selection, `--tp` mismatch. |
 | 3 | GPU backend or engine unavailable (CPU-only build, no engine for the architecture), runtime / execution failure, server bind failure. |
+
+Ornith warm `run ... --bench-mode raw --n-predict N` extends the raw timing run
+when N > 128 (including N=4096 for long-context KV tests). The ordinary raw run
+remains 128 timed tokens. The spec benchmark retains its fixed verify fixtures.
+Lever 4 buffers and kernels are reserved at interactive/sweep initialization;
+KV format changes apply only between variants, whose caches are reset and prefilled.
+
+### Lever 5 speculative cycle measurements
+
+`--bench-mode spec` emits `[spec_cycle_ms verifier=... source=suffix|mtp|dflash2]`
+with mean draft / verify / catch-up / recompute-on-reject / total milliseconds per
+speculative cycle. Timings surround completed device submissions; rejection state
+reconstruction is charged only to recompute, not catch-up. MTP deferred ingestion
+is catch-up. Raw governor fallback cycles are excluded. The label is the effective
+verifier: a TreeWY fallback is reported as lumotree. Verifier state layout and
+TreeWY backend are selected at engine load time; restart with
+`VEGAJET_GDN_VERIFY=ring|lumotree|treewy` to compare layouts. Warm attempts to change
+an incompatible layout fail explicitly. TreeWY currently supports TP=2, so TP=3
+cannot provide a TreeWY measurement. No default verifier change is made here.
+
+AcceptMoE is lossy opt-in even though the committed context row is exact. After
+zero drafts are accepted, the correction is from exact row 0. After a nonzero
+accepted prefix, correction logits and cached state may depend on lossy draft
+rows; row-0 exactness alone does not guarantee lossless greedy generation. Use
+unbiased settings (`KEEP=8`, or `PENALTY=1 COLD_PENALTY=1`) for exact
+standalone routing. These differ from **plain-equivalent** commitment settings
+(`MODE=commit ACCEPTANCE=1 COLD_PENALTY=1`), which reproduce the historical lossy
+plain policy and dispatch. Plain restores the historical verify path. Historical full-run reproduction
+also requires `LEGACY_PREFILL=1`: pre-F routing unintentionally biased prompt
+prefill, including the benchmark's own raw reference. Its 129/129 counter therefore
+does not prove parity against AcceptMoE-off decoding. Neither mode guarantees
+parity for arbitrary prompts or standalone verify widths. The pre-F K=4 result included exact ring batches: it is not evidence
+that weighted routing improves MTP acceptance.
+HOBBIT fetch selection similarly requires exact target re-verification if its low
+format is used in a target verifier. Its policy does not itself provide that replay.
+
+L4 M=1 decode (`VEGAJET_KV_QUANT=q4_0|turbo3` or `VEGAJET_SPLIT_KV=1`) selects the optional `vj_ornith_gqa_kvq.hsaco` module on every rank, retaining baseline GDN/MoE super-kernels. Absent module or forced AR tile tags keeps the standalone fallback. Compressed prefill/verify uses native KVQ; the M=1 copy uses FP32 queries and native Q8/Q4/Turbo3 cache, without padded wire queries. All L4 toggles remain default off. `VEGAJET_KV_CHRONOLOGICAL=1` uses one chronological flash chunk. Compressed attention is lossy; changed query quantization and floating association can change tokens.

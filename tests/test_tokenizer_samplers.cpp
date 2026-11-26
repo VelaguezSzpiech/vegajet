@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cmath>
 #include <random>
+#include <time.h>
 
 using namespace vegajet;
 using bpe::PreTok;
@@ -546,6 +547,12 @@ constexpr bool kSanitized = false;
 constexpr bool kSanitized = false;
 #endif
 
+double thread_cpu_us() {
+    timespec ts{};
+    VJ_CHECK(clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) == 0);
+    return static_cast<double>(ts.tv_sec) * 1e6 + static_cast<double>(ts.tv_nsec) / 1e3;
+}
+
 void test_latency() {
     // LLM-like logits: a N(0, 1.5) bulk over the vocabulary plus a few dominant tokens that move every step
     // (~1 % tail mass at temperature 1). Frames are prepared outside the timed region.
@@ -556,17 +563,65 @@ void test_latency() {
     for (auto& f : bulk) for (auto& x : f) x = nd(g);
     std::vector<float> frame(V);
     std::uniform_int_distribution<int32_t> tok(0, static_cast<int32_t>(V) - 1);
-    auto bench = [&](sampling::StackParams p, const char* label, int* fallbacks) {
+    auto bench = [&](sampling::StackParams p, const char* label, int* fallbacks, double work_budget = 0.0) {
         sampling::SamplerStack s(p);
-        for (int k = 0; k < 512; ++k) s.accept(tok(g));  // history for penalties / DRY
-        std::vector<double> us;
+        auto serial_params = p;
+        serial_params.threads = 1;
+        sampling::SamplerStack serial(serial_params);
+        for (int k = 0; k < 512; ++k) {
+            const auto id = tok(g);
+            s.accept(id);
+            serial.accept(id);
+        }
+        std::vector<double> us, serial_us, reference_us, work_ratios;
         for (int t = 0; t < 300; ++t) {
             frame = bulk[static_cast<size_t>(t) % bulk.size()];
             for (int k = 0; k < 6; ++k) frame[static_cast<size_t>(tok(g))] = 18.0f - 1.5f * static_cast<float>(k);
+            sampling::SampleResult serial_result;
+            if (work_budget > 0.0) {
+                double sample_cpu = 0.0, reference_cpu = 0.0;
+                auto sample_serial = [&] {
+                    const double start = thread_cpu_us();
+                    serial_result = serial.sample(frame.data(), frame.size());
+                    sample_cpu = thread_cpu_us() - start;
+                };
+                auto reference_work = [&] {
+                    const double start = thread_cpu_us();
+                    // Independent scalar O(V) work, not another call into the sampler:
+                    // a max pass plus a full double-precision exp normalizer.
+                    const double m = *std::max_element(frame.begin(), frame.end());
+                    double z = 0.0;
+                    for (float x : frame) z += std::exp(static_cast<double>(x) - m);
+                    reference_cpu = thread_cpu_us() - start;
+                    VJ_CHECK(std::isfinite(z) && z >= 1.0);
+                };
+                // Pair on the same frame and alternate order to balance cache/frequency effects.
+                // Thread CPU time excludes descheduling and idle OpenMP worker spin time.
+                if (t % 2) { reference_work(); sample_serial(); }
+                else { sample_serial(); reference_work(); }
+                VJ_CHECK(sample_cpu > 0.0 && reference_cpu > 0.0);
+                if (t >= 10) {  // exclude allocation / cold-start warmup, not slow measured samples
+                    serial_us.push_back(sample_cpu);
+                    reference_us.push_back(reference_cpu);
+                    work_ratios.push_back(sample_cpu / reference_cpu);
+                }
+            }
             const auto t0 = std::chrono::steady_clock::now();
             const auto r = s.sample(frame.data(), frame.size());
             const auto t1 = std::chrono::steady_clock::now();
-            VJ_CHECK(r.id >= 0);
+            VJ_CHECK(r.id >= 0 && static_cast<size_t>(r.id) < V);
+            if (work_budget > 0.0) {
+                // Exercise the unchanged default team as well as the timed serial path.
+                VJ_CHECK(r.id == serial_result.id && r.logprob == serial_result.logprob);
+                VJ_CHECK(r.n_candidates == serial_result.n_candidates);
+                VJ_CHECK(r.full_vocab_fallback == serial_result.full_vocab_fallback);
+                VJ_CHECK(r.top.size() == serial_result.top.size());
+                for (size_t i = 0; i < r.top.size(); ++i) {
+                    VJ_CHECK(r.top[i].id == serial_result.top[i].id);
+                    VJ_CHECK(r.top[i].logprob == serial_result.top[i].logprob);
+                }
+                serial.accept(serial_result.id);
+            }
             if (fallbacks) *fallbacks += r.full_vocab_fallback;
             s.accept(r.id);
             us.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
@@ -574,9 +629,22 @@ void test_latency() {
         std::sort(us.begin(), us.end());
         const double med = us[us.size() / 2], p90 = us[us.size() * 9 / 10];
         std::printf("  %-62s median %7.1f us  p90 %7.1f us\n", label, med, p90);
+        if (work_budget > 0.0) {
+            std::sort(serial_us.begin(), serial_us.end());
+            std::sort(reference_us.begin(), reference_us.end());
+            std::sort(work_ratios.begin(), work_ratios.end());
+            const size_t mid = work_ratios.size() / 2;
+            std::printf("    serial CPU median %.1f us; scalar reference %.1f us; paired ratio %.3f (budget < %.2f)%s\n",
+                        serial_us[mid], reference_us[mid], work_ratios[mid], work_budget,
+                        kSanitized ? " [diagnostic under sanitizers]" : "");
+            // Full chain must beat scalar normalization alone; without logprobs it must
+            // cost less than half that work. Full-sort / scalar-exp regressions remain gated.
+            if (!kSanitized) VJ_CHECK(work_ratios[mid] < work_budget);
+        }
         return med;
     };
-    std::printf("Sampler latency, %zu-token vocabulary, 300 steps (%s build)\n", V, kSanitized ? "sanitizer" : "optimized");
+    std::printf("Sampler latency, %zu-token vocabulary, 300 steps (%s build), requested default threads=%d\n",
+                V, kSanitized ? "sanitizer" : "optimized", sampling::StackParams{}.threads);
     sampling::StackParams full;
     full.temperature = 0.8f;
     full.top_k = 40; full.top_p = 0.95f; full.min_p = 0.05f; full.typical_p = 0.95f;
@@ -586,10 +654,10 @@ void test_latency() {
     full.logit_bias = {{100, 2.0f}, {200, -INFINITY}, {300, -1.0f}};
     full.n_logprobs = 5;
     full.seed = 7;
-    const double t_full = bench(full, "full chain (k40 p min-p typ XTC DRY pen bias) + 5 logprobs", nullptr);
+    const double t_full = bench(full, "full chain (k40 p min-p typ XTC DRY pen bias) + 5 logprobs", nullptr, 1.0);
     sampling::StackParams nolp = full;
     nolp.n_logprobs = 0;
-    const double t_nolp = bench(nolp, "full chain, no logprobs", nullptr);
+    const double t_nolp = bench(nolp, "full chain, no logprobs", nullptr, 0.5);
     sampling::StackParams one = full;
     one.threads = 1;
     bench(one, "full chain + 5 logprobs, 1 thread", nullptr);
@@ -609,8 +677,12 @@ void test_latency() {
     int fb = 0;
     bench(nok, "top_k off (p .95, min-p .05) + 5 logprobs", &fb);
     std::printf("  top_k off: %d / 300 steps grew the candidate set\n", fb);
-    // Gates (optimized builds): generous regression bounds so parallel ctest / shared CI VMs do not flake.
-    if (!kSanitized) {
+    // Default OpenMP wall latency remains visible, but is not a shared-host acceptance clock:
+    // StackParams explicitly requests four threads even when OMP_NUM_THREADS=1. RUN_SERIAL
+    // only excludes sibling CTests, not unrelated host work or OpenMP scheduling delays.
+    // Preserve the original absolute gates for an explicitly controlled latency run.
+    const char* strict_latency = std::getenv("VJ_SAMPLER_STRICT_LATENCY");
+    if (!kSanitized && strict_latency && std::strcmp(strict_latency, "1") == 0) {
         const bool ci_vm = (std::getenv("CI") != nullptr);
         VJ_CHECK(t_nolp < (ci_vm ? 1000.0 : 220.0));
         VJ_CHECK(t_full < (ci_vm ? 1500.0 : 350.0));

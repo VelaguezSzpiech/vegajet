@@ -5,6 +5,7 @@
 #include "models/registry.hpp"
 
 #include <algorithm>
+#include <cmath>
 
 namespace vegajet::ornith {
 
@@ -155,8 +156,13 @@ StepResult OrnithModel::decode_step(int32_t token, uint32_t verify_len) {
 StepResult OrnithModel::draft_step(const std::vector<int32_t>& context, uint32_t max_draft) {
     StepResult res;
     if (!loaded_) return res;
-    uint32_t k = std::min(max_draft, gov_.k_star());
-    if (k == 0) return res;  // governor: speculation does not pay at the observed acceptance rate
+    // The controller only limits the prefix.  A zero proposal is a cost decision: the caller must run one
+    // ordinary target decode step and emit that token; nothing here commits or rewrites a token.
+    const uint32_t available = std::min(max_draft, kEvictMaxDepth);
+    // One-shot measured union of the last completed target pass.  draft_step() consumes it, so a deferred or
+    // missing readback becomes 0 (unknown) instead of reusing a stale count.
+    uint32_t k = evict_.choose(available, route_feedback_.take());
+    if (k == 0) return res;
     if (draft_src_ == DraftSource::ExternalDFlash) {
         k = std::min(k, dhp_.block_size - 1);
         const uint32_t m = dhp_.block_size;
@@ -189,8 +195,25 @@ StepResult OrnithModel::draft_step(const std::vector<int32_t>& context, uint32_t
     return res;
 }
 
+bool OrnithModel::note_route_ids(const int32_t* ids, uint32_t layers, uint32_t tokens, uint32_t top_k,
+                                 uint32_t layer_stride_ids) {
+    RouteUnionConfig cfg;
+    cfg.max_layers = std::min<uint32_t>(kRouteUnionMaxLayers, hp_.n_trunk ? hp_.n_trunk : 48u);
+    cfg.max_experts = std::min<uint32_t>(kRouteUnionMaxExperts, hp_.n_expert ? hp_.n_expert : 256u);
+    cfg.max_tokens = kRouteUnionMaxTokens;
+    cfg.top_k = top_k;
+    return record_completed_routes(&route_feedback_, ids, layers, tokens, top_k, layer_stride_ids, cfg) ==
+           RouteUnionStatus::kOk;
+}
+
+bool OrnithModel::note_route_union(uint64_t unique_experts, uint32_t tokens) {
+    // The count must come from an exact RouteUnion dedup over completed route IDs; 0 is unknown.
+    return route_feedback_.observe_count(unique_experts, tokens);
+}
+
 ssm::ReplayRing::Rollback OrnithModel::accept_draft(const std::vector<int32_t>& verified, uint32_t proposed) {
     const uint32_t accepted = verified.empty() ? 0 : static_cast<uint32_t>(verified.size() - 1);
+    evict_.observe(proposed, accepted);
     gov_.observe(proposed, accepted);
     for (uint32_t i = 0; i < proposed + 1; ++i) ring_.push();  // the device advanced over every verified slot
     const auto rb = ring_.rollback(proposed - std::min(accepted, proposed));

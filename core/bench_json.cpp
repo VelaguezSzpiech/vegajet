@@ -122,6 +122,22 @@ bool after_ratio(const std::string& line, const char* key, long& a, long& b) {  
     return c.find(key) && c.integer(a) && c.lit("/") && c.integer(b);
 }
 
+std::optional<double> telemetry_number(const std::string& line, const char* key) {
+    Scan c{line};
+    double value = 0.0;
+    if (c.find(key) && c.number(value) && std::isfinite(value) && value >= 0) return value;
+    return std::nullopt;
+}
+
+std::string telemetry_word(const std::string& line, const char* key) {
+    Scan c{line};
+    return c.find(key) ? c.word() : std::string();
+}
+
+int telemetry_severity(const std::string& verdict) {
+    return verdict.empty() ? 0 : (verdict == "PASS" ? 1 : (verdict == "FAIL" ? 3 : 2));
+}
+
 }  // namespace
 
 bool parse_line(const std::string& line, Record& r) {
@@ -198,19 +214,41 @@ bool parse_line(const std::string& line, Record& r) {
         r.parity_verdict = c.lit("->") ? c.word() : std::string();
         return true;
     }
+    if (line.find("[TELEM card=") != std::string::npos) {
+        TelemetryCard card;
+        card.id = telemetry_word(line, "[TELEM card=");
+        if (card.id.empty()) return false;
+        card.timestamp_utc = r.timestamp_utc;
+        card.cap_w = telemetry_number(line, "cap=");
+        card.cap_min_w = telemetry_number(line, "cap_min=");
+        card.cap_max_w = telemetry_number(line, "cap_max=");
+        card.mean_w = telemetry_number(line, "mean=");
+        card.avg_w = telemetry_number(line, "rolling avg=");
+        card.window_s = telemetry_number(line, "window=");
+        card.avg1s_w = telemetry_number(line, "avg1s=");
+        card.window1s_s = telemetry_number(line, "window1s=");
+        card.peak_w = telemetry_number(line, "peak=");
+        card.tmem_max_c = telemetry_number(line, "max_TMem=");
+        card.observed_s = telemetry_number(line, "observed=");
+        if (auto v = telemetry_number(line, "samples=")) card.samples = static_cast<uint64_t>(*v);
+        if (auto v = telemetry_number(line, "missing=")) card.missing = static_cast<uint64_t>(*v);
+        card.window_kind = telemetry_word(line, "window_kind=");
+        card.hold = telemetry_word(line, "hold=");
+        card.verdict = telemetry_word(line, "->");
+        r.telemetry_cards.push_back(card);
+        return true;
+    }
     if (line.find("[TELEM]") != std::string::npos && line.find("rolling avg=") != std::string::npos) {
-        Scan c{line};
-        double avg = 0, peak = 0, tmem = 0, lim = 0;
-        if (!c.find("rolling avg=") || !c.number(avg)) return false;
-        const size_t at = c.i;
-        const bool has_lim = c.lit("W") && c.lit("(<=") && c.number(lim);
-        if (!has_lim) c.i = at;
-        if (!c.find("peak=") || !c.number(peak) || !c.find("max_TMem=") || !c.number(tmem) || !c.find("->")) return false;
-        r.power_avg_w = avg;
-        if (has_lim) r.power_avg_limit_w = lim;
-        r.power_peak_w = peak;
-        r.tmem_max_c = tmem;
-        r.telem_verdict = c.word();
+        r.power_avg_w = telemetry_number(line, "rolling avg=");
+        r.power_avg_limit_w = telemetry_number(line, "<=");
+        r.power_mean_w = telemetry_number(line, "mean=");
+        r.power_window_s = telemetry_number(line, "window=");
+        r.power_window_kind = telemetry_word(line, "window_kind=");
+        r.power_hold = telemetry_word(line, "hold=");
+        r.power_avg1s_w = telemetry_number(line, "worst 1 s avg=");
+        r.power_peak_w = telemetry_number(line, "peak=");
+        r.tmem_max_c = telemetry_number(line, "max_TMem=");
+        r.telem_verdict = telemetry_word(line, "->");
         return true;
     }
     if (line.find("[KLD dot8 prefill]") != std::string::npos) {
@@ -262,9 +300,25 @@ std::string to_json(const Record& r) {
     if (r.parity_match && r.parity_total)
         par.add("code_vs_tier1", Obj().add("match", num(*r.parity_match)).add("total", num(*r.parity_total)).add("verdict", q(r.parity_verdict)).str(4));
     for (const auto& kv : parity.kv) par.add(kv.first, kv.second);
+    std::string cards = "[";
+    for (size_t i = 0; i < r.telemetry_cards.size(); ++i) {
+        const auto& c = r.telemetry_cards[i];
+        Obj card;
+        card.add("id", q(c.id)).add("timestamp_utc", q(c.timestamp_utc))
+            .add("power_cap_w", opt(c.cap_w)).add("power_cap_min_w", opt(c.cap_min_w)).add("power_cap_max_w", opt(c.cap_max_w))
+            .add("power_mean_w", opt(c.mean_w)).add("power_rolling_avg_w", opt(c.avg_w)).add("power_window_s", opt(c.window_s))
+            .add("power_window_kind", q(c.window_kind)).add("power_hold", q(c.hold))
+            .add("power_avg1s_w", opt(c.avg1s_w)).add("power_window1s_s", opt(c.window1s_s))
+            .add("power_peak_w", opt(c.peak_w)).add("tmem_max_c", opt(c.tmem_max_c)).add("observed_s", opt(c.observed_s))
+            .add("samples", opt(c.samples)).add("missing", opt(c.missing)).add("verdict", q(c.verdict));
+        cards += (i ? ", " : "") + card.str(6);
+    }
+    cards += "]";
     Obj tel;
     tel.add("power_rolling_avg_w", opt(r.power_avg_w)).add("power_avg_limit_w", opt(r.power_avg_limit_w)).add("power_peak_w", opt(r.power_peak_w))
-        .add("tmem_max_c", opt(r.tmem_max_c)).add("verdict", q(r.telem_verdict));
+        .add("power_mean_w", opt(r.power_mean_w)).add("power_window_s", opt(r.power_window_s))
+        .add("power_window_kind", q(r.power_window_kind)).add("power_hold", q(r.power_hold)).add("power_avg1s_w", opt(r.power_avg1s_w))
+        .add("tmem_max_c", opt(r.tmem_max_c)).add("verdict", q(r.telem_verdict)).add("cards", cards);
     std::string gpus = "[";
     const std::vector<GpuState>& last = r.gpus_after.empty() ? r.gpus_before : r.gpus_after;
     for (size_t i = 0; i < last.size(); ++i) {
@@ -377,6 +431,34 @@ bool from_json(const std::string& text, Record& r, std::string* err) {
         r.power_peak_w = gnum(*t, "power_peak_w");
         r.tmem_max_c = gnum(*t, "tmem_max_c");
         r.telem_verdict = gstr(*t, "verdict");
+        r.power_mean_w = gnum(*t, "power_mean_w");
+        r.power_window_s = gnum(*t, "power_window_s");
+        r.power_window_kind = gstr(*t, "power_window_kind");
+        r.power_hold = gstr(*t, "power_hold");
+        r.power_avg1s_w = gnum(*t, "power_avg1s_w");
+        if (const auto* cards = at(*t, "cards"); cards && cards->is_array())
+            for (const auto& c : cards->arr) {
+                TelemetryCard card;
+                card.id = gstr(c, "id");
+                card.timestamp_utc = gstr(c, "timestamp_utc");
+                card.cap_w = gnum(c, "power_cap_w");
+                card.cap_min_w = gnum(c, "power_cap_min_w");
+                card.cap_max_w = gnum(c, "power_cap_max_w");
+                card.mean_w = gnum(c, "power_mean_w");
+                card.avg_w = gnum(c, "power_rolling_avg_w");
+                card.window_s = gnum(c, "power_window_s");
+                card.window_kind = gstr(c, "power_window_kind");
+                card.hold = gstr(c, "power_hold");
+                card.avg1s_w = gnum(c, "power_avg1s_w");
+                card.window1s_s = gnum(c, "power_window1s_s");
+                card.peak_w = gnum(c, "power_peak_w");
+                card.tmem_max_c = gnum(c, "tmem_max_c");
+                card.observed_s = gnum(c, "observed_s");
+                if (auto n = gnum(c, "samples")) card.samples = static_cast<uint64_t>(*n);
+                if (auto n = gnum(c, "missing")) card.missing = static_cast<uint64_t>(*n);
+                card.verdict = gstr(c, "verdict");
+                r.telemetry_cards.push_back(card);
+            }
     }
     // Stored RAS deltas come back as an "after" snapshot over a zero "before" (absolute counters as "before" only),
     // so to_json() reproduces them and merge() can add them.
@@ -433,9 +515,17 @@ void merge(Record& into, const Record& run) {
         else into.spec.push_back(s);
     }
     if (run.parity_match) { into.parity_match = run.parity_match; into.parity_total = run.parity_total; into.parity_verdict = run.parity_verdict; }
-    worst(into.power_avg_w, run.power_avg_w); worst(into.power_peak_w, run.power_peak_w); worst(into.tmem_max_c, run.tmem_max_c);
-    take(into.power_avg_limit_w, run.power_avg_limit_w);
-    if (!run.telem_verdict.empty() && (into.telem_verdict.empty() || run.telem_verdict == "FAIL")) into.telem_verdict = run.telem_verdict;
+    if (run.power_avg_w && (!into.power_avg_w || *run.power_avg_w > *into.power_avg_w)) {
+        into.power_avg_w = run.power_avg_w;
+        into.power_window_s = run.power_window_s;
+        into.power_window_kind = run.power_window_kind;
+        into.power_hold = run.power_hold;
+        into.power_avg_limit_w = run.power_avg_limit_w;
+    }
+    worst(into.power_mean_w, run.power_mean_w); worst(into.power_avg1s_w, run.power_avg1s_w);
+    worst(into.power_peak_w, run.power_peak_w); worst(into.tmem_max_c, run.tmem_max_c);
+    if (telemetry_severity(run.telem_verdict) > telemetry_severity(into.telem_verdict)) into.telem_verdict = run.telem_verdict;
+    into.telemetry_cards.insert(into.telemetry_cards.end(), run.telemetry_cards.begin(), run.telemetry_cards.end());
     // RAS: fold this run's deltas (after - before) into the stored deltas. A stored absolute snapshot (no "after")
     // is replaced by the first delta; a run without an "after" snapshot adds nothing.
     if (run.gpus_after.empty()) return;

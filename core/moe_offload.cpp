@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 #include "core/moe_offload.hpp"
+#include "core/offload/host.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -1197,4 +1198,28 @@ void MoeOffload::release_all() {
     if (dropped) st_.released_bytes += arena_bytes_;
 }
 
+} // namespace vegajet::moeoffload
+
+namespace vegajet::moeoffload {
+bool MoeOffload::fetch_spec(uint32_t layer, uint32_t expert, uint32_t row, uint32_t rank,
+                           double weight, MoeOffload* low, uint8_t* dst, size_t capacity,
+                           offload::FetchPrecision* precision, std::string* err) {
+    if (precision) *precision = offload::FetchPrecision::Full;
+    if (!dst || capacity < expert_bytes() || layer >= n_layers() || expert >= n_experts()) {
+        if (err) *err = "HOBBIT invalid destination/capacity/expert";
+        return false;
+    }
+    MoeOffload* source = this;
+    // threshold zero forbids policy Skip. Top-1 remains Full; hot experts and
+    // the committed context row bypass approximation before consulting policy.
+    if (offload::Switches::environment().hobbit && row > 0u && !is_hot(layer, expert)) {
+        const auto plan = offload::hobbit_plan(expert, rank, weight, 0.0);
+        if (plan.precision == offload::FetchPrecision::Low && low && low != this &&
+            low->n_layers() == n_layers() && low->n_experts() == n_experts() &&
+            low->expert_bytes() < expert_bytes() && low->staged(layer, expert)) source = low;
+    }
+    if (!source->fetch(layer, expert, dst, err)) return false;
+    if (precision && source != this) *precision = offload::FetchPrecision::Low;
+    return true;
+}
 } // namespace vegajet::moeoffload

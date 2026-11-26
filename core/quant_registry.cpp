@@ -230,6 +230,8 @@ double native_bits_per_weight(NativeFormat f, DiskQuantType disk) {
         case NativeFormat::VJ_Q4_DOT8: return 4.5;
         case NativeFormat::VJ_Q4_A8: return 5.0;
         case NativeFormat::VJ_IQ_PACKED: return disk_bits_per_weight(disk);
+        case NativeFormat::VJ_Q3_DOT8: return 3.5;   // 3 bit + fp16 (d, z) per 64-element group
+        case NativeFormat::VJ_Q2_DOT8: return 2.5;   // 2 bit + fp16 (d, z) per 64-element group
     }
     return 0.0;
 }

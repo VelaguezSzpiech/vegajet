@@ -1,0 +1,1882 @@
+rank,layer,kernel,bucket,bytes,note
+0,-1,ornith_embed_q8_kernel,input,39168,
+0,-1,ornith_rms_quant_kernel,input,626688,
+0,0,gemm_q4a8_m12,dense,14837760,
+0,0,gdn_conv_ring,conv,1239744,"weights + conv ring snapshots + activations, approximate"
+0,0,gdn_recur_ring,recur,20447232,one full state read + M full state-ring writes; ignores Q/K/V/Z
+0,0,gemm_q4a8_m12,dense,5898240,
+0,0,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,0,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,0,gemm_q4a8_m12,dense,1474560,
+0,0,moe_top8,top8,13056,
+0,0,swiglu_q8,shared,59904,
+0,0,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,0,gemm_q4a8_m12,dense,737280,
+0,0,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,0,p2p_ar_n_fp16,AR,294912,
+0,1,gemm_q4a8_m12,dense,14837760,
+0,1,gdn_conv_ring,conv,1239744,"weights + conv ring snapshots + activations, approximate"
+0,1,gdn_recur_ring,recur,20447232,one full state read + M full state-ring writes; ignores Q/K/V/Z
+0,1,gemm_q4a8_m12,dense,5898240,
+0,1,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,1,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,1,gemm_q4a8_m12,dense,1474560,
+0,1,moe_top8,top8,13056,
+0,1,swiglu_q8,shared,59904,
+0,1,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,1,gemm_q4a8_m12,dense,737280,
+0,1,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,1,p2p_ar_n_fp16,AR,294912,
+0,2,gemm_q4a8_m12,dense,14837760,
+0,2,gdn_conv_ring,conv,1239744,"weights + conv ring snapshots + activations, approximate"
+0,2,gdn_recur_ring,recur,20447232,one full state read + M full state-ring writes; ignores Q/K/V/Z
+0,2,gemm_q4a8_m12,dense,5898240,
+0,2,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,2,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,2,gemm_q4a8_m12,dense,1474560,
+0,2,moe_top8,top8,13056,
+0,2,swiglu_q8,shared,59904,
+0,2,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,2,gemm_q4a8_m12,dense,737280,
+0,2,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,2,p2p_ar_n_fp16,AR,294912,
+0,3,gemm_q4a8_m12,dense,12779520,
+0,3,attn_prep,prep,326016,"approx, Q/K norms + rope + KV write"
+0,3,attn_flash_q8,flash,10536192,per-query-head requested K/V; cache shares KV heads
+0,3,gemm_q4a8_m12,dense,5898240,
+0,3,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,3,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,3,gemm_q4a8_m12,dense,1474560,
+0,3,moe_top8,top8,13056,
+0,3,swiglu_q8,shared,59904,
+0,3,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,3,gemm_q4a8_m12,dense,737280,
+0,3,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,3,p2p_ar_n_fp16,AR,294912,
+0,4,gemm_q4a8_m12,dense,14837760,
+0,4,gdn_conv_ring,conv,1239744,"weights + conv ring snapshots + activations, approximate"
+0,4,gdn_recur_ring,recur,20447232,one full state read + M full state-ring writes; ignores Q/K/V/Z
+0,4,gemm_q4a8_m12,dense,5898240,
+0,4,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,4,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,4,gemm_q4a8_m12,dense,1474560,
+0,4,moe_top8,top8,13056,
+0,4,swiglu_q8,shared,59904,
+0,4,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,4,gemm_q4a8_m12,dense,737280,
+0,4,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,4,p2p_ar_n_fp16,AR,294912,
+0,5,gemm_q4a8_m12,dense,14837760,
+0,5,gdn_conv_ring,conv,1239744,"weights + conv ring snapshots + activations, approximate"
+0,5,gdn_recur_ring,recur,20447232,one full state read + M full state-ring writes; ignores Q/K/V/Z
+0,5,gemm_q4a8_m12,dense,5898240,
+0,5,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,5,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,5,gemm_q4a8_m12,dense,1474560,
+0,5,moe_top8,top8,13056,
+0,5,swiglu_q8,shared,59904,
+0,5,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,5,gemm_q4a8_m12,dense,737280,
+0,5,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,5,p2p_ar_n_fp16,AR,294912,
+0,6,gemm_q4a8_m12,dense,14837760,
+0,6,gdn_conv_ring,conv,1239744,"weights + conv ring snapshots + activations, approximate"
+0,6,gdn_recur_ring,recur,20447232,one full state read + M full state-ring writes; ignores Q/K/V/Z
+0,6,gemm_q4a8_m12,dense,5898240,
+0,6,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,6,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,6,gemm_q4a8_m12,dense,1474560,
+0,6,moe_top8,top8,13056,
+0,6,swiglu_q8,shared,59904,
+0,6,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,6,gemm_q4a8_m12,dense,737280,
+0,6,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,6,p2p_ar_n_fp16,AR,294912,
+0,7,gemm_q4a8_m12,dense,12779520,
+0,7,attn_prep,prep,326016,"approx, Q/K norms + rope + KV write"
+0,7,attn_flash_q8,flash,10536192,per-query-head requested K/V; cache shares KV heads
+0,7,gemm_q4a8_m12,dense,5898240,
+0,7,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,7,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,7,gemm_q4a8_m12,dense,1474560,
+0,7,moe_top8,top8,13056,
+0,7,swiglu_q8,shared,59904,
+0,7,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,7,gemm_q4a8_m12,dense,737280,
+0,7,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,7,p2p_ar_n_fp16,AR,294912,
+0,8,gemm_q4a8_m12,dense,14837760,
+0,8,gdn_conv_ring,conv,1239744,"weights + conv ring snapshots + activations, approximate"
+0,8,gdn_recur_ring,recur,20447232,one full state read + M full state-ring writes; ignores Q/K/V/Z
+0,8,gemm_q4a8_m12,dense,5898240,
+0,8,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,8,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,8,gemm_q4a8_m12,dense,1474560,
+0,8,moe_top8,top8,13056,
+0,8,swiglu_q8,shared,59904,
+0,8,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,8,gemm_q4a8_m12,dense,737280,
+0,8,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,8,p2p_ar_n_fp16,AR,294912,
+0,9,gemm_q4a8_m12,dense,14837760,
+0,9,gdn_conv_ring,conv,1239744,"weights + conv ring snapshots + activations, approximate"
+0,9,gdn_recur_ring,recur,20447232,one full state read + M full state-ring writes; ignores Q/K/V/Z
+0,9,gemm_q4a8_m12,dense,5898240,
+0,9,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,9,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,9,gemm_q4a8_m12,dense,1474560,
+0,9,moe_top8,top8,13056,
+0,9,swiglu_q8,shared,59904,
+0,9,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,9,gemm_q4a8_m12,dense,737280,
+0,9,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,9,p2p_ar_n_fp16,AR,294912,
+0,10,gemm_q4a8_m12,dense,14837760,
+0,10,gdn_conv_ring,conv,1239744,"weights + conv ring snapshots + activations, approximate"
+0,10,gdn_recur_ring,recur,20447232,one full state read + M full state-ring writes; ignores Q/K/V/Z
+0,10,gemm_q4a8_m12,dense,5898240,
+0,10,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,10,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,10,gemm_q4a8_m12,dense,1474560,
+0,10,moe_top8,top8,13056,
+0,10,swiglu_q8,shared,59904,
+0,10,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,10,gemm_q4a8_m12,dense,737280,
+0,10,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,10,p2p_ar_n_fp16,AR,294912,
+0,11,gemm_q4a8_m12,dense,12779520,
+0,11,attn_prep,prep,326016,"approx, Q/K norms + rope + KV write"
+0,11,attn_flash_q8,flash,10536192,per-query-head requested K/V; cache shares KV heads
+0,11,gemm_q4a8_m12,dense,5898240,
+0,11,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,11,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,11,gemm_q4a8_m12,dense,1474560,
+0,11,moe_top8,top8,13056,
+0,11,swiglu_q8,shared,59904,
+0,11,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,11,gemm_q4a8_m12,dense,737280,
+0,11,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,11,p2p_ar_n_fp16,AR,294912,
+0,12,gemm_q4a8_m12,dense,14837760,
+0,12,gdn_conv_ring,conv,1239744,"weights + conv ring snapshots + activations, approximate"
+0,12,gdn_recur_ring,recur,20447232,one full state read + M full state-ring writes; ignores Q/K/V/Z
+0,12,gemm_q4a8_m12,dense,5898240,
+0,12,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,12,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,12,gemm_q4a8_m12,dense,1474560,
+0,12,moe_top8,top8,13056,
+0,12,swiglu_q8,shared,59904,
+0,12,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,12,gemm_q4a8_m12,dense,737280,
+0,12,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,12,p2p_ar_n_fp16,AR,294912,
+0,13,gemm_q4a8_m12,dense,14837760,
+0,13,gdn_conv_ring,conv,1239744,"weights + conv ring snapshots + activations, approximate"
+0,13,gdn_recur_ring,recur,20447232,one full state read + M full state-ring writes; ignores Q/K/V/Z
+0,13,gemm_q4a8_m12,dense,5898240,
+0,13,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,13,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,13,gemm_q4a8_m12,dense,1474560,
+0,13,moe_top8,top8,13056,
+0,13,swiglu_q8,shared,59904,
+0,13,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,13,gemm_q4a8_m12,dense,737280,
+0,13,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,13,p2p_ar_n_fp16,AR,294912,
+0,14,gemm_q4a8_m12,dense,14837760,
+0,14,gdn_conv_ring,conv,1239744,"weights + conv ring snapshots + activations, approximate"
+0,14,gdn_recur_ring,recur,20447232,one full state read + M full state-ring writes; ignores Q/K/V/Z
+0,14,gemm_q4a8_m12,dense,5898240,
+0,14,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,14,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,14,gemm_q4a8_m12,dense,1474560,
+0,14,moe_top8,top8,13056,
+0,14,swiglu_q8,shared,59904,
+0,14,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,14,gemm_q4a8_m12,dense,737280,
+0,14,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,14,p2p_ar_n_fp16,AR,294912,
+0,15,gemm_q4a8_m12,dense,12779520,
+0,15,attn_prep,prep,326016,"approx, Q/K norms + rope + KV write"
+0,15,attn_flash_q8,flash,10536192,per-query-head requested K/V; cache shares KV heads
+0,15,gemm_q4a8_m12,dense,5898240,
+0,15,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,15,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,15,gemm_q4a8_m12,dense,1474560,
+0,15,moe_top8,top8,13056,
+0,15,swiglu_q8,shared,59904,
+0,15,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,15,gemm_q4a8_m12,dense,737280,
+0,15,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,15,p2p_ar_n_fp16,AR,294912,
+0,16,gemm_q4a8_m12,dense,14837760,
+0,16,gdn_conv_ring,conv,1239744,"weights + conv ring snapshots + activations, approximate"
+0,16,gdn_recur_ring,recur,20447232,one full state read + M full state-ring writes; ignores Q/K/V/Z
+0,16,gemm_q4a8_m12,dense,5898240,
+0,16,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,16,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,16,gemm_q4a8_m12,dense,1474560,
+0,16,moe_top8,top8,13056,
+0,16,swiglu_q8,shared,59904,
+0,16,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,16,gemm_q4a8_m12,dense,737280,
+0,16,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,16,p2p_ar_n_fp16,AR,294912,
+0,17,gemm_q4a8_m12,dense,14837760,
+0,17,gdn_conv_ring,conv,1239744,"weights + conv ring snapshots + activations, approximate"
+0,17,gdn_recur_ring,recur,20447232,one full state read + M full state-ring writes; ignores Q/K/V/Z
+0,17,gemm_q4a8_m12,dense,5898240,
+0,17,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,17,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,17,gemm_q4a8_m12,dense,1474560,
+0,17,moe_top8,top8,13056,
+0,17,swiglu_q8,shared,59904,
+0,17,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,17,gemm_q4a8_m12,dense,737280,
+0,17,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,17,p2p_ar_n_fp16,AR,294912,
+0,18,gemm_q4a8_m12,dense,14837760,
+0,18,gdn_conv_ring,conv,1239744,"weights + conv ring snapshots + activations, approximate"
+0,18,gdn_recur_ring,recur,20447232,one full state read + M full state-ring writes; ignores Q/K/V/Z
+0,18,gemm_q4a8_m12,dense,5898240,
+0,18,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,18,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,18,gemm_q4a8_m12,dense,1474560,
+0,18,moe_top8,top8,13056,
+0,18,swiglu_q8,shared,59904,
+0,18,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,18,gemm_q4a8_m12,dense,737280,
+0,18,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,18,p2p_ar_n_fp16,AR,294912,
+0,19,gemm_q4a8_m12,dense,12779520,
+0,19,attn_prep,prep,326016,"approx, Q/K norms + rope + KV write"
+0,19,attn_flash_q8,flash,10536192,per-query-head requested K/V; cache shares KV heads
+0,19,gemm_q4a8_m12,dense,5898240,
+0,19,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,19,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,19,gemm_q4a8_m12,dense,1474560,
+0,19,moe_top8,top8,13056,
+0,19,swiglu_q8,shared,59904,
+0,19,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,19,gemm_q4a8_m12,dense,737280,
+0,19,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,19,p2p_ar_n_fp16,AR,294912,
+0,20,gemm_q4a8_m12,dense,14837760,
+0,20,gdn_conv_ring,conv,1239744,"weights + conv ring snapshots + activations, approximate"
+0,20,gdn_recur_ring,recur,20447232,one full state read + M full state-ring writes; ignores Q/K/V/Z
+0,20,gemm_q4a8_m12,dense,5898240,
+0,20,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,20,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,20,gemm_q4a8_m12,dense,1474560,
+0,20,moe_top8,top8,13056,
+0,20,swiglu_q8,shared,59904,
+0,20,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,20,gemm_q4a8_m12,dense,737280,
+0,20,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,20,p2p_ar_n_fp16,AR,294912,
+0,21,gemm_q4a8_m12,dense,14837760,
+0,21,gdn_conv_ring,conv,1239744,"weights + conv ring snapshots + activations, approximate"
+0,21,gdn_recur_ring,recur,20447232,one full state read + M full state-ring writes; ignores Q/K/V/Z
+0,21,gemm_q4a8_m12,dense,5898240,
+0,21,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,21,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,21,gemm_q4a8_m12,dense,1474560,
+0,21,moe_top8,top8,13056,
+0,21,swiglu_q8,shared,59904,
+0,21,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,21,gemm_q4a8_m12,dense,737280,
+0,21,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,21,p2p_ar_n_fp16,AR,294912,
+0,22,gemm_q4a8_m12,dense,14837760,
+0,22,gdn_conv_ring,conv,1239744,"weights + conv ring snapshots + activations, approximate"
+0,22,gdn_recur_ring,recur,20447232,one full state read + M full state-ring writes; ignores Q/K/V/Z
+0,22,gemm_q4a8_m12,dense,5898240,
+0,22,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,22,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,22,gemm_q4a8_m12,dense,1474560,
+0,22,moe_top8,top8,13056,
+0,22,swiglu_q8,shared,59904,
+0,22,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,22,gemm_q4a8_m12,dense,737280,
+0,22,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,22,p2p_ar_n_fp16,AR,294912,
+0,23,gemm_q4a8_m12,dense,12779520,
+0,23,attn_prep,prep,326016,"approx, Q/K norms + rope + KV write"
+0,23,attn_flash_q8,flash,10536192,per-query-head requested K/V; cache shares KV heads
+0,23,gemm_q4a8_m12,dense,5898240,
+0,23,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,23,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,23,gemm_q4a8_m12,dense,1474560,
+0,23,moe_top8,top8,13056,
+0,23,swiglu_q8,shared,59904,
+0,23,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,23,gemm_q4a8_m12,dense,737280,
+0,23,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,23,p2p_ar_n_fp16,AR,294912,
+0,24,gemm_q4a8_m12,dense,14837760,
+0,24,gdn_conv_ring,conv,1239744,"weights + conv ring snapshots + activations, approximate"
+0,24,gdn_recur_ring,recur,20447232,one full state read + M full state-ring writes; ignores Q/K/V/Z
+0,24,gemm_q4a8_m12,dense,5898240,
+0,24,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,24,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,24,gemm_q4a8_m12,dense,1474560,
+0,24,moe_top8,top8,13056,
+0,24,swiglu_q8,shared,59904,
+0,24,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,24,gemm_q4a8_m12,dense,737280,
+0,24,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,24,p2p_ar_n_fp16,AR,294912,
+0,25,gemm_q4a8_m12,dense,14837760,
+0,25,gdn_conv_ring,conv,1239744,"weights + conv ring snapshots + activations, approximate"
+0,25,gdn_recur_ring,recur,20447232,one full state read + M full state-ring writes; ignores Q/K/V/Z
+0,25,gemm_q4a8_m12,dense,5898240,
+0,25,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,25,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,25,gemm_q4a8_m12,dense,1474560,
+0,25,moe_top8,top8,13056,
+0,25,swiglu_q8,shared,59904,
+0,25,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,25,gemm_q4a8_m12,dense,737280,
+0,25,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,25,p2p_ar_n_fp16,AR,294912,
+0,26,gemm_q4a8_m12,dense,14837760,
+0,26,gdn_conv_ring,conv,1239744,"weights + conv ring snapshots + activations, approximate"
+0,26,gdn_recur_ring,recur,20447232,one full state read + M full state-ring writes; ignores Q/K/V/Z
+0,26,gemm_q4a8_m12,dense,5898240,
+0,26,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,26,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,26,gemm_q4a8_m12,dense,1474560,
+0,26,moe_top8,top8,13056,
+0,26,swiglu_q8,shared,59904,
+0,26,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,26,gemm_q4a8_m12,dense,737280,
+0,26,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,26,p2p_ar_n_fp16,AR,294912,
+0,27,gemm_q4a8_m12,dense,12779520,
+0,27,attn_prep,prep,326016,"approx, Q/K norms + rope + KV write"
+0,27,attn_flash_q8,flash,10536192,per-query-head requested K/V; cache shares KV heads
+0,27,gemm_q4a8_m12,dense,5898240,
+0,27,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,27,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,27,gemm_q4a8_m12,dense,1474560,
+0,27,moe_top8,top8,13056,
+0,27,swiglu_q8,shared,59904,
+0,27,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,27,gemm_q4a8_m12,dense,737280,
+0,27,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,27,p2p_ar_n_fp16,AR,294912,
+0,28,gemm_q4a8_m12,dense,14837760,
+0,28,gdn_conv_ring,conv,1239744,"weights + conv ring snapshots + activations, approximate"
+0,28,gdn_recur_ring,recur,20447232,one full state read + M full state-ring writes; ignores Q/K/V/Z
+0,28,gemm_q4a8_m12,dense,5898240,
+0,28,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,28,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,28,gemm_q4a8_m12,dense,1474560,
+0,28,moe_top8,top8,13056,
+0,28,swiglu_q8,shared,59904,
+0,28,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,28,gemm_q4a8_m12,dense,737280,
+0,28,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,28,p2p_ar_n_fp16,AR,294912,
+0,29,gemm_q4a8_m12,dense,14837760,
+0,29,gdn_conv_ring,conv,1239744,"weights + conv ring snapshots + activations, approximate"
+0,29,gdn_recur_ring,recur,20447232,one full state read + M full state-ring writes; ignores Q/K/V/Z
+0,29,gemm_q4a8_m12,dense,5898240,
+0,29,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,29,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,29,gemm_q4a8_m12,dense,1474560,
+0,29,moe_top8,top8,13056,
+0,29,swiglu_q8,shared,59904,
+0,29,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,29,gemm_q4a8_m12,dense,737280,
+0,29,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,29,p2p_ar_n_fp16,AR,294912,
+0,30,gemm_q4a8_m12,dense,14837760,
+0,30,gdn_conv_ring,conv,1239744,"weights + conv ring snapshots + activations, approximate"
+0,30,gdn_recur_ring,recur,20447232,one full state read + M full state-ring writes; ignores Q/K/V/Z
+0,30,gemm_q4a8_m12,dense,5898240,
+0,30,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,30,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,30,gemm_q4a8_m12,dense,1474560,
+0,30,moe_top8,top8,13056,
+0,30,swiglu_q8,shared,59904,
+0,30,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,30,gemm_q4a8_m12,dense,737280,
+0,30,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,30,p2p_ar_n_fp16,AR,294912,
+0,31,gemm_q4a8_m12,dense,12779520,
+0,31,attn_prep,prep,326016,"approx, Q/K norms + rope + KV write"
+0,31,attn_flash_q8,flash,10536192,per-query-head requested K/V; cache shares KV heads
+0,31,gemm_q4a8_m12,dense,5898240,
+0,31,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,31,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,31,gemm_q4a8_m12,dense,1474560,
+0,31,moe_top8,top8,13056,
+0,31,swiglu_q8,shared,59904,
+0,31,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,31,gemm_q4a8_m12,dense,737280,
+0,31,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,31,p2p_ar_n_fp16,AR,294912,
+0,32,gemm_q4a8_m12,dense,14837760,
+0,32,gdn_conv_ring,conv,1239744,"weights + conv ring snapshots + activations, approximate"
+0,32,gdn_recur_ring,recur,20447232,one full state read + M full state-ring writes; ignores Q/K/V/Z
+0,32,gemm_q4a8_m12,dense,5898240,
+0,32,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,32,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,32,gemm_q4a8_m12,dense,1474560,
+0,32,moe_top8,top8,13056,
+0,32,swiglu_q8,shared,59904,
+0,32,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,32,gemm_q4a8_m12,dense,737280,
+0,32,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,32,p2p_ar_n_fp16,AR,294912,
+0,33,gemm_q4a8_m12,dense,14837760,
+0,33,gdn_conv_ring,conv,1239744,"weights + conv ring snapshots + activations, approximate"
+0,33,gdn_recur_ring,recur,20447232,one full state read + M full state-ring writes; ignores Q/K/V/Z
+0,33,gemm_q4a8_m12,dense,5898240,
+0,33,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,33,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,33,gemm_q4a8_m12,dense,1474560,
+0,33,moe_top8,top8,13056,
+0,33,swiglu_q8,shared,59904,
+0,33,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,33,gemm_q4a8_m12,dense,737280,
+0,33,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,33,p2p_ar_n_fp16,AR,294912,
+0,34,gemm_q4a8_m12,dense,14837760,
+0,34,gdn_conv_ring,conv,1239744,"weights + conv ring snapshots + activations, approximate"
+0,34,gdn_recur_ring,recur,20447232,one full state read + M full state-ring writes; ignores Q/K/V/Z
+0,34,gemm_q4a8_m12,dense,5898240,
+0,34,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,34,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,34,gemm_q4a8_m12,dense,1474560,
+0,34,moe_top8,top8,13056,
+0,34,swiglu_q8,shared,59904,
+0,34,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,34,gemm_q4a8_m12,dense,737280,
+0,34,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,34,p2p_ar_n_fp16,AR,294912,
+0,35,gemm_q4a8_m12,dense,12779520,
+0,35,attn_prep,prep,326016,"approx, Q/K norms + rope + KV write"
+0,35,attn_flash_q8,flash,10536192,per-query-head requested K/V; cache shares KV heads
+0,35,gemm_q4a8_m12,dense,5898240,
+0,35,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,35,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,35,gemm_q4a8_m12,dense,1474560,
+0,35,moe_top8,top8,13056,
+0,35,swiglu_q8,shared,59904,
+0,35,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,35,gemm_q4a8_m12,dense,737280,
+0,35,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,35,p2p_ar_n_fp16,AR,294912,
+0,36,gemm_q4a8_m12,dense,14837760,
+0,36,gdn_conv_ring,conv,1239744,"weights + conv ring snapshots + activations, approximate"
+0,36,gdn_recur_ring,recur,20447232,one full state read + M full state-ring writes; ignores Q/K/V/Z
+0,36,gemm_q4a8_m12,dense,5898240,
+0,36,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,36,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,36,gemm_q4a8_m12,dense,1474560,
+0,36,moe_top8,top8,13056,
+0,36,swiglu_q8,shared,59904,
+0,36,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,36,gemm_q4a8_m12,dense,737280,
+0,36,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,36,p2p_ar_n_fp16,AR,294912,
+0,37,gemm_q4a8_m12,dense,14837760,
+0,37,gdn_conv_ring,conv,1239744,"weights + conv ring snapshots + activations, approximate"
+0,37,gdn_recur_ring,recur,20447232,one full state read + M full state-ring writes; ignores Q/K/V/Z
+0,37,gemm_q4a8_m12,dense,5898240,
+0,37,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,37,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,37,gemm_q4a8_m12,dense,1474560,
+0,37,moe_top8,top8,13056,
+0,37,swiglu_q8,shared,59904,
+0,37,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,37,gemm_q4a8_m12,dense,737280,
+0,37,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,37,p2p_ar_n_fp16,AR,294912,
+0,38,gemm_q4a8_m12,dense,14837760,
+0,38,gdn_conv_ring,conv,1239744,"weights + conv ring snapshots + activations, approximate"
+0,38,gdn_recur_ring,recur,20447232,one full state read + M full state-ring writes; ignores Q/K/V/Z
+0,38,gemm_q4a8_m12,dense,5898240,
+0,38,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,38,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,38,gemm_q4a8_m12,dense,1474560,
+0,38,moe_top8,top8,13056,
+0,38,swiglu_q8,shared,59904,
+0,38,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,38,gemm_q4a8_m12,dense,737280,
+0,38,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,38,p2p_ar_n_fp16,AR,294912,
+0,39,gemm_q4a8_m12,dense,12779520,
+0,39,attn_prep,prep,326016,"approx, Q/K norms + rope + KV write"
+0,39,attn_flash_q8,flash,10536192,per-query-head requested K/V; cache shares KV heads
+0,39,gemm_q4a8_m12,dense,5898240,
+0,39,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,39,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,39,gemm_q4a8_m12,dense,1474560,
+0,39,moe_top8,top8,13056,
+0,39,swiglu_q8,shared,59904,
+0,39,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,39,gemm_q4a8_m12,dense,737280,
+0,39,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,39,p2p_ar_n_fp16,AR,294912,
+0,40,gemm_q4a8_m12,dense,14837760,
+0,40,gdn_conv_ring,conv,1239744,"weights + conv ring snapshots + activations, approximate"
+0,40,gdn_recur_ring,recur,20447232,one full state read + M full state-ring writes; ignores Q/K/V/Z
+0,40,gemm_q4a8_m12,dense,5898240,
+0,40,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,40,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,40,gemm_q4a8_m12,dense,1474560,
+0,40,moe_top8,top8,13056,
+0,40,swiglu_q8,shared,59904,
+0,40,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,40,gemm_q4a8_m12,dense,737280,
+0,40,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,40,p2p_ar_n_fp16,AR,294912,
+0,41,gemm_q4a8_m12,dense,14837760,
+0,41,gdn_conv_ring,conv,1239744,"weights + conv ring snapshots + activations, approximate"
+0,41,gdn_recur_ring,recur,20447232,one full state read + M full state-ring writes; ignores Q/K/V/Z
+0,41,gemm_q4a8_m12,dense,5898240,
+0,41,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,41,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,41,gemm_q4a8_m12,dense,1474560,
+0,41,moe_top8,top8,13056,
+0,41,swiglu_q8,shared,59904,
+0,41,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,41,gemm_q4a8_m12,dense,737280,
+0,41,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,41,p2p_ar_n_fp16,AR,294912,
+0,42,gemm_q4a8_m12,dense,14837760,
+0,42,gdn_conv_ring,conv,1239744,"weights + conv ring snapshots + activations, approximate"
+0,42,gdn_recur_ring,recur,20447232,one full state read + M full state-ring writes; ignores Q/K/V/Z
+0,42,gemm_q4a8_m12,dense,5898240,
+0,42,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,42,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,42,gemm_q4a8_m12,dense,1474560,
+0,42,moe_top8,top8,13056,
+0,42,swiglu_q8,shared,59904,
+0,42,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,42,gemm_q4a8_m12,dense,737280,
+0,42,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,42,p2p_ar_n_fp16,AR,294912,
+0,43,gemm_q4a8_m12,dense,12779520,
+0,43,attn_prep,prep,326016,"approx, Q/K norms + rope + KV write"
+0,43,attn_flash_q8,flash,10536192,per-query-head requested K/V; cache shares KV heads
+0,43,gemm_q4a8_m12,dense,5898240,
+0,43,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,43,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,43,gemm_q4a8_m12,dense,1474560,
+0,43,moe_top8,top8,13056,
+0,43,swiglu_q8,shared,59904,
+0,43,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,43,gemm_q4a8_m12,dense,737280,
+0,43,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,43,p2p_ar_n_fp16,AR,294912,
+0,44,gemm_q4a8_m12,dense,14837760,
+0,44,gdn_conv_ring,conv,1239744,"weights + conv ring snapshots + activations, approximate"
+0,44,gdn_recur_ring,recur,20447232,one full state read + M full state-ring writes; ignores Q/K/V/Z
+0,44,gemm_q4a8_m12,dense,5898240,
+0,44,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,44,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,44,gemm_q4a8_m12,dense,1474560,
+0,44,moe_top8,top8,13056,
+0,44,swiglu_q8,shared,59904,
+0,44,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,44,gemm_q4a8_m12,dense,737280,
+0,44,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,44,p2p_ar_n_fp16,AR,294912,
+0,45,gemm_q4a8_m12,dense,14837760,
+0,45,gdn_conv_ring,conv,1239744,"weights + conv ring snapshots + activations, approximate"
+0,45,gdn_recur_ring,recur,20447232,one full state read + M full state-ring writes; ignores Q/K/V/Z
+0,45,gemm_q4a8_m12,dense,5898240,
+0,45,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,45,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,45,gemm_q4a8_m12,dense,1474560,
+0,45,moe_top8,top8,13056,
+0,45,swiglu_q8,shared,59904,
+0,45,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,45,gemm_q4a8_m12,dense,737280,
+0,45,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,45,p2p_ar_n_fp16,AR,294912,
+0,46,gemm_q4a8_m12,dense,14837760,
+0,46,gdn_conv_ring,conv,1239744,"weights + conv ring snapshots + activations, approximate"
+0,46,gdn_recur_ring,recur,20447232,one full state read + M full state-ring writes; ignores Q/K/V/Z
+0,46,gemm_q4a8_m12,dense,5898240,
+0,46,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,46,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,46,gemm_q4a8_m12,dense,1474560,
+0,46,moe_top8,top8,13056,
+0,46,swiglu_q8,shared,59904,
+0,46,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,46,gemm_q4a8_m12,dense,737280,
+0,46,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,46,p2p_ar_n_fp16,AR,294912,
+0,47,gemm_q4a8_m12,dense,12779520,
+0,47,attn_prep,prep,326016,"approx, Q/K norms + rope + KV write"
+0,47,attn_flash_q8,flash,10536192,per-query-head requested K/V; cache shares KV heads
+0,47,gemm_q4a8_m12,dense,5898240,
+0,47,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+0,47,moe_router_logits,router,3158016,"8-row tile, approx weights"
+0,47,gemm_q4a8_m12,dense,1474560,
+0,47,moe_top8,top8,13056,
+0,47,swiglu_q8,shared,59904,
+0,47,vj_moe_gu_q3_kernel,GU,93782016,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+0,47,gemm_q4a8_m12,dense,737280,
+0,47,moe_down_dot8_sub32,Down,70778880,one read for each routed expert per row
+0,47,p2p_ar_n_fp16,AR,294912,
+0,48,vocab_argmax_b12,LM,298721280,approx vocabulary shard; read exact vocab rows from model for precise total
+1,-1,ornith_embed_q8_kernel,input,39168,
+1,-1,ornith_rms_quant_kernel,input,626688,
+1,0,gemm_q4a8_m12,dense,12364800,
+1,0,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+1,0,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+1,0,gemm_q4a8_m12,dense,4915200,
+1,0,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,0,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,0,gemm_q4a8_m12,dense,1228800,
+1,0,moe_top8,top8,13056,
+1,0,swiglu_q8,shared,49920,
+1,0,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,0,gemm_q4a8_m12,dense,614400,
+1,0,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,0,p2p_ar_n_fp16,AR,294912,
+1,1,gemm_q4a8_m12,dense,12364800,
+1,1,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+1,1,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+1,1,gemm_q4a8_m12,dense,4915200,
+1,1,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,1,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,1,gemm_q4a8_m12,dense,1228800,
+1,1,moe_top8,top8,13056,
+1,1,swiglu_q8,shared,49920,
+1,1,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,1,gemm_q4a8_m12,dense,614400,
+1,1,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,1,p2p_ar_n_fp16,AR,294912,
+1,2,gemm_q4a8_m12,dense,12364800,
+1,2,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+1,2,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+1,2,gemm_q4a8_m12,dense,4915200,
+1,2,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,2,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,2,gemm_q4a8_m12,dense,1228800,
+1,2,moe_top8,top8,13056,
+1,2,swiglu_q8,shared,49920,
+1,2,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,2,gemm_q4a8_m12,dense,614400,
+1,2,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,2,p2p_ar_n_fp16,AR,294912,
+1,3,gemm_q4a8_m12,dense,11796480,
+1,3,attn_prep,prep,307968,"approx, Q/K norms + rope + KV write"
+1,3,attn_flash_q8,flash,8780160,per-query-head requested K/V; cache shares KV heads
+1,3,gemm_q4a8_m12,dense,4915200,
+1,3,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,3,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,3,gemm_q4a8_m12,dense,1228800,
+1,3,moe_top8,top8,13056,
+1,3,swiglu_q8,shared,49920,
+1,3,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,3,gemm_q4a8_m12,dense,614400,
+1,3,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,3,p2p_ar_n_fp16,AR,294912,
+1,4,gemm_q4a8_m12,dense,12364800,
+1,4,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+1,4,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+1,4,gemm_q4a8_m12,dense,4915200,
+1,4,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,4,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,4,gemm_q4a8_m12,dense,1228800,
+1,4,moe_top8,top8,13056,
+1,4,swiglu_q8,shared,49920,
+1,4,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,4,gemm_q4a8_m12,dense,614400,
+1,4,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,4,p2p_ar_n_fp16,AR,294912,
+1,5,gemm_q4a8_m12,dense,12364800,
+1,5,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+1,5,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+1,5,gemm_q4a8_m12,dense,4915200,
+1,5,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,5,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,5,gemm_q4a8_m12,dense,1228800,
+1,5,moe_top8,top8,13056,
+1,5,swiglu_q8,shared,49920,
+1,5,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,5,gemm_q4a8_m12,dense,614400,
+1,5,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,5,p2p_ar_n_fp16,AR,294912,
+1,6,gemm_q4a8_m12,dense,12364800,
+1,6,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+1,6,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+1,6,gemm_q4a8_m12,dense,4915200,
+1,6,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,6,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,6,gemm_q4a8_m12,dense,1228800,
+1,6,moe_top8,top8,13056,
+1,6,swiglu_q8,shared,49920,
+1,6,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,6,gemm_q4a8_m12,dense,614400,
+1,6,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,6,p2p_ar_n_fp16,AR,294912,
+1,7,gemm_q4a8_m12,dense,11796480,
+1,7,attn_prep,prep,307968,"approx, Q/K norms + rope + KV write"
+1,7,attn_flash_q8,flash,8780160,per-query-head requested K/V; cache shares KV heads
+1,7,gemm_q4a8_m12,dense,4915200,
+1,7,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,7,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,7,gemm_q4a8_m12,dense,1228800,
+1,7,moe_top8,top8,13056,
+1,7,swiglu_q8,shared,49920,
+1,7,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,7,gemm_q4a8_m12,dense,614400,
+1,7,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,7,p2p_ar_n_fp16,AR,294912,
+1,8,gemm_q4a8_m12,dense,12364800,
+1,8,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+1,8,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+1,8,gemm_q4a8_m12,dense,4915200,
+1,8,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,8,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,8,gemm_q4a8_m12,dense,1228800,
+1,8,moe_top8,top8,13056,
+1,8,swiglu_q8,shared,49920,
+1,8,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,8,gemm_q4a8_m12,dense,614400,
+1,8,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,8,p2p_ar_n_fp16,AR,294912,
+1,9,gemm_q4a8_m12,dense,12364800,
+1,9,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+1,9,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+1,9,gemm_q4a8_m12,dense,4915200,
+1,9,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,9,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,9,gemm_q4a8_m12,dense,1228800,
+1,9,moe_top8,top8,13056,
+1,9,swiglu_q8,shared,49920,
+1,9,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,9,gemm_q4a8_m12,dense,614400,
+1,9,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,9,p2p_ar_n_fp16,AR,294912,
+1,10,gemm_q4a8_m12,dense,12364800,
+1,10,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+1,10,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+1,10,gemm_q4a8_m12,dense,4915200,
+1,10,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,10,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,10,gemm_q4a8_m12,dense,1228800,
+1,10,moe_top8,top8,13056,
+1,10,swiglu_q8,shared,49920,
+1,10,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,10,gemm_q4a8_m12,dense,614400,
+1,10,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,10,p2p_ar_n_fp16,AR,294912,
+1,11,gemm_q4a8_m12,dense,11796480,
+1,11,attn_prep,prep,307968,"approx, Q/K norms + rope + KV write"
+1,11,attn_flash_q8,flash,8780160,per-query-head requested K/V; cache shares KV heads
+1,11,gemm_q4a8_m12,dense,4915200,
+1,11,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,11,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,11,gemm_q4a8_m12,dense,1228800,
+1,11,moe_top8,top8,13056,
+1,11,swiglu_q8,shared,49920,
+1,11,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,11,gemm_q4a8_m12,dense,614400,
+1,11,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,11,p2p_ar_n_fp16,AR,294912,
+1,12,gemm_q4a8_m12,dense,12364800,
+1,12,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+1,12,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+1,12,gemm_q4a8_m12,dense,4915200,
+1,12,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,12,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,12,gemm_q4a8_m12,dense,1228800,
+1,12,moe_top8,top8,13056,
+1,12,swiglu_q8,shared,49920,
+1,12,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,12,gemm_q4a8_m12,dense,614400,
+1,12,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,12,p2p_ar_n_fp16,AR,294912,
+1,13,gemm_q4a8_m12,dense,12364800,
+1,13,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+1,13,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+1,13,gemm_q4a8_m12,dense,4915200,
+1,13,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,13,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,13,gemm_q4a8_m12,dense,1228800,
+1,13,moe_top8,top8,13056,
+1,13,swiglu_q8,shared,49920,
+1,13,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,13,gemm_q4a8_m12,dense,614400,
+1,13,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,13,p2p_ar_n_fp16,AR,294912,
+1,14,gemm_q4a8_m12,dense,12364800,
+1,14,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+1,14,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+1,14,gemm_q4a8_m12,dense,4915200,
+1,14,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,14,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,14,gemm_q4a8_m12,dense,1228800,
+1,14,moe_top8,top8,13056,
+1,14,swiglu_q8,shared,49920,
+1,14,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,14,gemm_q4a8_m12,dense,614400,
+1,14,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,14,p2p_ar_n_fp16,AR,294912,
+1,15,gemm_q4a8_m12,dense,11796480,
+1,15,attn_prep,prep,307968,"approx, Q/K norms + rope + KV write"
+1,15,attn_flash_q8,flash,8780160,per-query-head requested K/V; cache shares KV heads
+1,15,gemm_q4a8_m12,dense,4915200,
+1,15,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,15,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,15,gemm_q4a8_m12,dense,1228800,
+1,15,moe_top8,top8,13056,
+1,15,swiglu_q8,shared,49920,
+1,15,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,15,gemm_q4a8_m12,dense,614400,
+1,15,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,15,p2p_ar_n_fp16,AR,294912,
+1,16,gemm_q4a8_m12,dense,12364800,
+1,16,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+1,16,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+1,16,gemm_q4a8_m12,dense,4915200,
+1,16,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,16,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,16,gemm_q4a8_m12,dense,1228800,
+1,16,moe_top8,top8,13056,
+1,16,swiglu_q8,shared,49920,
+1,16,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,16,gemm_q4a8_m12,dense,614400,
+1,16,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,16,p2p_ar_n_fp16,AR,294912,
+1,17,gemm_q4a8_m12,dense,12364800,
+1,17,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+1,17,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+1,17,gemm_q4a8_m12,dense,4915200,
+1,17,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,17,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,17,gemm_q4a8_m12,dense,1228800,
+1,17,moe_top8,top8,13056,
+1,17,swiglu_q8,shared,49920,
+1,17,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,17,gemm_q4a8_m12,dense,614400,
+1,17,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,17,p2p_ar_n_fp16,AR,294912,
+1,18,gemm_q4a8_m12,dense,12364800,
+1,18,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+1,18,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+1,18,gemm_q4a8_m12,dense,4915200,
+1,18,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,18,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,18,gemm_q4a8_m12,dense,1228800,
+1,18,moe_top8,top8,13056,
+1,18,swiglu_q8,shared,49920,
+1,18,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,18,gemm_q4a8_m12,dense,614400,
+1,18,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,18,p2p_ar_n_fp16,AR,294912,
+1,19,gemm_q4a8_m12,dense,11796480,
+1,19,attn_prep,prep,307968,"approx, Q/K norms + rope + KV write"
+1,19,attn_flash_q8,flash,8780160,per-query-head requested K/V; cache shares KV heads
+1,19,gemm_q4a8_m12,dense,4915200,
+1,19,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,19,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,19,gemm_q4a8_m12,dense,1228800,
+1,19,moe_top8,top8,13056,
+1,19,swiglu_q8,shared,49920,
+1,19,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,19,gemm_q4a8_m12,dense,614400,
+1,19,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,19,p2p_ar_n_fp16,AR,294912,
+1,20,gemm_q4a8_m12,dense,12364800,
+1,20,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+1,20,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+1,20,gemm_q4a8_m12,dense,4915200,
+1,20,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,20,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,20,gemm_q4a8_m12,dense,1228800,
+1,20,moe_top8,top8,13056,
+1,20,swiglu_q8,shared,49920,
+1,20,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,20,gemm_q4a8_m12,dense,614400,
+1,20,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,20,p2p_ar_n_fp16,AR,294912,
+1,21,gemm_q4a8_m12,dense,12364800,
+1,21,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+1,21,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+1,21,gemm_q4a8_m12,dense,4915200,
+1,21,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,21,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,21,gemm_q4a8_m12,dense,1228800,
+1,21,moe_top8,top8,13056,
+1,21,swiglu_q8,shared,49920,
+1,21,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,21,gemm_q4a8_m12,dense,614400,
+1,21,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,21,p2p_ar_n_fp16,AR,294912,
+1,22,gemm_q4a8_m12,dense,12364800,
+1,22,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+1,22,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+1,22,gemm_q4a8_m12,dense,4915200,
+1,22,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,22,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,22,gemm_q4a8_m12,dense,1228800,
+1,22,moe_top8,top8,13056,
+1,22,swiglu_q8,shared,49920,
+1,22,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,22,gemm_q4a8_m12,dense,614400,
+1,22,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,22,p2p_ar_n_fp16,AR,294912,
+1,23,gemm_q4a8_m12,dense,11796480,
+1,23,attn_prep,prep,307968,"approx, Q/K norms + rope + KV write"
+1,23,attn_flash_q8,flash,8780160,per-query-head requested K/V; cache shares KV heads
+1,23,gemm_q4a8_m12,dense,4915200,
+1,23,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,23,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,23,gemm_q4a8_m12,dense,1228800,
+1,23,moe_top8,top8,13056,
+1,23,swiglu_q8,shared,49920,
+1,23,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,23,gemm_q4a8_m12,dense,614400,
+1,23,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,23,p2p_ar_n_fp16,AR,294912,
+1,24,gemm_q4a8_m12,dense,12364800,
+1,24,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+1,24,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+1,24,gemm_q4a8_m12,dense,4915200,
+1,24,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,24,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,24,gemm_q4a8_m12,dense,1228800,
+1,24,moe_top8,top8,13056,
+1,24,swiglu_q8,shared,49920,
+1,24,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,24,gemm_q4a8_m12,dense,614400,
+1,24,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,24,p2p_ar_n_fp16,AR,294912,
+1,25,gemm_q4a8_m12,dense,12364800,
+1,25,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+1,25,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+1,25,gemm_q4a8_m12,dense,4915200,
+1,25,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,25,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,25,gemm_q4a8_m12,dense,1228800,
+1,25,moe_top8,top8,13056,
+1,25,swiglu_q8,shared,49920,
+1,25,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,25,gemm_q4a8_m12,dense,614400,
+1,25,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,25,p2p_ar_n_fp16,AR,294912,
+1,26,gemm_q4a8_m12,dense,12364800,
+1,26,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+1,26,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+1,26,gemm_q4a8_m12,dense,4915200,
+1,26,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,26,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,26,gemm_q4a8_m12,dense,1228800,
+1,26,moe_top8,top8,13056,
+1,26,swiglu_q8,shared,49920,
+1,26,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,26,gemm_q4a8_m12,dense,614400,
+1,26,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,26,p2p_ar_n_fp16,AR,294912,
+1,27,gemm_q4a8_m12,dense,11796480,
+1,27,attn_prep,prep,307968,"approx, Q/K norms + rope + KV write"
+1,27,attn_flash_q8,flash,8780160,per-query-head requested K/V; cache shares KV heads
+1,27,gemm_q4a8_m12,dense,4915200,
+1,27,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,27,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,27,gemm_q4a8_m12,dense,1228800,
+1,27,moe_top8,top8,13056,
+1,27,swiglu_q8,shared,49920,
+1,27,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,27,gemm_q4a8_m12,dense,614400,
+1,27,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,27,p2p_ar_n_fp16,AR,294912,
+1,28,gemm_q4a8_m12,dense,12364800,
+1,28,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+1,28,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+1,28,gemm_q4a8_m12,dense,4915200,
+1,28,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,28,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,28,gemm_q4a8_m12,dense,1228800,
+1,28,moe_top8,top8,13056,
+1,28,swiglu_q8,shared,49920,
+1,28,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,28,gemm_q4a8_m12,dense,614400,
+1,28,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,28,p2p_ar_n_fp16,AR,294912,
+1,29,gemm_q4a8_m12,dense,12364800,
+1,29,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+1,29,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+1,29,gemm_q4a8_m12,dense,4915200,
+1,29,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,29,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,29,gemm_q4a8_m12,dense,1228800,
+1,29,moe_top8,top8,13056,
+1,29,swiglu_q8,shared,49920,
+1,29,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,29,gemm_q4a8_m12,dense,614400,
+1,29,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,29,p2p_ar_n_fp16,AR,294912,
+1,30,gemm_q4a8_m12,dense,12364800,
+1,30,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+1,30,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+1,30,gemm_q4a8_m12,dense,4915200,
+1,30,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,30,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,30,gemm_q4a8_m12,dense,1228800,
+1,30,moe_top8,top8,13056,
+1,30,swiglu_q8,shared,49920,
+1,30,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,30,gemm_q4a8_m12,dense,614400,
+1,30,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,30,p2p_ar_n_fp16,AR,294912,
+1,31,gemm_q4a8_m12,dense,11796480,
+1,31,attn_prep,prep,307968,"approx, Q/K norms + rope + KV write"
+1,31,attn_flash_q8,flash,8780160,per-query-head requested K/V; cache shares KV heads
+1,31,gemm_q4a8_m12,dense,4915200,
+1,31,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,31,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,31,gemm_q4a8_m12,dense,1228800,
+1,31,moe_top8,top8,13056,
+1,31,swiglu_q8,shared,49920,
+1,31,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,31,gemm_q4a8_m12,dense,614400,
+1,31,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,31,p2p_ar_n_fp16,AR,294912,
+1,32,gemm_q4a8_m12,dense,12364800,
+1,32,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+1,32,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+1,32,gemm_q4a8_m12,dense,4915200,
+1,32,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,32,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,32,gemm_q4a8_m12,dense,1228800,
+1,32,moe_top8,top8,13056,
+1,32,swiglu_q8,shared,49920,
+1,32,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,32,gemm_q4a8_m12,dense,614400,
+1,32,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,32,p2p_ar_n_fp16,AR,294912,
+1,33,gemm_q4a8_m12,dense,12364800,
+1,33,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+1,33,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+1,33,gemm_q4a8_m12,dense,4915200,
+1,33,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,33,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,33,gemm_q4a8_m12,dense,1228800,
+1,33,moe_top8,top8,13056,
+1,33,swiglu_q8,shared,49920,
+1,33,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,33,gemm_q4a8_m12,dense,614400,
+1,33,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,33,p2p_ar_n_fp16,AR,294912,
+1,34,gemm_q4a8_m12,dense,12364800,
+1,34,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+1,34,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+1,34,gemm_q4a8_m12,dense,4915200,
+1,34,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,34,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,34,gemm_q4a8_m12,dense,1228800,
+1,34,moe_top8,top8,13056,
+1,34,swiglu_q8,shared,49920,
+1,34,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,34,gemm_q4a8_m12,dense,614400,
+1,34,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,34,p2p_ar_n_fp16,AR,294912,
+1,35,gemm_q4a8_m12,dense,11796480,
+1,35,attn_prep,prep,307968,"approx, Q/K norms + rope + KV write"
+1,35,attn_flash_q8,flash,8780160,per-query-head requested K/V; cache shares KV heads
+1,35,gemm_q4a8_m12,dense,4915200,
+1,35,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,35,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,35,gemm_q4a8_m12,dense,1228800,
+1,35,moe_top8,top8,13056,
+1,35,swiglu_q8,shared,49920,
+1,35,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,35,gemm_q4a8_m12,dense,614400,
+1,35,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,35,p2p_ar_n_fp16,AR,294912,
+1,36,gemm_q4a8_m12,dense,12364800,
+1,36,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+1,36,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+1,36,gemm_q4a8_m12,dense,4915200,
+1,36,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,36,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,36,gemm_q4a8_m12,dense,1228800,
+1,36,moe_top8,top8,13056,
+1,36,swiglu_q8,shared,49920,
+1,36,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,36,gemm_q4a8_m12,dense,614400,
+1,36,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,36,p2p_ar_n_fp16,AR,294912,
+1,37,gemm_q4a8_m12,dense,12364800,
+1,37,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+1,37,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+1,37,gemm_q4a8_m12,dense,4915200,
+1,37,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,37,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,37,gemm_q4a8_m12,dense,1228800,
+1,37,moe_top8,top8,13056,
+1,37,swiglu_q8,shared,49920,
+1,37,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,37,gemm_q4a8_m12,dense,614400,
+1,37,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,37,p2p_ar_n_fp16,AR,294912,
+1,38,gemm_q4a8_m12,dense,12364800,
+1,38,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+1,38,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+1,38,gemm_q4a8_m12,dense,4915200,
+1,38,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,38,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,38,gemm_q4a8_m12,dense,1228800,
+1,38,moe_top8,top8,13056,
+1,38,swiglu_q8,shared,49920,
+1,38,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,38,gemm_q4a8_m12,dense,614400,
+1,38,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,38,p2p_ar_n_fp16,AR,294912,
+1,39,gemm_q4a8_m12,dense,11796480,
+1,39,attn_prep,prep,307968,"approx, Q/K norms + rope + KV write"
+1,39,attn_flash_q8,flash,8780160,per-query-head requested K/V; cache shares KV heads
+1,39,gemm_q4a8_m12,dense,4915200,
+1,39,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,39,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,39,gemm_q4a8_m12,dense,1228800,
+1,39,moe_top8,top8,13056,
+1,39,swiglu_q8,shared,49920,
+1,39,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,39,gemm_q4a8_m12,dense,614400,
+1,39,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,39,p2p_ar_n_fp16,AR,294912,
+1,40,gemm_q4a8_m12,dense,12364800,
+1,40,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+1,40,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+1,40,gemm_q4a8_m12,dense,4915200,
+1,40,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,40,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,40,gemm_q4a8_m12,dense,1228800,
+1,40,moe_top8,top8,13056,
+1,40,swiglu_q8,shared,49920,
+1,40,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,40,gemm_q4a8_m12,dense,614400,
+1,40,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,40,p2p_ar_n_fp16,AR,294912,
+1,41,gemm_q4a8_m12,dense,12364800,
+1,41,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+1,41,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+1,41,gemm_q4a8_m12,dense,4915200,
+1,41,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,41,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,41,gemm_q4a8_m12,dense,1228800,
+1,41,moe_top8,top8,13056,
+1,41,swiglu_q8,shared,49920,
+1,41,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,41,gemm_q4a8_m12,dense,614400,
+1,41,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,41,p2p_ar_n_fp16,AR,294912,
+1,42,gemm_q4a8_m12,dense,12364800,
+1,42,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+1,42,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+1,42,gemm_q4a8_m12,dense,4915200,
+1,42,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,42,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,42,gemm_q4a8_m12,dense,1228800,
+1,42,moe_top8,top8,13056,
+1,42,swiglu_q8,shared,49920,
+1,42,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,42,gemm_q4a8_m12,dense,614400,
+1,42,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,42,p2p_ar_n_fp16,AR,294912,
+1,43,gemm_q4a8_m12,dense,11796480,
+1,43,attn_prep,prep,307968,"approx, Q/K norms + rope + KV write"
+1,43,attn_flash_q8,flash,8780160,per-query-head requested K/V; cache shares KV heads
+1,43,gemm_q4a8_m12,dense,4915200,
+1,43,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,43,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,43,gemm_q4a8_m12,dense,1228800,
+1,43,moe_top8,top8,13056,
+1,43,swiglu_q8,shared,49920,
+1,43,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,43,gemm_q4a8_m12,dense,614400,
+1,43,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,43,p2p_ar_n_fp16,AR,294912,
+1,44,gemm_q4a8_m12,dense,12364800,
+1,44,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+1,44,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+1,44,gemm_q4a8_m12,dense,4915200,
+1,44,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,44,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,44,gemm_q4a8_m12,dense,1228800,
+1,44,moe_top8,top8,13056,
+1,44,swiglu_q8,shared,49920,
+1,44,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,44,gemm_q4a8_m12,dense,614400,
+1,44,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,44,p2p_ar_n_fp16,AR,294912,
+1,45,gemm_q4a8_m12,dense,12364800,
+1,45,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+1,45,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+1,45,gemm_q4a8_m12,dense,4915200,
+1,45,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,45,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,45,gemm_q4a8_m12,dense,1228800,
+1,45,moe_top8,top8,13056,
+1,45,swiglu_q8,shared,49920,
+1,45,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,45,gemm_q4a8_m12,dense,614400,
+1,45,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,45,p2p_ar_n_fp16,AR,294912,
+1,46,gemm_q4a8_m12,dense,12364800,
+1,46,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+1,46,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+1,46,gemm_q4a8_m12,dense,4915200,
+1,46,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,46,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,46,gemm_q4a8_m12,dense,1228800,
+1,46,moe_top8,top8,13056,
+1,46,swiglu_q8,shared,49920,
+1,46,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,46,gemm_q4a8_m12,dense,614400,
+1,46,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,46,p2p_ar_n_fp16,AR,294912,
+1,47,gemm_q4a8_m12,dense,11796480,
+1,47,attn_prep,prep,307968,"approx, Q/K norms + rope + KV write"
+1,47,attn_flash_q8,flash,8780160,per-query-head requested K/V; cache shares KV heads
+1,47,gemm_q4a8_m12,dense,4915200,
+1,47,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+1,47,moe_router_logits,router,3158016,"8-row tile, approx weights"
+1,47,gemm_q4a8_m12,dense,1228800,
+1,47,moe_top8,top8,13056,
+1,47,swiglu_q8,shared,49920,
+1,47,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+1,47,gemm_q4a8_m12,dense,614400,
+1,47,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+1,47,p2p_ar_n_fp16,AR,294912,
+1,48,vocab_argmax_b12,LM,255688704,approx vocabulary shard; read exact vocab rows from model for precise total
+2,-1,ornith_embed_q8_kernel,input,39168,
+2,-1,ornith_rms_quant_kernel,input,626688,
+2,0,gemm_q4a8_m12,dense,12364800,
+2,0,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+2,0,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+2,0,gemm_q4a8_m12,dense,4915200,
+2,0,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,0,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,0,gemm_q4a8_m12,dense,1228800,
+2,0,moe_top8,top8,13056,
+2,0,swiglu_q8,shared,49920,
+2,0,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,0,gemm_q4a8_m12,dense,614400,
+2,0,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,0,p2p_ar_n_fp16,AR,294912,
+2,1,gemm_q4a8_m12,dense,12364800,
+2,1,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+2,1,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+2,1,gemm_q4a8_m12,dense,4915200,
+2,1,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,1,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,1,gemm_q4a8_m12,dense,1228800,
+2,1,moe_top8,top8,13056,
+2,1,swiglu_q8,shared,49920,
+2,1,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,1,gemm_q4a8_m12,dense,614400,
+2,1,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,1,p2p_ar_n_fp16,AR,294912,
+2,2,gemm_q4a8_m12,dense,12364800,
+2,2,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+2,2,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+2,2,gemm_q4a8_m12,dense,4915200,
+2,2,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,2,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,2,gemm_q4a8_m12,dense,1228800,
+2,2,moe_top8,top8,13056,
+2,2,swiglu_q8,shared,49920,
+2,2,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,2,gemm_q4a8_m12,dense,614400,
+2,2,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,2,p2p_ar_n_fp16,AR,294912,
+2,3,gemm_q4a8_m12,dense,10813440,
+2,3,attn_prep,prep,276864,"approx, Q/K norms + rope + KV write"
+2,3,attn_flash_q8,flash,8780160,per-query-head requested K/V; cache shares KV heads
+2,3,gemm_q4a8_m12,dense,4915200,
+2,3,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,3,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,3,gemm_q4a8_m12,dense,1228800,
+2,3,moe_top8,top8,13056,
+2,3,swiglu_q8,shared,49920,
+2,3,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,3,gemm_q4a8_m12,dense,614400,
+2,3,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,3,p2p_ar_n_fp16,AR,294912,
+2,4,gemm_q4a8_m12,dense,12364800,
+2,4,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+2,4,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+2,4,gemm_q4a8_m12,dense,4915200,
+2,4,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,4,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,4,gemm_q4a8_m12,dense,1228800,
+2,4,moe_top8,top8,13056,
+2,4,swiglu_q8,shared,49920,
+2,4,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,4,gemm_q4a8_m12,dense,614400,
+2,4,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,4,p2p_ar_n_fp16,AR,294912,
+2,5,gemm_q4a8_m12,dense,12364800,
+2,5,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+2,5,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+2,5,gemm_q4a8_m12,dense,4915200,
+2,5,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,5,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,5,gemm_q4a8_m12,dense,1228800,
+2,5,moe_top8,top8,13056,
+2,5,swiglu_q8,shared,49920,
+2,5,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,5,gemm_q4a8_m12,dense,614400,
+2,5,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,5,p2p_ar_n_fp16,AR,294912,
+2,6,gemm_q4a8_m12,dense,12364800,
+2,6,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+2,6,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+2,6,gemm_q4a8_m12,dense,4915200,
+2,6,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,6,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,6,gemm_q4a8_m12,dense,1228800,
+2,6,moe_top8,top8,13056,
+2,6,swiglu_q8,shared,49920,
+2,6,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,6,gemm_q4a8_m12,dense,614400,
+2,6,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,6,p2p_ar_n_fp16,AR,294912,
+2,7,gemm_q4a8_m12,dense,10813440,
+2,7,attn_prep,prep,276864,"approx, Q/K norms + rope + KV write"
+2,7,attn_flash_q8,flash,8780160,per-query-head requested K/V; cache shares KV heads
+2,7,gemm_q4a8_m12,dense,4915200,
+2,7,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,7,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,7,gemm_q4a8_m12,dense,1228800,
+2,7,moe_top8,top8,13056,
+2,7,swiglu_q8,shared,49920,
+2,7,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,7,gemm_q4a8_m12,dense,614400,
+2,7,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,7,p2p_ar_n_fp16,AR,294912,
+2,8,gemm_q4a8_m12,dense,12364800,
+2,8,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+2,8,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+2,8,gemm_q4a8_m12,dense,4915200,
+2,8,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,8,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,8,gemm_q4a8_m12,dense,1228800,
+2,8,moe_top8,top8,13056,
+2,8,swiglu_q8,shared,49920,
+2,8,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,8,gemm_q4a8_m12,dense,614400,
+2,8,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,8,p2p_ar_n_fp16,AR,294912,
+2,9,gemm_q4a8_m12,dense,12364800,
+2,9,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+2,9,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+2,9,gemm_q4a8_m12,dense,4915200,
+2,9,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,9,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,9,gemm_q4a8_m12,dense,1228800,
+2,9,moe_top8,top8,13056,
+2,9,swiglu_q8,shared,49920,
+2,9,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,9,gemm_q4a8_m12,dense,614400,
+2,9,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,9,p2p_ar_n_fp16,AR,294912,
+2,10,gemm_q4a8_m12,dense,12364800,
+2,10,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+2,10,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+2,10,gemm_q4a8_m12,dense,4915200,
+2,10,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,10,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,10,gemm_q4a8_m12,dense,1228800,
+2,10,moe_top8,top8,13056,
+2,10,swiglu_q8,shared,49920,
+2,10,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,10,gemm_q4a8_m12,dense,614400,
+2,10,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,10,p2p_ar_n_fp16,AR,294912,
+2,11,gemm_q4a8_m12,dense,10813440,
+2,11,attn_prep,prep,276864,"approx, Q/K norms + rope + KV write"
+2,11,attn_flash_q8,flash,8780160,per-query-head requested K/V; cache shares KV heads
+2,11,gemm_q4a8_m12,dense,4915200,
+2,11,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,11,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,11,gemm_q4a8_m12,dense,1228800,
+2,11,moe_top8,top8,13056,
+2,11,swiglu_q8,shared,49920,
+2,11,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,11,gemm_q4a8_m12,dense,614400,
+2,11,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,11,p2p_ar_n_fp16,AR,294912,
+2,12,gemm_q4a8_m12,dense,12364800,
+2,12,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+2,12,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+2,12,gemm_q4a8_m12,dense,4915200,
+2,12,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,12,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,12,gemm_q4a8_m12,dense,1228800,
+2,12,moe_top8,top8,13056,
+2,12,swiglu_q8,shared,49920,
+2,12,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,12,gemm_q4a8_m12,dense,614400,
+2,12,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,12,p2p_ar_n_fp16,AR,294912,
+2,13,gemm_q4a8_m12,dense,12364800,
+2,13,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+2,13,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+2,13,gemm_q4a8_m12,dense,4915200,
+2,13,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,13,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,13,gemm_q4a8_m12,dense,1228800,
+2,13,moe_top8,top8,13056,
+2,13,swiglu_q8,shared,49920,
+2,13,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,13,gemm_q4a8_m12,dense,614400,
+2,13,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,13,p2p_ar_n_fp16,AR,294912,
+2,14,gemm_q4a8_m12,dense,12364800,
+2,14,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+2,14,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+2,14,gemm_q4a8_m12,dense,4915200,
+2,14,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,14,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,14,gemm_q4a8_m12,dense,1228800,
+2,14,moe_top8,top8,13056,
+2,14,swiglu_q8,shared,49920,
+2,14,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,14,gemm_q4a8_m12,dense,614400,
+2,14,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,14,p2p_ar_n_fp16,AR,294912,
+2,15,gemm_q4a8_m12,dense,10813440,
+2,15,attn_prep,prep,276864,"approx, Q/K norms + rope + KV write"
+2,15,attn_flash_q8,flash,8780160,per-query-head requested K/V; cache shares KV heads
+2,15,gemm_q4a8_m12,dense,4915200,
+2,15,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,15,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,15,gemm_q4a8_m12,dense,1228800,
+2,15,moe_top8,top8,13056,
+2,15,swiglu_q8,shared,49920,
+2,15,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,15,gemm_q4a8_m12,dense,614400,
+2,15,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,15,p2p_ar_n_fp16,AR,294912,
+2,16,gemm_q4a8_m12,dense,12364800,
+2,16,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+2,16,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+2,16,gemm_q4a8_m12,dense,4915200,
+2,16,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,16,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,16,gemm_q4a8_m12,dense,1228800,
+2,16,moe_top8,top8,13056,
+2,16,swiglu_q8,shared,49920,
+2,16,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,16,gemm_q4a8_m12,dense,614400,
+2,16,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,16,p2p_ar_n_fp16,AR,294912,
+2,17,gemm_q4a8_m12,dense,12364800,
+2,17,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+2,17,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+2,17,gemm_q4a8_m12,dense,4915200,
+2,17,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,17,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,17,gemm_q4a8_m12,dense,1228800,
+2,17,moe_top8,top8,13056,
+2,17,swiglu_q8,shared,49920,
+2,17,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,17,gemm_q4a8_m12,dense,614400,
+2,17,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,17,p2p_ar_n_fp16,AR,294912,
+2,18,gemm_q4a8_m12,dense,12364800,
+2,18,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+2,18,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+2,18,gemm_q4a8_m12,dense,4915200,
+2,18,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,18,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,18,gemm_q4a8_m12,dense,1228800,
+2,18,moe_top8,top8,13056,
+2,18,swiglu_q8,shared,49920,
+2,18,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,18,gemm_q4a8_m12,dense,614400,
+2,18,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,18,p2p_ar_n_fp16,AR,294912,
+2,19,gemm_q4a8_m12,dense,10813440,
+2,19,attn_prep,prep,276864,"approx, Q/K norms + rope + KV write"
+2,19,attn_flash_q8,flash,8780160,per-query-head requested K/V; cache shares KV heads
+2,19,gemm_q4a8_m12,dense,4915200,
+2,19,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,19,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,19,gemm_q4a8_m12,dense,1228800,
+2,19,moe_top8,top8,13056,
+2,19,swiglu_q8,shared,49920,
+2,19,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,19,gemm_q4a8_m12,dense,614400,
+2,19,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,19,p2p_ar_n_fp16,AR,294912,
+2,20,gemm_q4a8_m12,dense,12364800,
+2,20,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+2,20,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+2,20,gemm_q4a8_m12,dense,4915200,
+2,20,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,20,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,20,gemm_q4a8_m12,dense,1228800,
+2,20,moe_top8,top8,13056,
+2,20,swiglu_q8,shared,49920,
+2,20,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,20,gemm_q4a8_m12,dense,614400,
+2,20,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,20,p2p_ar_n_fp16,AR,294912,
+2,21,gemm_q4a8_m12,dense,12364800,
+2,21,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+2,21,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+2,21,gemm_q4a8_m12,dense,4915200,
+2,21,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,21,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,21,gemm_q4a8_m12,dense,1228800,
+2,21,moe_top8,top8,13056,
+2,21,swiglu_q8,shared,49920,
+2,21,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,21,gemm_q4a8_m12,dense,614400,
+2,21,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,21,p2p_ar_n_fp16,AR,294912,
+2,22,gemm_q4a8_m12,dense,12364800,
+2,22,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+2,22,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+2,22,gemm_q4a8_m12,dense,4915200,
+2,22,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,22,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,22,gemm_q4a8_m12,dense,1228800,
+2,22,moe_top8,top8,13056,
+2,22,swiglu_q8,shared,49920,
+2,22,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,22,gemm_q4a8_m12,dense,614400,
+2,22,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,22,p2p_ar_n_fp16,AR,294912,
+2,23,gemm_q4a8_m12,dense,10813440,
+2,23,attn_prep,prep,276864,"approx, Q/K norms + rope + KV write"
+2,23,attn_flash_q8,flash,8780160,per-query-head requested K/V; cache shares KV heads
+2,23,gemm_q4a8_m12,dense,4915200,
+2,23,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,23,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,23,gemm_q4a8_m12,dense,1228800,
+2,23,moe_top8,top8,13056,
+2,23,swiglu_q8,shared,49920,
+2,23,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,23,gemm_q4a8_m12,dense,614400,
+2,23,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,23,p2p_ar_n_fp16,AR,294912,
+2,24,gemm_q4a8_m12,dense,12364800,
+2,24,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+2,24,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+2,24,gemm_q4a8_m12,dense,4915200,
+2,24,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,24,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,24,gemm_q4a8_m12,dense,1228800,
+2,24,moe_top8,top8,13056,
+2,24,swiglu_q8,shared,49920,
+2,24,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,24,gemm_q4a8_m12,dense,614400,
+2,24,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,24,p2p_ar_n_fp16,AR,294912,
+2,25,gemm_q4a8_m12,dense,12364800,
+2,25,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+2,25,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+2,25,gemm_q4a8_m12,dense,4915200,
+2,25,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,25,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,25,gemm_q4a8_m12,dense,1228800,
+2,25,moe_top8,top8,13056,
+2,25,swiglu_q8,shared,49920,
+2,25,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,25,gemm_q4a8_m12,dense,614400,
+2,25,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,25,p2p_ar_n_fp16,AR,294912,
+2,26,gemm_q4a8_m12,dense,12364800,
+2,26,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+2,26,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+2,26,gemm_q4a8_m12,dense,4915200,
+2,26,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,26,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,26,gemm_q4a8_m12,dense,1228800,
+2,26,moe_top8,top8,13056,
+2,26,swiglu_q8,shared,49920,
+2,26,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,26,gemm_q4a8_m12,dense,614400,
+2,26,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,26,p2p_ar_n_fp16,AR,294912,
+2,27,gemm_q4a8_m12,dense,10813440,
+2,27,attn_prep,prep,276864,"approx, Q/K norms + rope + KV write"
+2,27,attn_flash_q8,flash,8780160,per-query-head requested K/V; cache shares KV heads
+2,27,gemm_q4a8_m12,dense,4915200,
+2,27,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,27,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,27,gemm_q4a8_m12,dense,1228800,
+2,27,moe_top8,top8,13056,
+2,27,swiglu_q8,shared,49920,
+2,27,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,27,gemm_q4a8_m12,dense,614400,
+2,27,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,27,p2p_ar_n_fp16,AR,294912,
+2,28,gemm_q4a8_m12,dense,12364800,
+2,28,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+2,28,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+2,28,gemm_q4a8_m12,dense,4915200,
+2,28,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,28,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,28,gemm_q4a8_m12,dense,1228800,
+2,28,moe_top8,top8,13056,
+2,28,swiglu_q8,shared,49920,
+2,28,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,28,gemm_q4a8_m12,dense,614400,
+2,28,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,28,p2p_ar_n_fp16,AR,294912,
+2,29,gemm_q4a8_m12,dense,12364800,
+2,29,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+2,29,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+2,29,gemm_q4a8_m12,dense,4915200,
+2,29,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,29,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,29,gemm_q4a8_m12,dense,1228800,
+2,29,moe_top8,top8,13056,
+2,29,swiglu_q8,shared,49920,
+2,29,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,29,gemm_q4a8_m12,dense,614400,
+2,29,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,29,p2p_ar_n_fp16,AR,294912,
+2,30,gemm_q4a8_m12,dense,12364800,
+2,30,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+2,30,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+2,30,gemm_q4a8_m12,dense,4915200,
+2,30,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,30,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,30,gemm_q4a8_m12,dense,1228800,
+2,30,moe_top8,top8,13056,
+2,30,swiglu_q8,shared,49920,
+2,30,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,30,gemm_q4a8_m12,dense,614400,
+2,30,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,30,p2p_ar_n_fp16,AR,294912,
+2,31,gemm_q4a8_m12,dense,10813440,
+2,31,attn_prep,prep,276864,"approx, Q/K norms + rope + KV write"
+2,31,attn_flash_q8,flash,8780160,per-query-head requested K/V; cache shares KV heads
+2,31,gemm_q4a8_m12,dense,4915200,
+2,31,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,31,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,31,gemm_q4a8_m12,dense,1228800,
+2,31,moe_top8,top8,13056,
+2,31,swiglu_q8,shared,49920,
+2,31,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,31,gemm_q4a8_m12,dense,614400,
+2,31,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,31,p2p_ar_n_fp16,AR,294912,
+2,32,gemm_q4a8_m12,dense,12364800,
+2,32,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+2,32,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+2,32,gemm_q4a8_m12,dense,4915200,
+2,32,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,32,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,32,gemm_q4a8_m12,dense,1228800,
+2,32,moe_top8,top8,13056,
+2,32,swiglu_q8,shared,49920,
+2,32,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,32,gemm_q4a8_m12,dense,614400,
+2,32,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,32,p2p_ar_n_fp16,AR,294912,
+2,33,gemm_q4a8_m12,dense,12364800,
+2,33,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+2,33,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+2,33,gemm_q4a8_m12,dense,4915200,
+2,33,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,33,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,33,gemm_q4a8_m12,dense,1228800,
+2,33,moe_top8,top8,13056,
+2,33,swiglu_q8,shared,49920,
+2,33,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,33,gemm_q4a8_m12,dense,614400,
+2,33,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,33,p2p_ar_n_fp16,AR,294912,
+2,34,gemm_q4a8_m12,dense,12364800,
+2,34,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+2,34,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+2,34,gemm_q4a8_m12,dense,4915200,
+2,34,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,34,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,34,gemm_q4a8_m12,dense,1228800,
+2,34,moe_top8,top8,13056,
+2,34,swiglu_q8,shared,49920,
+2,34,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,34,gemm_q4a8_m12,dense,614400,
+2,34,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,34,p2p_ar_n_fp16,AR,294912,
+2,35,gemm_q4a8_m12,dense,10813440,
+2,35,attn_prep,prep,276864,"approx, Q/K norms + rope + KV write"
+2,35,attn_flash_q8,flash,8780160,per-query-head requested K/V; cache shares KV heads
+2,35,gemm_q4a8_m12,dense,4915200,
+2,35,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,35,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,35,gemm_q4a8_m12,dense,1228800,
+2,35,moe_top8,top8,13056,
+2,35,swiglu_q8,shared,49920,
+2,35,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,35,gemm_q4a8_m12,dense,614400,
+2,35,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,35,p2p_ar_n_fp16,AR,294912,
+2,36,gemm_q4a8_m12,dense,12364800,
+2,36,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+2,36,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+2,36,gemm_q4a8_m12,dense,4915200,
+2,36,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,36,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,36,gemm_q4a8_m12,dense,1228800,
+2,36,moe_top8,top8,13056,
+2,36,swiglu_q8,shared,49920,
+2,36,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,36,gemm_q4a8_m12,dense,614400,
+2,36,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,36,p2p_ar_n_fp16,AR,294912,
+2,37,gemm_q4a8_m12,dense,12364800,
+2,37,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+2,37,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+2,37,gemm_q4a8_m12,dense,4915200,
+2,37,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,37,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,37,gemm_q4a8_m12,dense,1228800,
+2,37,moe_top8,top8,13056,
+2,37,swiglu_q8,shared,49920,
+2,37,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,37,gemm_q4a8_m12,dense,614400,
+2,37,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,37,p2p_ar_n_fp16,AR,294912,
+2,38,gemm_q4a8_m12,dense,12364800,
+2,38,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+2,38,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+2,38,gemm_q4a8_m12,dense,4915200,
+2,38,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,38,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,38,gemm_q4a8_m12,dense,1228800,
+2,38,moe_top8,top8,13056,
+2,38,swiglu_q8,shared,49920,
+2,38,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,38,gemm_q4a8_m12,dense,614400,
+2,38,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,38,p2p_ar_n_fp16,AR,294912,
+2,39,gemm_q4a8_m12,dense,10813440,
+2,39,attn_prep,prep,276864,"approx, Q/K norms + rope + KV write"
+2,39,attn_flash_q8,flash,8780160,per-query-head requested K/V; cache shares KV heads
+2,39,gemm_q4a8_m12,dense,4915200,
+2,39,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,39,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,39,gemm_q4a8_m12,dense,1228800,
+2,39,moe_top8,top8,13056,
+2,39,swiglu_q8,shared,49920,
+2,39,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,39,gemm_q4a8_m12,dense,614400,
+2,39,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,39,p2p_ar_n_fp16,AR,294912,
+2,40,gemm_q4a8_m12,dense,12364800,
+2,40,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+2,40,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+2,40,gemm_q4a8_m12,dense,4915200,
+2,40,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,40,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,40,gemm_q4a8_m12,dense,1228800,
+2,40,moe_top8,top8,13056,
+2,40,swiglu_q8,shared,49920,
+2,40,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,40,gemm_q4a8_m12,dense,614400,
+2,40,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,40,p2p_ar_n_fp16,AR,294912,
+2,41,gemm_q4a8_m12,dense,12364800,
+2,41,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+2,41,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+2,41,gemm_q4a8_m12,dense,4915200,
+2,41,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,41,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,41,gemm_q4a8_m12,dense,1228800,
+2,41,moe_top8,top8,13056,
+2,41,swiglu_q8,shared,49920,
+2,41,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,41,gemm_q4a8_m12,dense,614400,
+2,41,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,41,p2p_ar_n_fp16,AR,294912,
+2,42,gemm_q4a8_m12,dense,12364800,
+2,42,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+2,42,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+2,42,gemm_q4a8_m12,dense,4915200,
+2,42,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,42,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,42,gemm_q4a8_m12,dense,1228800,
+2,42,moe_top8,top8,13056,
+2,42,swiglu_q8,shared,49920,
+2,42,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,42,gemm_q4a8_m12,dense,614400,
+2,42,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,42,p2p_ar_n_fp16,AR,294912,
+2,43,gemm_q4a8_m12,dense,10813440,
+2,43,attn_prep,prep,276864,"approx, Q/K norms + rope + KV write"
+2,43,attn_flash_q8,flash,8780160,per-query-head requested K/V; cache shares KV heads
+2,43,gemm_q4a8_m12,dense,4915200,
+2,43,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,43,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,43,gemm_q4a8_m12,dense,1228800,
+2,43,moe_top8,top8,13056,
+2,43,swiglu_q8,shared,49920,
+2,43,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,43,gemm_q4a8_m12,dense,614400,
+2,43,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,43,p2p_ar_n_fp16,AR,294912,
+2,44,gemm_q4a8_m12,dense,12364800,
+2,44,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+2,44,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+2,44,gemm_q4a8_m12,dense,4915200,
+2,44,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,44,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,44,gemm_q4a8_m12,dense,1228800,
+2,44,moe_top8,top8,13056,
+2,44,swiglu_q8,shared,49920,
+2,44,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,44,gemm_q4a8_m12,dense,614400,
+2,44,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,44,p2p_ar_n_fp16,AR,294912,
+2,45,gemm_q4a8_m12,dense,12364800,
+2,45,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+2,45,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+2,45,gemm_q4a8_m12,dense,4915200,
+2,45,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,45,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,45,gemm_q4a8_m12,dense,1228800,
+2,45,moe_top8,top8,13056,
+2,45,swiglu_q8,shared,49920,
+2,45,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,45,gemm_q4a8_m12,dense,614400,
+2,45,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,45,p2p_ar_n_fp16,AR,294912,
+2,46,gemm_q4a8_m12,dense,12364800,
+2,46,gdn_conv_ring,conv,1033120,"weights + conv ring snapshots + activations, approximate"
+2,46,gdn_recur_ring,recur,17039360,one full state read + M full state-ring writes; ignores Q/K/V/Z
+2,46,gemm_q4a8_m12,dense,4915200,
+2,46,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,46,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,46,gemm_q4a8_m12,dense,1228800,
+2,46,moe_top8,top8,13056,
+2,46,swiglu_q8,shared,49920,
+2,46,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,46,gemm_q4a8_m12,dense,614400,
+2,46,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,46,p2p_ar_n_fp16,AR,294912,
+2,47,gemm_q4a8_m12,dense,10813440,
+2,47,attn_prep,prep,276864,"approx, Q/K norms + rope + KV write"
+2,47,attn_flash_q8,flash,8780160,per-query-head requested K/V; cache shares KV heads
+2,47,gemm_q4a8_m12,dense,4915200,
+2,47,p2p_ar_n_fp16,AR,294912,two peer sends + two peer receives; prepush moves sends into GEMM
+2,47,moe_router_logits,router,3158016,"8-row tile, approx weights"
+2,47,gemm_q4a8_m12,dense,1228800,
+2,47,moe_top8,top8,13056,
+2,47,swiglu_q8,shared,49920,
+2,47,vj_moe_gu_q3_kernel,GU,78151680,96 routes at M12; Q3 scales include 192 B subscales + 48 B fp16 pairs
+2,47,gemm_q4a8_m12,dense,614400,
+2,47,moe_down_dot8_sub32,Down,58982400,one read for each routed expert per row
+2,47,p2p_ar_n_fp16,AR,294912,
+2,48,vocab_argmax_b12,LM,256315392,approx vocabulary shard; read exact vocab rows from model for precise total

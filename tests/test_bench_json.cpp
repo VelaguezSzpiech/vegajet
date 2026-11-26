@@ -8,6 +8,7 @@
 //                               w4a8_then_dot8.json for tests/test_bench_json_roundtrip.py.
 #include "core/bench_json.hpp"
 #include "core/json_lite.hpp"
+#include "core/power_telemetry.hpp"
 #include "tests/test_common.hpp"
 
 #include <unistd.h>
@@ -34,7 +35,7 @@ std::string fmt(const char* f, ...) {
     return b;
 }
 
-// One bench log as the engine prints it (format strings verbatim from ornith_gpu.cpp).
+// Historical engine-format fixture, including the legacy telemetry line for compatibility.
 std::string engine_log(double raw, double pp512, double pp2048, unsigned code_match, double tmem, double avg_w, bool dot8_kld_line,
                        bool hyb_lossless = true) {
     std::string s;
@@ -229,6 +230,18 @@ int main(int argc, char** argv) {
         bad.gpus_after = snapshot(root.string());
         std::ofstream(d / "cand_bad.json") << to_json(bad);
         std::ofstream(d / "w4a8_then_dot8.json") << to_json(merged);
+        // Current formatter -> C++ parser/JSON -> Python scorecard (including nulls).
+        std::vector<telemetry::Card> cards(2);
+        cards[0].id = "card1";
+        cards[0].observe(100.0, 220.0, 50.0, 150.0);
+        cards[0].observe(100.125, 220.0, 51.0, 150.0);
+        cards[1].id = "card2";  // Discovered but all reads unavailable.
+        cards[1].observe(100.25, telemetry::unavailable(), telemetry::unavailable(), telemetry::unavailable());
+        const std::string telemetry_log = telemetry::report(cards);
+        std::ofstream(d / "telemetry.log") << telemetry_log;
+        Record telemetry_record = base_record("w4a8");
+        parse_log(telemetry_log, telemetry_record);
+        std::ofstream(d / "telemetry.json") << to_json(telemetry_record);
     }
     fs::remove_all(root);
     std::printf("test_bench_json: engine lines (engine format strings), vegajet.bench.v1 JSON, idempotent round trip, "

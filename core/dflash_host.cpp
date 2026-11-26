@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <map>
 
@@ -212,6 +213,78 @@ MaskDiff diff_mask(const MaskSpec& expected, const std::vector<uint8_t>& observe
     else
         d.summary += "; matches no known variant";
     return d;
+}
+
+// ---- 3b. engine block-mask plan --------------------------------------------------------------------------------
+const char* block_mask_mode_name(BlockMaskMode m) {
+    switch (m) {
+        case BlockMaskMode::Bidir: return "bidir";
+        case BlockMaskMode::ZLab: return "zlab";
+        case BlockMaskMode::Causal: return "causal";
+    }
+    return "?";
+}
+
+bool parse_block_mask_mode(const char* text, BlockMaskMode* out) {
+    if (out == nullptr) return false;
+    if (text == nullptr || text[0] == '\0') {
+        *out = BlockMaskMode::Bidir;
+        return true;
+    }
+    if (std::strcmp(text, "bidir") == 0) { *out = BlockMaskMode::Bidir; return true; }
+    if (std::strcmp(text, "zlab") == 0) { *out = BlockMaskMode::ZLab; return true; }
+    if (std::strcmp(text, "causal") == 0) { *out = BlockMaskMode::Causal; return true; }
+    return false;
+}
+
+DraftBlockMaskPlan plan_draft_block_mask(const DraftBlockMaskConfig& c) {
+    DraftBlockMaskPlan p;
+    char buf[256];
+    if (c.mode == BlockMaskMode::Bidir) {
+        p.ok = true;
+        p.summary = "mode=bidir (shipped: bidirectional block on every layer, no arm)";
+        return p;
+    }
+    const std::string mode = block_mask_mode_name(c.mode);
+    if (!c.pattern_known) {
+        p.error = "mode=" + mode +
+                  " needs dflash.attention.sliding_window_pattern (one entry per drafter layer) to tell the "
+                  "sliding_attention layers from the full one; unknown pattern: fail closed";
+        return p;
+    }
+    if (c.n_layer == 0u || c.n_layer > 32u) {
+        p.error = "mode=" + mode + " needs 1..32 drafter layers, got " + std::to_string(c.n_layer);
+        return p;
+    }
+    if (c.block_len == 0u || c.block_len > 32u) {
+        p.error = "block_len (B) out of range 1..32: " + std::to_string(c.block_len);
+        return p;
+    }
+    const uint32_t known = (c.n_layer == 32u) ? 0xFFFFFFFFu : ((1u << c.n_layer) - 1u);
+    if ((c.swa_layer_mask & ~known) != 0u) {
+        snprintf(buf, sizeof(buf), "swa_layer_mask=0x%x has bits outside n_layer=%u",
+                 static_cast<unsigned>(c.swa_layer_mask), static_cast<unsigned>(c.n_layer));
+        p.error = buf;
+        return p;
+    }
+    if (c.swa_window == 0u) {
+        p.error = "attention.sliding_window is 0: the short-context boundary would be empty (mode=" + mode + ")";
+        return p;
+    }
+    const uint32_t swa = c.swa_layer_mask & known;
+    const uint32_t masked = (c.mode == BlockMaskMode::Causal) ? known : swa;
+    const uint64_t last_query = static_cast<uint64_t>(c.block_start) + static_cast<uint64_t>(c.block_len);
+    p.arm = last_query <= static_cast<uint64_t>(c.swa_window);
+    p.causal_mask = p.arm ? masked : 0u;
+    p.ok = true;
+    snprintf(buf, sizeof(buf),
+             "mode=%s arm=%d s_pos=%u B=%u W=%u causal_layers=0x%x (pattern %u swa of 0x%x, %u full)",
+             mode.c_str(), p.arm ? 1 : 0, static_cast<unsigned>(c.block_start), static_cast<unsigned>(c.block_len),
+             static_cast<unsigned>(c.swa_window), static_cast<unsigned>(p.causal_mask),
+             static_cast<unsigned>(__builtin_popcount(swa)), static_cast<unsigned>(swa),
+             static_cast<unsigned>(__builtin_popcount(known & ~swa)));
+    p.summary = buf;
+    return p;
 }
 
 void masked_attention(const float* q, const float* k, const float* v, const std::vector<uint8_t>& mask, int B,

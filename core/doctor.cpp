@@ -840,6 +840,10 @@ bool calibrate_and_save_hw_profile(const std::string& out_path) {
             if (loc_cu.count(loc)) n_cu = loc_cu[loc];
         }
         fs::path dev = fs::path("/sys/bus/pci/devices") / g.bdf;
+        std::string uid_hex;
+        if (read_first_line((dev / "unique_id").string(), uid_hex)) {
+            for (char& c : uid_hex) if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+        }
         double sclk_ghz = read_dpm_mhz(dev / "pp_dpm_sclk", 1725.0) / 1000.0;
         double mclk_mhz = read_dpm_mhz(dev / "pp_dpm_mclk", 1080.0);
         const bool is_measured = measured_bw_gbs.count(g.bdf) > 0;
@@ -847,11 +851,12 @@ bool calibrate_and_save_hw_profile(const std::string& out_path) {
         double eta      = 0.55;
         double i_star   = (static_cast<double>(n_cu) * 64.0 * sclk_ghz * eta) / bw_gbs;
         double pcap     = (g.power_cap_w > 0.0) ? g.power_cap_w : 200.0;
-        std::printf("  [%s] n_cu=%u sclk=%.3f GHz mclk=%.0f MHz bw=%.1f GB/s (%s) cap=%.0f W | I*=%.2f inst/B (M=5 2x reuse: %.2f)\n",
-                    g.bdf.c_str(), n_cu, sclk_ghz, mclk_mhz, bw_gbs, is_measured ? "s_memrealtime" : "sysfs est",
-                    pcap, i_star, i_star * 0.5);
-        ofs << "    {\"bdf\": \"" << g.bdf
-            << "\", \"n_cu\": " << n_cu
+        std::printf("  [%s] uid=%s n_cu=%u sclk=%.3f GHz mclk=%.0f MHz bw=%.1f GB/s (%s) cap=%.0f W | I*=%.2f inst/B (M=5 2x reuse: %.2f)\n",
+                    g.bdf.c_str(), uid_hex.empty() ? "-" : uid_hex.c_str(), n_cu, sclk_ghz, mclk_mhz, bw_gbs,
+                    is_measured ? "s_memrealtime" : "sysfs est", pcap, i_star, i_star * 0.5);
+        ofs << "    {\"bdf\": \"" << g.bdf << "\"";
+        if (!uid_hex.empty()) ofs << ", \"unique_id\": \"" << uid_hex << "\"";
+        ofs << ", \"n_cu\": " << n_cu
             << ", \"sclk_ghz\": " << sclk_ghz
             << ", \"mclk_mhz\": " << mclk_mhz
             << ", \"bw_hbm_gbs\": " << bw_gbs

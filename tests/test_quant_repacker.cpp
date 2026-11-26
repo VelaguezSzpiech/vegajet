@@ -204,8 +204,8 @@ int main() {
 
     // Roofline profile + JSON round trip.
     HardwareRooflineProfile hw;
-    hw.gpus = {GpuRooflineInfo{"gpu0", 60, 1.50, 1080.0, 732.0, 200.0, 0.55},
-               GpuRooflineInfo{"gpu1", 60, 1.50, 1140.0, 761.0, 200.0, 0.55}};
+    hw.gpus = {GpuRooflineInfo{"gpu0", "", 60, 1.50, 1080.0, 732.0, 200.0, 0.55},
+               GpuRooflineInfo{"gpu1", "", 60, 1.50, 1140.0, 761.0, 200.0, 0.55}};
     VJ_CHECK(std::fabs(hw.gpus[0].i_star() - 4.33) < 0.05 && std::fabs(hw.gpus[1].i_star() - 4.16) < 0.05);
     VJ_CHECK(std::fabs(hw.min_i_star(2.0) - 2.08) < 0.05);
     const std::string js = "/tmp/vegajet_test_hw_profile_" + std::to_string(getpid()) + ".json";

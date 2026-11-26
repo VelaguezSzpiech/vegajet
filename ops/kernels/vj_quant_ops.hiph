@@ -943,9 +943,9 @@ __device__ __forceinline__ void vj_gemm_q8_dp4a_tiled_32x64_persistent(
 } // namespace dev
 } // namespace vegajet
 
-// High-AI Prefill Tiled GEMM: VJ_Q8_DP4A (BN=64, BM=32, BK=128, 128-bit dwordx4 loads, full unroll, 14.7 KiB LDS, 0 B spill!)
+// High-AI Prefill Tiled GEMM: VJ_Q8_DP4A (BN=64, BM=32, BK=128, 128-bit dwordx4 loads, 14.7 KiB LDS)
 // Grid: (ceil(M/32)*256, ceil(N/64), 1) -> schedules mt=0 & mt=1 for same N-tile together for 100% L2 hit on w_qs!
-extern "C" __global__ __launch_bounds__(256, 3)
+extern "C" __global__ __launch_bounds__(256, 3) __attribute__((amdgpu_num_vgpr(64)))
 void vj_gemm_q8_dp4a_tiled_64x32_kernel(
     const int8_t*   __restrict__ w_qs,
     const uint16_t* __restrict__ w_ds,
@@ -1006,12 +1006,13 @@ void vj_gemm_q8_dp4a_tiled_64x32_kernel(
 
         const uint32_t r0 = tn * 4u, r1 = r0 + 1u, r2 = r0 + 2u, r3 = r0 + 3u;
         const uint32_t t0 = tm * 2u, t1 = t0 + 1u;
-        #pragma unroll
+        // Bound live dot-product operands; retain ascending sub/k accumulation order.
+        #pragma nounroll
         for (uint32_t sub = 0u; sub < 8u; ++sub) {
             int32_t a00 = 0, a01 = 0, a02 = 0, a03 = 0;
             int32_t a10 = 0, a11 = 0, a12 = 0, a13 = 0;
             const uint32_t kb = sub * 4u;
-            #pragma unroll
+            #pragma nounroll
             for (uint32_t k = 0u; k < 4u; ++k) {
                 uint32_t wr0 = sm_w[r0][kb + k], wr1 = sm_w[r1][kb + k], wr2 = sm_w[r2][kb + k], wr3 = sm_w[r3][kb + k];
                 uint32_t xt0 = sm_x[t0][kb + k], xt1 = sm_x[t1][kb + k];

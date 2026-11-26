@@ -1,0 +1,78 @@
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+#pragma once
+#include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+#include <stdint.h>
+namespace vegajet::kvq_dev {
+__device__ float halfval(const uint16_t* p) { return __half2float(__ushort_as_half(*p)); }
+__device__ float cb(unsigned c) {
+    float v=(c&3)==0 ? 0.2451f : (c&3)==1 ? 0.7560f : (c&3)==2 ? 1.3439f : 2.1519f;
+    if(c<4) { unsigned j=3-c; v=j==0?0.2451f:j==1?0.7560f:j==2?1.3439f:2.1519f; }
+    return c<4 ? -v : v;
+}
+__device__ unsigned nearest(float x) {
+    unsigned i=0; while(i<7 && x>0.5f*(cb(i)+cb(i+1))) ++i; return i;
+}
+__device__ unsigned stride(unsigned f,unsigned d) { return f==0?2*d:f==1?d+2*(d/32):f==2?18*(d/32):14*(d/32); }
+__device__ float elem(const uint8_t* p,unsigned f,unsigned d,unsigned i) {
+    if(f==0) return halfval((const uint16_t*)p+i);
+    float s=halfval((const uint16_t*)p+i/32);
+    const uint8_t* c=p+2*(d/32);
+    if(f==1) return s*((const int8_t*)c)[i];
+    if(f==2) { unsigned n=(((const uint32_t*)c)[i/8]>>(4*(i%8)))&15; return s*(n>=8?int(n)-16:int(n)); }
+    const uint32_t* b=(const uint32_t*)c+3*(i/32); unsigned j=i%32;
+    return s*cb(((b[j/16]>>(2*(j%16)))&3)|(((b[2]>>j)&1)<<2));
+}
+__device__ void transform(float* x,unsigned d,unsigned tid) {
+    for(unsigned h=1;h<d;h<<=1) {
+        float a=tid<d?x[tid]:0, b=tid<d?x[tid^h]:0;
+        __syncthreads();
+        if(tid<d) x[tid]=(tid&h)?b-a:a+b;
+        __syncthreads();
+    }
+    if(tid<d) x[tid]*=rsqrtf(float(d));
+    __syncthreads();
+}
+__device__ float sum64(float x) {
+    for(int s=32;s;s>>=1) x+=__shfl_xor(x,s,64); return x;
+}
+
+// x contains the signed/FWHT rotated vector for Turbo3; all block threads call.
+__device__ __forceinline__ void append_vector(float* x,uint8_t* p,unsigned dim,unsigned format,unsigned tid) {
+    if(format==0) { if(tid<dim) ((uint16_t*)p)[tid]=__half_as_ushort(__float2half(x[tid])); return; }
+    if(tid>=dim/32) return;
+    unsigned b=tid; float* xb=x+b*32;
+    float am=0,mv=0;
+    for(unsigned j=0;j<32;++j) if(fabsf(xb[j])>am) { am=fabsf(xb[j]); mv=xb[j]; }
+    float s=format==1?am/127:mv/-8;
+    if(format==3) {
+        double ss=0; for(unsigned j=0;j<32;++j) ss+=double(xb[j])*xb[j];
+        double best=-1; uint16_t bh=0;
+        for(unsigned start=0;start<2;++start) {
+            float sc=start?am/2.1519f:float(sqrt(ss/32));
+            for(int it=0;it<3 && sc>0;++it) {
+                double num=0,den=0;
+                for(unsigned j=0;j<32;++j) { float c=cb(nearest(xb[j]/sc)); num+=double(xb[j])*c; den+=double(c)*c; }
+                if(num>0 && den>0) sc=float(num/den);
+            }
+            uint16_t sh=__half_as_ushort(__float2half(sc)); float sf=halfval(&sh); double err=0;
+            for(unsigned j=0;j<32;++j) { double r=sf>0?xb[j]-sf*cb(nearest(xb[j]/sf)):xb[j]; err+=r*r; }
+            if(best<0 || err<best) { best=err; bh=sh; }
+        }
+        ((uint16_t*)p)[b]=bh; s=halfval(&bh);
+        uint32_t* c=(uint32_t*)(p+2*(dim/32))+3*b;
+        unsigned a=0,bb=0,cc=0;
+        for(unsigned j=0;j<32;++j) { unsigned n=s>0?nearest(xb[j]/s):4; if(j<16) a|=(n&3)<<(2*j); else bb|=(n&3)<<(2*(j-16)); cc|=(n>>2)<<j; }
+        c[0]=a;c[1]=bb;c[2]=cc;
+    } else {
+        ((uint16_t*)p)[b]=__half_as_ushort(__float2half(s)); float inv=s!=0?1/s:0;
+        uint8_t* c=p+2*(dim/32);
+        if(format==1) for(unsigned j=0;j<32;++j) ((int8_t*)c)[32*b+j]=max(-127,min(127,int(roundf(xb[j]*inv))));
+        else for(unsigned w=0;w<4;++w) {
+            unsigned word=0;
+            for(unsigned j=0;j<8;++j) word|=(unsigned(min(15,int(xb[w*8+j]*inv+8.5f))-8)&15)<<(4*j);
+            ((uint32_t*)c)[4*b+w]=word;
+        }
+    }
+}
+} // namespace vegajet::kvq_dev

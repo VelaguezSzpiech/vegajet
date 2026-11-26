@@ -11,9 +11,12 @@
 // Steps emit ops::OpGraph only: no hyper-connections, no host-side per-layer embeddings; GDN uses the
 // chunked WY prefill + recurrent decode ops, attention uses Wave64 FlashDecoding, MoE is one fused op.
 // Drafting: an external DFlash GGUF (LoadOptions::draft_gguf) or model-free SuffixDecoding, with the
-// MoE K* governor choosing the draft length.
+// EVICT prefix-depth controller choosing the draft length from verified acceptance history and the
+// routed-expert union.  A zero proposal means the caller runs one ordinary target decode step.
 #pragma once
 
+#include "core/evict_depth.hpp"
+#include "core/route_union.hpp"
 #include "core/kv_cache.hpp"
 #include "core/model_interface.hpp"
 #include "core/quant_repacker.hpp"
@@ -52,6 +55,7 @@ struct DraftHparams {
     double   rope_base = 1e7, rms_eps = 1e-6;
     uint64_t mask_token = 0;
     std::vector<uint32_t> target_layers;
+    std::vector<uint8_t> swa_pattern;  // dflash.attention.sliding_window_pattern (1 = SWA layer, 0 = full); empty if absent
     bool is_dflash2() const { return selector_top_k > 0u; }
 };
 
@@ -92,6 +96,18 @@ public:
     const std::vector<shard::GdnShard>& gdn_shards() const { return gdn_; }
     const std::vector<kv::KvPlan>& kv_plans() const { return kv_; }
     spec::MoeKGovernor& governor() { return gov_; }
+    EvictDepth& evict_depth() { return evict_; }
+    const EvictDepth& evict_depth() const { return evict_; }
+
+    // Publishes the actual distinct routed-(layer, expert) union of one COMPLETED target verifier pass for the
+    // next draft_step().  `ids` is the rank-0 top-ID block [layer][token][top_k], with layer_stride_ids between
+    // layers.  A null/short/out-of-range readback leaves the signal unknown (0), never a metadata estimate.
+    // The signal is one-shot: draft_step() consumes it.
+    bool note_route_ids(const int32_t* ids, uint32_t layers, uint32_t tokens, uint32_t top_k,
+                        uint32_t layer_stride_ids);
+    bool note_route_union(uint64_t unique_experts, uint32_t tokens);
+    RouteUnionFeedback& route_feedback() { return route_feedback_; }
+    const RouteUnionFeedback& route_feedback() const { return route_feedback_; }
     spec::SuffixTree& suffix_tree() { return suffix_; }
     ssm::ReplayRing& replay_ring() { return ring_; }
 
@@ -101,10 +117,13 @@ public:
                                std::vector<float>& native_f32, std::vector<float>& disk_f32, std::string* err) const;
 
     // After a verify step of `proposed` drafts: `verified` = accepted drafts + the bonus token. Updates the
-    // K* governor and suffix tree, and returns how the device must roll back the recurrent state.
+    // EVICT depth controller, the legacy K* governor and the suffix tree, and returns how the device must roll
+    // back the recurrent state.  Only the target-verified prefix reaches this method; the controller never
+    // authorizes or invents a committed token.
     ssm::ReplayRing::Rollback accept_draft(const std::vector<int32_t>& verified, uint32_t proposed);
 
     static constexpr uint32_t kPrefillChunk = 512;
+    static constexpr uint32_t kEvictMaxDepth = 32;  // hard cap on a drafted prefix before max_draft applies
 
 private:
     bool parse_hparams(const GgufFile& f, std::string* err);
@@ -123,6 +142,8 @@ private:
     std::vector<shard::GdnShard> gdn_;
     std::vector<kv::KvPlan> kv_;
     spec::MoeKGovernor gov_;
+    EvictDepth evict_{kEvictMaxDepth};
+    RouteUnionFeedback route_feedback_;
     spec::SuffixTree suffix_;
     ssm::ReplayRing ring_;
     uint64_t pos_ = 0;

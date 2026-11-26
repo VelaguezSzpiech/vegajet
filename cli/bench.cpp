@@ -39,8 +39,11 @@ void usage(const char* cmd) {
                 "                    [--gu-dot8-layers 0..48] [--spec-flash]\n"
                 "  Prefill flags:    [--prefill-chunk 128|256|512|1024] [--down-grp-prefill 0|1|2|3] [--down-grp-verify 0|1|2]\n"
                 "                    [--pf-fa2] [--pf-fa2-fp16] [--pf-gemm 0|64|128] [--pf-gdn 0|1|2] [--pf-gu-tiled] [--prefill-ar-int8]\n"
-                "                    [--prefill-dot8] [--dot8-clip A] [--dot8-scope 0|1|2] [--no-fast-prefill]\n"
-                "  Spec flags:       [--suffix-decode] [--suffix-max-draft 1..15] [--spec-gdn] [--zero-tax-catchup]\n"
+                "                    [--prefill-dot8] [--dot8-clip A] [--dot8-scope 0|1|2] [--dot8-fwht] [--dot8-fwht-layers N]\n"
+                "                    [--no-dot8-fwht] [--gdn-splitv8|--no-gdn-splitv8] [--no-fast-prefill]\n"
+                "                    [--pf-moe-iq-lds 0|1|2] [--pf-moe-iq-lds-layer 0..63] (one MoE layer at a time)\n"
+                "                    [--pf-moe-iq-lds32 0|1|2] (diagnostic 32-row x 64-token tile of the same item)\n"
+                "  Spec flags:       [--suffix-decode] [--suffix-max-draft 1..15] [--spec-gdn] [--zero-tax-catchup (default) | --no-zero-tax-catchup]\n"
                 "                    [--fr-spec 0|32768|65536] [--mtp-k 1..6] [--gu-grp-verify] [--spec-force-reject]\n"
                 "                    [--draft-model F] [--mask-embedding F] [--dflash-k 1..15] [--dflash-p-min P]\n"
                 "  Diagnostics:      [--profile-stages] [--pp-stages] [--ar-timeline] [--dot8-ab] [--ab-no-prepush]\n"
@@ -68,10 +71,11 @@ int run_bench(const std::string& cmd, const std::vector<std::string>& args) {
     bool suffix_decode = false;
     bool fr_spec_cli = false;  // --fr-spec given; otherwise VEGAJET_FR_SPEC_ROWS decides
     bool dry_only = false;
-    bool bench_ar = false, bench_gemv = false, ar_int8 = false, fuse_router = true, gdn_splitv = true, fuse_back = true, profile_stages = false, force_reject = false, dot8_ab = false, ar_timeline = false, pp_stages = false, ab_no_prepush = false;
-    uint32_t back_wgs = 240, gu_dot8_layers = 0, prefill_chunk = 1024, sfx_max = 11, fr_spec = 0, mtp_k = 4, dflash_k = 7, dgp = 3, dgv = 0, pf_gemm = 128, pf_gdn = 1, dot8_scope = 0;
+    bool bench_ar = false, bench_gemv = false, ar_int8 = false, fuse_router = true, gdn_splitv = true, gdn_splitv8 = false, fuse_back = true, profile_stages = false, force_reject = false, dot8_ab = false, ar_timeline = false, pp_stages = false, ab_no_prepush = false;
+    uint32_t back_wgs = 240, gu_dot8_layers = 0, prefill_chunk = 1024, sfx_max = 11, fr_spec = 0, mtp_k = 4, dflash_k = 7, dgp = 3, dgv = 0, pf_gemm = 128, pf_gdn = 1, dot8_scope = 0, dot8_fwht_layers = 0;
     float dflash_p_min = 0.55f, dot8_clip = 1.0f;
-    bool pf_fa2 = true, pf_fa2_fp16 = true, pf_gu = true, prefill_ar_int8 = true, prefill_dot8 = false, prefill_seq = false, spec_gdn = false, spec_flash = false, zero_tax_catchup = false, gu_grp_verify = false;
+    bool pf_fa2 = true, pf_fa2_fp16 = true, pf_gu = true, prefill_ar_int8 = true, prefill_dot8 = false, dot8_fwht = false, prefill_seq = false, spec_gdn = false, spec_flash = false, zero_tax_catchup = true, gu_grp_verify = false;
+    uint32_t pf_moe_iq_lds = 0, pf_moe_iq_lds32 = 0, pf_moe_iq_lds_layer = 0xFFFFFFFFu;
     std::string gdn_dump;
     int decode_n = 32;
     std::vector<double> bws;
@@ -95,6 +99,8 @@ int run_bench(const std::string& cmd, const std::vector<std::string>& args) {
         else if (a == "--bench-gemv") bench_gemv = true;
         else if (a == "--fuse-router") fuse_router = true;
         else if (a == "--gdn-splitv") gdn_splitv = true;
+        else if (a == "--gdn-splitv8") gdn_splitv8 = true;
+        else if (a == "--no-gdn-splitv8") gdn_splitv8 = false;
         else if (a == "--no-fuse-router") fuse_router = false;
         else if (a == "--fuse-back") fuse_back = true;
         else if (a == "--no-fuse-back") fuse_back = false;
@@ -112,11 +118,18 @@ int run_bench(const std::string& cmd, const std::vector<std::string>& args) {
         else if (a == "--no-fast-prefill") { prefill_chunk = 128; pf_fa2 = false; pf_fa2_fp16 = false; pf_gemm = 0; pf_gdn = 0; pf_gu = false; dgp = 1; prefill_ar_int8 = false; }
         else if (a == "--ab-no-prepush") ab_no_prepush = true;
         else if (a == "--prefill-dot8") prefill_dot8 = true;
+        else if (a == "--pf-moe-iq-lds") { const int v = std::atoi(next().c_str()); if (v < 0 || v > 2) { std::fprintf(stderr, "--pf-moe-iq-lds takes 0, 1 or 2\n"); return 2; } pf_moe_iq_lds = static_cast<uint32_t>(v); }
+        else if (a == "--pf-moe-iq-lds32") { const int v = std::atoi(next().c_str()); if (v < 0 || v > 2) { std::fprintf(stderr, "--pf-moe-iq-lds32 takes 0, 1 or 2\n"); return 2; } pf_moe_iq_lds32 = static_cast<uint32_t>(v); }
+        else if (a == "--pf-moe-iq-lds-layer") { const int v = std::atoi(next().c_str()); if (v < 0 || v > 63) { std::fprintf(stderr, "--pf-moe-iq-lds-layer takes 0..63 (omit for every MoE layer)\n"); return 2; } pf_moe_iq_lds_layer = static_cast<uint32_t>(v); }
         else if (a == "--dot8-scope") dot8_scope = static_cast<uint32_t>(std::atoi(next().c_str()));
         else if (a == "--dot8-clip") dot8_clip = static_cast<float>(std::atof(next().c_str()));
+        else if (a == "--dot8-fwht") dot8_fwht = true;
+        else if (a == "--no-dot8-fwht") dot8_fwht = false;
+        else if (a == "--dot8-fwht-layers") dot8_fwht_layers = static_cast<uint32_t>(std::atoi(next().c_str()));
         else if (a == "--spec-gdn") spec_gdn = true;
         else if (a == "--spec-flash") spec_flash = true;
         else if (a == "--zero-tax-catchup") zero_tax_catchup = true;
+        else if (a == "--no-zero-tax-catchup") zero_tax_catchup = false;
         else if (a == "--gu-grp-verify") gu_grp_verify = true;
         else if (a == "--fr-spec") { const int v = std::atoi(next().c_str()); if (v < 0 || (v != 0 && (v % 512 != 0 || v > 131072))) { std::fprintf(stderr, "--fr-spec takes 0 or a multiple of 512 up to 131072 (e.g. 32768, 65536)\n"); return 2; } fr_spec = static_cast<uint32_t>(v); fr_spec_cli = true; }
         else if (a == "--mtp-k") { const int v = std::atoi(next().c_str()); if (v < 1 || v > 6) { std::fprintf(stderr, "--mtp-k takes 1..6\n"); return 2; } mtp_k = static_cast<uint32_t>(v); }
@@ -139,6 +152,8 @@ int run_bench(const std::string& cmd, const std::vector<std::string>& args) {
         else if (a == "--dump-golden-layers") dump_golden_layers_dir = next();
         else if (a == "--back-wgs") { const int v = std::atoi(next().c_str()); if (v < 1 || v > 240) { std::fprintf(stderr, "--back-wgs takes 1..240\n"); return 2; } back_wgs = static_cast<uint32_t>(v); }
         else if (a == "--no-gdn-splitv") gdn_splitv = false;
+        else if (a == "--gdn-splitv8") gdn_splitv8 = true;
+        else if (a == "--no-gdn-splitv8") gdn_splitv8 = false;
         else if (a == "--ar-wire") { const std::string w = next(); if (w != "int8" && w != "fp16") { std::fprintf(stderr, "--ar-wire takes fp16|int8\n"); return 2; } ar_int8 = (w == "int8"); }
         else if (a == "--n-predict" || a == "-n") decode_n = std::atoi(next().c_str());
         else if (a == "--prompt") prompt = next();
@@ -250,13 +265,12 @@ int run_bench(const std::string& cmd, const std::vector<std::string>& args) {
 
     if (kfd::Runtime::compiled_with_gpu() && !dry_only && model->name() == "ornith") {
         // Alpha portability: refuse before the runner reserves its per-GPU arenas, with what is needed vs found,
-        // instead of failing late inside the 2 x ~30 GiB allocation on a smaller host.
+        // instead of failing late inside the N x ~30 GiB allocation on a smaller host.
         {
-            constexpr uint32_t kOrnithGpus = 2;                          // run_ornith_gpu requires 2 GPUs
             portability::FitRequest fr;
             const size_t slash = model_path.find_last_of('/');
             fr.model = slash == std::string::npos ? model_path : model_path.substr(slash + 1);
-            fr.gpus_required = kOrnithGpus > tp ? kOrnithGpus : tp;
+            fr.gpus_required = std::max<uint32_t>(1u, tp);
             fr.arena_bytes_per_gpu = 30ULL * portability::kGiB;          // rt.init(30.5), falling back to 30.0 GiB
             if (rep.weight_bytes_per_gpu.size() == fr.gpus_required)    // the plan describes the runner's layout
                 for (size_t i = 0; i < rep.weight_bytes_per_gpu.size(); ++i)
@@ -284,6 +298,7 @@ int run_bench(const std::string& cmd, const std::vector<std::string>& args) {
         gopt.ar_wire_int8    = ar_int8;
         gopt.fuse_moe_router = fuse_router;
         gopt.gdn_splitv      = gdn_splitv;
+        gopt.gdn_splitv8     = gdn_splitv8;
         gopt.fuse_moe_back   = fuse_back;
         gopt.gu_dot8_layers  = gu_dot8_layers;
         gopt.profile_stages  = profile_stages;
@@ -310,11 +325,16 @@ int run_bench(const std::string& cmd, const std::vector<std::string>& args) {
         gopt.pf_gemm = pf_gemm;
         gopt.pf_gdn = pf_gdn;
         gopt.pf_gu_tiled = pf_gu;
+        gopt.pf_moe_iq_lds = pf_moe_iq_lds;
+        gopt.pf_moe_iq_lds32 = pf_moe_iq_lds32;
+        gopt.pf_moe_iq_lds_layer = pf_moe_iq_lds_layer;
         gopt.prefill_ar_int8 = prefill_ar_int8;
         gopt.ab_no_prepush   = ab_no_prepush;
         gopt.prefill_dot8 = prefill_dot8;
         gopt.dot8_scope = dot8_scope;
         gopt.dot8_clip_alpha = dot8_clip;
+        gopt.dot8_fwht = dot8_fwht;
+        gopt.dot8_fwht_layers = dot8_fwht_layers;
         gopt.dump_logits_path = dump_logits;
         gopt.down_grp_prefill = dgp;
         gopt.down_grp_verify = dgv;
