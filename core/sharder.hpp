@@ -18,6 +18,13 @@ struct Range { uint64_t begin = 0, end = 0; uint64_t size() const { return end -
 // Splits `rows` into contiguous per-GPU ranges, multiples of `row_unit` (default kRowUnit=32; pass 16 for
 // TP=3 expert_ff=512 balance) except the last non-empty one.
 std::vector<Range> split_rows(uint64_t rows, const std::vector<double>& bw, uint32_t row_unit = kRowUnit);
+// Source Gate/Up tensors are [expert][full_ff][D], never [rank][expert][local_ff][D].
+constexpr uint64_t expert_row_index(uint64_t expert, uint32_t full_ff, uint32_t begin, uint32_t row) {
+    return expert * full_ff + begin + row;
+}
+// Two nonempty, 32-row-aligned intermediate shards; default retains TP=2 halves.
+std::vector<Range> split_expert_intermediate(uint32_t rows, const std::vector<double>& bw, bool enabled);
+
 // Splits whole experts (MoE expert parallel) across GPUs.
 std::vector<Range> split_experts(uint64_t n_experts, const std::vector<double>& bw);
 

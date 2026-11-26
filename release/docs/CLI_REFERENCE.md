@@ -288,6 +288,7 @@ Exit codes: 0 ok (end of input or `/quit`), 1 server unreachable (`GET /health` 
 | `VEGAJET_TELEM_MS` | Ornith GPU bench | Telemetry sampling period in ms; `0` disables sampling. |
 | `VEGAJET_MOE_LRU` | Ornith GPU bench | MoE expert LRU cache slots (default 44 with `--spec-gdn`, else 0). |
 | `VEGAJET_NO_AUTO_DOT8` | Ornith GPU bench | `1` disables automatic Gate+Up DOT8 promotion. |
+| `VEGAJET_V12_ASYM_EXPERTS` | Ornith GPU bench | `1` enables bandwidth-proportional, 32-row-aligned routed/shared expert TP (1024 total, each rank nonempty); unset/other values retain 512/512 and the legacy kernels. Uses calibrated per-BDF HBM bandwidth, not MCLK. The fused back path needs `--back-wgs 224`; other sizes use generic Down. Shape-specific grouped/tiled Down and the monolithic superkernel are bypassed; legacy `--dot8-ab`/`--dump-golden-layers` are rejected. See [D1 verification](../../docs/V12_ASYM_EXPERTS.md). |
 | `VEGAJET_EVICT_ADAPT` | Ornith GPU bench | `1` enables the adaptive draft-length / eviction controller. |
 | `VEGAJET_V12_SPEC_GOV` | Ornith GPU bench | `1`: drive the draft depth from the measured per-M verify time (`t_ver[M]`) and the live accepted length instead of the fabricated inflation constant, and feed the measured time inflation to `VEGAJET_EVICT_ADAPT`. Default off (off = unchanged behaviour). |
 | `VEGAJET_V12_BATCH_CATCHUP` | Ornith GPU bench | `1`: ingest accepted tokens (and prompt tokens) of the blk.48 MTP drafter in one M-row forward instead of one M=1 forward per token. Default off. |

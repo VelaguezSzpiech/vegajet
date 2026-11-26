@@ -352,6 +352,9 @@ struct KernelTable {
     const kfd::LoadedKernel* p2p_ar_moe_m1_front = nullptr;
     const kfd::LoadedKernel* p2p_ar_moe_m1_front_s240 = nullptr;
     const kfd::LoadedKernel* moe_m1_back_s224 = nullptr;
+    const kfd::LoadedKernel* moe_m1_back_asym = nullptr;
+    const kfd::LoadedKernel* moe_down_asym = nullptr;
+    const kfd::LoadedKernel* moe_down_asym_q4 = nullptr;
     const kfd::LoadedKernel* moe_m1_back_s240 = nullptr;
     const kfd::LoadedKernel* mtp_eh_cat = nullptr;
     const kfd::LoadedKernel* moe_gu_q4a8 = nullptr;
@@ -843,6 +846,8 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
     const LoadReport lrep = planner.load(f, lopt);
     if (!lrep.ok) { res.error = lrep.error; return res; }
     const auto& hp = planner.hparams();
+    const char* asym_env = std::getenv("VEGAJET_V12_ASYM_EXPERTS");
+    const bool asym_experts = asym_env && std::strcmp(asym_env, "1") == 0;
 
     kfd::Runtime rt;
     if (!rt.init(30.5, 64, &res.error) && !rt.init(30.0, 64, &res.error)) return res;
@@ -1021,6 +1026,11 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             K[g].mtp_eh_cat   = need_k("ornith_mtp_eh_norm_cat_q8_kernel");
             K[g].moe_gu_q4a8  = need_k("ornith_moe_gu_q4a8_kernel");
             K[g].moe_down_q4a8= need_k("ornith_moe_down_q4a8_kernel");
+            if (asym_experts) {
+                K[g].moe_m1_back_asym = need_k("vj_moe_m1_back_asym_s224_kernel");
+                K[g].moe_down_asym = need_k("vj_moe_down_asym_kernel");
+                K[g].moe_down_asym_q4 = need_k("vj_moe_down_asym_q4a8_kernel");
+            }
             K[g].memcpy_u32   = need_k("kfd_memcpy_u32");
             K[g].memset_u32   = need_k("kfd_memset_u32");
             if (!opt.draft_gguf.empty() && planner.draft_hparams().is_dflash2()) {
@@ -1062,7 +1072,20 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                                    static_cast<uint32_t>(voc_ranges[1].size()) };
     const uint32_t voc_off[2]  = { static_cast<uint32_t>(voc_ranges[0].begin),
                                    static_cast<uint32_t>(voc_ranges[1].begin) };
-    const uint32_t local_ff = hp.n_ff_exp / 2u; // 512 (kept symmetric where fused M=1 s224/Down kernels require equal local_ff)
+    const auto ff_ranges = shard::split_expert_intermediate(hp.n_ff_exp, bw_vec, asym_experts);
+    if (ff_ranges.size() != 2u || (asym_experts && hp.n_ff_exp != 1024u)) {
+        res.error = "asymmetric experts require two nonempty 32-row shards of n_ff_exp=1024"; return res;
+    }
+    if (asym_experts && (opt.dot8_ab || !opt.dump_golden_layers_dir.empty())) {
+        res.error = "asymmetric experts do not support legacy 512-only --dot8-ab / --dump-golden-layers; use --dump-logits";
+        return res;
+    }
+    const uint32_t ff_size[2] = {static_cast<uint32_t>(ff_ranges[0].size()), static_cast<uint32_t>(ff_ranges[1].size())};
+    const uint32_t ff_begin[2] = {0u, static_cast<uint32_t>(ff_ranges[1].begin)};
+    // Capacity planning uses the larger shard; launches use the rank's width.
+    const uint32_t local_ff = std::max(ff_size[0], ff_size[1]);
+    if (asym_experts) std::printf("[ornith::asym] expert FF=%u/%u (BW %.1f/%.1f GB/s, row unit=32)\n",
+                                  ff_size[0], ff_size[1], bw_vec[0], bw_vec[1]);
 
     const auto gdn_plan = shard::plan_gdn(hp.ssm_groups, hp.ssm_v_heads, bw_vec);
     const auto gqa_plan = shard::plan_attention(hp.n_head, hp.n_head_kv, bw_vec, false);
@@ -1209,7 +1232,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         target_gu_dot8_layers = static_cast<uint32_t>(std::max(0, std::atoi(gd_env)));
     }
     const bool no_auto_dot8 = (std::getenv("VEGAJET_NO_AUTO_DOT8") != nullptr && std::getenv("VEGAJET_NO_AUTO_DOT8")[0] == '1');
-    if (target_gu_dot8_layers == 0u && !no_auto_dot8 && local_ff == 512u && D == 3072u) {
+    if (target_gu_dot8_layers == 0u && !no_auto_dot8 && (asym_experts || local_ff == 512u) && D == 3072u) {
         const Dot8RowLayout gu_lay = dot8_gu_iq2s_layout(256ULL * local_ff, D);
         const uint64_t est_base_vram = raw_only_vram ? (24600ULL << 20) : (26400ULL << 20);
         const uint64_t headroom      = raw_only_vram ? (640ULL << 20)   : (1600ULL << 20);
@@ -1244,6 +1267,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         const bool is_gdn = hp.is_recurrent(il);
 
         for (size_t g = 0; g < 2; ++g) {
+            const uint32_t local_ff = ff_size[g];
             auto& lw = layers[g][il];
             lw.is_gdn = is_gdn;
             if (!upload_f32_rows(rt, g, f, p + "attn_norm.weight", nullptr, lw.attn_norm_va, &res.error)) return res;
@@ -1277,11 +1301,11 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             if (!upload_f32_as_f16(rt, g, f, p + "ffn_gate_inp.weight", lw.w_router_f16_va, &res.error)) return res;
             if (!upload_f32_rows(rt, g, f, p + "ffn_gate_inp_shexp.weight", nullptr, lw.w_sh_gate_va, &res.error)) return res;
             if (!upload_fused_q4a8_tcc(rt, g, f, {
-                    {p + "ffn_gate_shexp.weight", iota_range(static_cast<uint32_t>(g) * local_ff, local_ff)},
-                    {p + "ffn_up_shexp.weight",   iota_range(static_cast<uint32_t>(g) * local_ff, local_ff)}
+                    {p + "ffn_gate_shexp.weight", iota_range(ff_begin[g], local_ff)},
+                    {p + "ffn_up_shexp.weight",   iota_range(ff_begin[g], local_ff)}
                 }, 0, D, nullptr, lw.w_sh_gu, &res.error)) return res;
             if (!upload_fused_q4a8_tcc(rt, g, f, {{p + "ffn_down_shexp.weight", all_D_rows}},
-                                       static_cast<uint32_t>(g) * local_ff, local_ff, nullptr, lw.w_sh_down, &res.error)) return res;
+                                       ff_begin[g], local_ff, nullptr, lw.w_sh_down, &res.error)) return res;
         }
 
         // Pack Gate+Up IQ2_S into coalesced uint4 merged split-plane layout
@@ -1323,7 +1347,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
 
             const bool use_gu_q3 = (std::getenv("VEGAJET_GU_Q3") != nullptr && std::atoi(std::getenv("VEGAJET_GU_Q3")) > 0);
             bool promoted_in_place = false;
-            if (use_gu_q3 && local_ff == 512u && D == 3072u) {
+            if (use_gu_q3 && (asym_experts || local_ff == 512u) && D == 3072u) {
                 const Dot8RowLayout lay = q3_gu_iq2s_layout(n_rows_rank, D);
                 const uint64_t reserve_tail = raw_only_vram
                     ? (static_cast<uint64_t>(47u - il) * (540ULL << 20) + (512ULL << 20))
@@ -1331,13 +1355,15 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                        + (opt.spec_gdn ? 2048ULL : 2800ULL) * (1ULL << 20));
                 if (rt.vram_arena(0).used() + lay.vram_bytes() + reserve_tail <= arena_cap_bytes &&
                     rt.vram_arena(1).used() + lay.vram_bytes() + reserve_tail <= arena_cap_bytes) {
-                    const Dot8RowLayout lay_e = q3_gu_iq2s_layout(local_ff, D);
                     for (size_t g = 0; g < 2; ++g) {
+                        const uint32_t local_ff = ff_size[g];
+                        const auto lay = q3_gu_iq2s_layout(256ULL * local_ff, D);
+                        const auto lay_e = q3_gu_iq2s_layout(local_ff, D);
                         std::vector<uint8_t> wpl(lay.w_plane_bytes()), spl(lay.s_plane_bytes());
                         bool rok = true;
                         #pragma omp parallel for schedule(static) reduction(&&:rok)
                         for (size_t e = 0; e < 256u; ++e) {
-                            const size_t src_r0 = e * (2u * local_ff) + g * local_ff;
+                            const size_t src_r0 = shard::expert_row_index(e, hp.n_ff_exp, ff_begin[g], 0u);
                             std::string e_err;
                             rok = rok && q3_repack_gu_iq2s_rows(
                                 rg + src_r0 * raw_rb, ru + src_r0 * raw_rb, raw_rb, 0u, lay_e, 0u, local_ff,
@@ -1358,7 +1384,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                     promoted_in_place = true;
                 }
             }
-            if (!promoted_in_place && il < target_gu_dot8_layers && local_ff == 512u && D == 3072u) {
+            if (!promoted_in_place && il < target_gu_dot8_layers && (asym_experts || local_ff == 512u) && D == 3072u) {
                 const Dot8RowLayout lay = dot8_gu_iq2s_layout(n_rows_rank, D);
                 const uint64_t reserve_tail = raw_only_vram
                     ? (static_cast<uint64_t>(47u - il) * (505ULL << 20) + (768ULL << 20))
@@ -1368,13 +1394,15 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                 const uint64_t iq2s_extra = raw_only_vram ? 0ULL : (n_rows_rank * row_u4 * 16ULL);
                 if (rt.vram_arena(0).used() + lay.vram_bytes() + iq2s_extra + reserve_tail <= arena_cap_bytes &&
                     rt.vram_arena(1).used() + lay.vram_bytes() + iq2s_extra + reserve_tail <= arena_cap_bytes) {
-                    const Dot8RowLayout lay_e = dot8_gu_iq2s_layout(local_ff, D);
                     for (size_t g = 0; g < 2; ++g) {
+                        const uint32_t local_ff = ff_size[g];
+                        const auto lay = dot8_gu_iq2s_layout(256ULL * local_ff, D);
+                        const auto lay_e = dot8_gu_iq2s_layout(local_ff, D);
                         std::vector<uint8_t> wpl(lay.w_plane_bytes()), spl(lay.s_plane_bytes());
                         bool rok = true;
                         #pragma omp parallel for schedule(static) reduction(&&:rok)
                         for (size_t e = 0; e < 256u; ++e) {
-                            const size_t src_r0 = e * (2u * local_ff) + g * local_ff;
+                            const size_t src_r0 = shard::expert_row_index(e, hp.n_ff_exp, ff_begin[g], 0u);
                             std::string e_err;
                             rok = rok && dot8_repack_gu_iq2s_rows(
                                 rg + src_r0 * raw_rb, ru + src_r0 * raw_rb, raw_rb, 0u, lay_e, 0u, local_ff,
@@ -1400,7 +1428,23 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                     promoted_in_place = raw_only_vram;
                 }
             }
-            if (!promoted_in_place) {
+            if (!promoted_in_place && asym_experts) {
+                for (size_t g = 0; g < 2; ++g) {
+                    const uint32_t lff = ff_size[g];
+                    std::vector<uint32_t> packed(256ULL * lff * row_u4 * 4u);
+                    #pragma omp parallel for schedule(static)
+                    for (size_t e = 0; e < 256u; ++e) for (size_t r = 0; r < lff; ++r) {
+                        const size_t src_r = shard::expert_row_index(e, hp.n_ff_exp, ff_begin[g], r);
+                        pack_row(rg + src_r * raw_rb, ru + src_r * raw_rb,
+                                 packed.data() + (e * lff + r) * row_u4 * 4u);
+                    }
+                    const size_t bytes = packed.size() * 4u;
+                    auto& va = layers[g][il].w_gu_iq2s_va;
+                    va = rt.vram_arena(g).alloc(bytes, 4096, kfd::Tier::COLD);
+                    if (!va) { res.error = "VRAM OOM for routed Gate+Up"; return res; }
+                    VJ_CHECK(rt.upload_to_vram(g, va, packed.data(), bytes));
+                }
+            } else if (!promoted_in_place) {
                 std::vector<uint32_t> m0(n_rows_rank * row_u4 * 4u), m1(n_rows_rank * row_u4 * 4u);
                 #pragma omp parallel for schedule(static)
                 for (size_t e = 0; e < 256u; ++e) {
@@ -1432,15 +1476,19 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             // Routed Down is stored as the exact 16-level DOT8 repack (4.25 bpw read, register v_perm decode): it is
             // bit-identical to the compact IQ3_XXS layout on hardware and 1.16-1.65x faster at M = 1 / 5 / 128.
             {
-                const Dot8RowLayout lay = dot8_iq3_layout(n_rows, 512u);
                 for (size_t g = 0; g < 2; ++g) {
+                    const auto lay = asym_experts ? dot8_iq3_asym_layout(n_rows, ff_size[g])
+                                                  : dot8_iq3_layout(n_rows, 512u);
                     std::vector<uint8_t> wpl(lay.w_plane_bytes()), spl(lay.s_plane_bytes());
                     bool rok = true;
                     #pragma omp parallel for schedule(static) reduction(&&:rok)
                     for (size_t r0 = 0; r0 < n_rows; r0 += 4096u) {
                         std::string e;
-                        rok = rok && dot8_repack_iq3xxs_rows(rd, full_rb, static_cast<uint32_t>(2u * g), lay, r0,
-                                                             std::min<uint64_t>(n_rows, r0 + 4096u), wpl.data(), spl.data(), &e);
+                        rok = rok && (asym_experts
+                            ? dot8_repack_iq3xxs_asym_rows(rd, full_rb, ff_begin[g], lay, r0,
+                                  std::min<uint64_t>(n_rows, r0 + 4096u), wpl.data(), spl.data(), &e)
+                            : dot8_repack_iq3xxs_rows(rd, full_rb, static_cast<uint32_t>(2u * g), lay, r0,
+                                  std::min<uint64_t>(n_rows, r0 + 4096u), wpl.data(), spl.data(), &e));
                     }
                     if (!rok) { res.error = "DOT8 repack of ffn_down_exps failed"; return res; }
                     auto& lw = layers[g][il];
@@ -1508,13 +1556,15 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         const std::string p = "blk.48.";
         std::vector<uint32_t> gu_rows[2];
         for (size_t g = 0; g < 2; ++g) {
+            const uint32_t local_ff = ff_size[g];
             gu_rows[g].reserve(256u * local_ff);
             for (uint32_t e = 0; e < 256u; ++e)
                 for (uint32_t r = 0; r < local_ff; ++r)
-                    gu_rows[g].push_back(e * (2u * local_ff) + static_cast<uint32_t>(g) * local_ff + r);
+                    gu_rows[g].push_back(shard::expert_row_index(e, hp.n_ff_exp, ff_begin[g], r));
         }
         const auto all_exp_dn_rows = iota_range(0, 256u * D);
         for (size_t g = 0; g < 2; ++g) {
+            const uint32_t local_ff = ff_size[g];
             auto& ml = mtp[g];
             if (!upload_f32_rows(rt, g, f, p + "nextn.enorm.weight", nullptr, ml.enorm_va, &res.error)) return res;
             if (!upload_f32_rows(rt, g, f, p + "nextn.hnorm.weight", nullptr, ml.hnorm_va, &res.error)) return res;
@@ -1535,18 +1585,18 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             if (!upload_f32_as_f16(rt, g, f, p + "ffn_gate_inp.weight", ml.w_router_f16_va, &res.error)) return res;
             if (!upload_f32_rows(rt, g, f, p + "ffn_gate_inp_shexp.weight", nullptr, ml.w_sh_gate_va, &res.error)) return res;
             if (!upload_fused_q4a8_tcc(rt, g, f, {
-                    {p + "ffn_gate_shexp.weight", iota_range(static_cast<uint32_t>(g) * local_ff, local_ff)},
-                    {p + "ffn_up_shexp.weight",   iota_range(static_cast<uint32_t>(g) * local_ff, local_ff)}
+                    {p + "ffn_gate_shexp.weight", iota_range(ff_begin[g], local_ff)},
+                    {p + "ffn_up_shexp.weight",   iota_range(ff_begin[g], local_ff)}
                 }, 0, D, nullptr, ml.w_sh_gu, &res.error)) return res;
             if (!upload_fused_q4a8_tcc(rt, g, f, {{p + "ffn_down_shexp.weight", all_D_rows}},
-                                       static_cast<uint32_t>(g) * local_ff, local_ff, nullptr, ml.w_sh_down, &res.error)) return res;
+                                       ff_begin[g], local_ff, nullptr, ml.w_sh_down, &res.error)) return res;
             kfd::ArenaTierScope mtp_cold(rt.vram_arena(g), kfd::Tier::COLD);  // MTP routed experts: 8/256 read per draft
             if (!upload_fused_q4a8_tcc(rt, g, f, {{p + "ffn_gate_exps.weight", gu_rows[g]}},
                                        0, D, nullptr, ml.w_exp_gate, &res.error)) return res;
             if (!upload_fused_q4a8_tcc(rt, g, f, {{p + "ffn_up_exps.weight", gu_rows[g]}},
                                        0, D, nullptr, ml.w_exp_up, &res.error)) return res;
             if (!upload_fused_q4a8_tcc(rt, g, f, {{p + "ffn_down_exps.weight", all_exp_dn_rows}},
-                                       static_cast<uint32_t>(g) * local_ff, local_ff, nullptr, ml.w_exp_down, &res.error)) return res;
+                                       ff_begin[g], local_ff, nullptr, ml.w_exp_down, &res.error)) return res;
             ml.loaded = true;
         }
         for (const char* suf : {"nextn.enorm.weight", "nextn.hnorm.weight", "nextn.shared_head_norm.weight",
@@ -1781,6 +1831,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
     auto grp_item_cap = [](uint32_t M) { const uint32_t R = M * 8u, U = std::min(R, 256u); return std::min(R, (R + 63u * U + 63u) / 64u); };
     GpuStateDev S[2];
     for (size_t g = 0; g < 2; ++g) {
+        const uint32_t local_ff = ff_size[g];
         bool alloc_oom = false;
         auto alloc = [&](uint64_t b, uint64_t a = 256) {
             const uint64_t v = rt.vram_arena(g).alloc(b, a);
@@ -1913,13 +1964,13 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
 
     // Wave 5 Dynamic LRU VJ_Q4_DOT8 MoE Gate+Up Cache (up to 44 slots/L in spare VRAM for M >= 4 verify!).
     uint32_t lru_slots = 0u;
-    Dot8RowLayout lru_lay{};
+    Dot8RowLayout lru_lay[2]{};
     uint64_t lru_w_va[2][48] = {}, lru_s_va[2][48] = {}, lru_e2s_va[2][48] = {};
     std::vector<std::array<int32_t, 256>> lru_e2s_host(48);
     std::unique_ptr<moecache::MoeLruCache> lru_cache;
     const uint64_t lru_top_va = io_buf.va + 3ULL * 1024ULL * 1024ULL;
     auto* lru_top_host = reinterpret_cast<int32_t*>(io_host_u8 + 3ULL * 1024ULL * 1024ULL);
-    if (local_ff == 512u && D == 3072u && K[0].moe_gu_repack && K[0].moe_gu_lru && layers[0][0].w_gu_d8_w_va == 0u) {
+    if ((asym_experts || local_ff == 512u) && D == 3072u && K[0].moe_gu_repack && K[0].moe_gu_lru && layers[0][0].w_gu_d8_w_va == 0u) {
         const char* lru_env = std::getenv("VEGAJET_MOE_LRU");
         uint32_t want_slots = lru_env ? static_cast<uint32_t>(std::max(0, std::atoi(lru_env))) : 0u;
         if (want_slots == 0u && !lru_env && (!opt.sweep_spec.empty() || opt.interactive)) {
@@ -1940,15 +1991,15 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             if (min_free > reserve_b + 8ULL * per_slot_all_layers) {
                 const uint32_t max_fit = static_cast<uint32_t>((min_free - reserve_b) / per_slot_all_layers);
                 lru_slots = std::min<uint32_t>(want_slots, max_fit);
-                lru_lay = dot8_gu_iq2s_layout(static_cast<uint64_t>(lru_slots) * local_ff, D);
+                for (size_t g = 0; g < 2; ++g) lru_lay[g] = dot8_gu_iq2s_layout(static_cast<uint64_t>(lru_slots) * ff_size[g], D);
                 std::vector<int32_t> neg_tab(256, -1);
                 for (uint32_t il = 0; il < 48u; ++il) lru_e2s_host[il].fill(-1);
                 bool ok_lru = true;
                 for (size_t g = 0; g < 2 && ok_lru; ++g) {
                     for (uint32_t il = 0; il < 48u && ok_lru; ++il) {
-                        lru_w_va[g][il]   = rt.vram_arena(g).alloc(lru_lay.w_plane_bytes(), 4096, kfd::Tier::COLD);
-                        lru_s_va[g][il]   = lru_lay.scale_embedded ? (lru_w_va[g][il] + lru_lay.s_offset_bytes)
-                                                                   : rt.vram_arena(g).alloc(lru_lay.s_plane_bytes(), 256, kfd::Tier::COLD);
+                        lru_w_va[g][il]   = rt.vram_arena(g).alloc(lru_lay[g].w_plane_bytes(), 4096, kfd::Tier::COLD);
+                        lru_s_va[g][il]   = lru_lay[g].scale_embedded ? (lru_w_va[g][il] + lru_lay[g].s_offset_bytes)
+                                                                   : rt.vram_arena(g).alloc(lru_lay[g].s_plane_bytes(), 256, kfd::Tier::COLD);
                         lru_e2s_va[g][il] = rt.vram_arena(g).alloc(256u * 4u, 256);
                         if (!lru_w_va[g][il] || !lru_s_va[g][il] || !lru_e2s_va[g][il] ||
                             !rt.upload_to_vram(g, lru_e2s_va[g][il], neg_tab.data(), 256u * 4u)) {
@@ -1962,7 +2013,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                     ccfg.max_admits_per_step = 48u; ccfg.max_admits_per_layer_step = 1u; ccfg.admit_after_misses = 2u;
                     lru_cache = std::make_unique<moecache::MoeLruCache>(ccfg);
                     std::printf("  allocated Dynamic LRU MoE Gate+Up cache: %u slots/L (%.2f GiB/GPU)\n",
-                                lru_slots, (48.0 * lru_lay.vram_bytes()) / 1073741824.0);
+                                lru_slots, (48.0 * std::max(lru_lay[0].vram_bytes(), lru_lay[1].vram_bytes())) / 1073741824.0);
                 } else {
                     lru_slots = 0u;
                 }
@@ -2031,6 +2082,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
 
     // Populate and upload per-layer M=1 super-kernel descriptors once per GPU (~24 KiB/GPU).
     for (size_t g = 0; g < 2; ++g) {
+        const uint32_t local_ff = ff_size[g];
         const size_t peer = 1u - g;
         std::vector<ornith_super::GdnSuperDesc> gdn_d(36);
         std::vector<ornith_super::GqaSuperDesc> gqa_d(12);
@@ -2420,7 +2472,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             }
         };
 
-        const bool use_m1_super = (ab_enable_super && !golden_cap_on && M == 1u && !ab_w64 && !ab_f2_front && !ab_b2_back &&
+        const bool use_m1_super = (!asym_experts && ab_enable_super && !golden_cap_on && M == 1u && !ab_w64 && !ab_f2_front && !ab_b2_back &&
                                    opt.fuse_moe_router && opt.fuse_moe_back && opt.gdn_splitv &&
                                    !opt.ab_no_prepush && !opt.ar_wire_int8 && !opt.spec_flash &&
                                    !ar_ts_on && !st_on && !tap_on && !capture_dflash_taps &&
@@ -2825,7 +2877,8 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                 gcap_dump("gqa_partial_out", S[0].partial_va, static_cast<uint64_t>(M) * D * 4ULL);
             }
             const bool fuse_front = !golden_cap_on && opt.fuse_moe_router && M == 1u && layers[0][il].w_sh_gu.cols == D &&
-                                    33u + (layers[0][il].w_sh_gu.rows + 7u) / 8u <= 240u;
+                                    33u + (layers[0][il].w_sh_gu.rows + 7u) / 8u <= 240u &&
+                                    (!asym_experts || 33u + (layers[1][il].w_sh_gu.rows + 7u) / 8u <= 240u);
             const bool use_f2_front = (ab_f2_front && fuse_front && K[0].moe_m1_rtr_shgu != nullptr && K[0].moe_m1_top8_swiglu != nullptr);
             const bool fuse_ar_front = (!use_f2_front && fuse_front && M == 1u && ep_pushed_attn && !ar_ts_on && !opt.ar_wire_int8 &&
                                         !st_on && K[0].p2p_ar_moe_m1_front != nullptr);
@@ -2841,17 +2894,19 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             }
 
             // Decided once per layer for both ranks: a rank that skipped the sense bump would fall through the barrier.
-            const bool fuse_back = opt.fuse_moe_back && M == 1u && local_ff == 512u && opt.moe_back_wgs >= 1u && opt.moe_back_wgs <= 240u &&
-                                   layers[0][il].w_sh_down.cols == 512u && layers[1][il].w_sh_down.cols == 512u &&
+            const bool fuse_back = opt.fuse_moe_back && M == 1u && (asym_experts || local_ff == 512u) && (!asym_experts || opt.moe_back_wgs == 224u) && opt.moe_back_wgs >= 1u && opt.moe_back_wgs <= 240u &&
+                                   layers[0][il].w_sh_down.cols == ff_size[0] && layers[1][il].w_sh_down.cols == ff_size[1] &&
                                    layers[0][il].w_gu_d8_w_va == 0u;
             const bool is_prefill_moe = (!use_ring && M >= 16u) || M > 16u;
             const uint32_t dgrp = is_prefill_moe ? opt.down_grp_prefill : ((M >= 2u) ? opt.down_grp_verify : 0u);
-            const bool use_pf_down_tiled = (S[0].dgrp_buf_va != 0u && S[0].pf_gu_queue_va != 0u && !fuse_back && dgrp == 3u && K[0].pf_down_tiled && D % 128u == 0u && local_ff == 512u);
-            const bool use_dgrp = (S[0].dgrp_buf_va != 0u && !fuse_back && !use_pf_down_tiled && dgrp != 0u && dgrp != 3u && D % 64u == 0u);
+            // Grouped/tiled Down and the monolithic superkernel retain their legacy 512-column layouts.
+            const bool use_pf_down_tiled = (!asym_experts && S[0].dgrp_buf_va != 0u && S[0].pf_gu_queue_va != 0u && !fuse_back && dgrp == 3u && K[0].pf_down_tiled && D % 128u == 0u && local_ff == 512u);
+            const bool use_dgrp = (!asym_experts && S[0].dgrp_buf_va != 0u && !fuse_back && !use_pf_down_tiled && dgrp != 0u && dgrp != 3u && D % 64u == 0u);
             if (fuse_front && !use_f2_front) moe_sense += reps_of(7u);
-            if (fuse_back && !ab_b2_back) moe_back_sense += reps_of(8u);
+            if (fuse_back && (!ab_b2_back || asym_experts)) moe_back_sense += reps_of(8u);
             const uint32_t ar_front_ep = fuse_ar_front ? ar_epoch++ : 0u;
             for (size_t g = 0; g < 2; ++g) {
+                const uint32_t local_ff = ff_size[g];
                 const auto& lw = layers[g][il];
                 if (use_f2_front) {
                     struct RsKA { uint64_t wr, wsh, xn, shq, shdm, xq, xds, logits, shgsc, shgu; uint32_t D, sh_rows, sh_stride; };
@@ -2952,7 +3007,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                 if (fuse_back) {
                     const bool do_ep_moe = (!opt.ab_no_prepush && M == 1u && !ar_ts_on && !opt.ar_wire_int8);
                     const uint64_t ptx_moe = do_ep_moe ? (pay_base + (1u - g) * kfd::kArGpuBytes + (ar_epoch & 1u) * kfd::kArSlotBytes) : 0ULL;
-                    if (ab_b2_back && local_ff == 512u && D == 3072u && K[g].moe_gu_16r && K[g].moe_mid_f32_to_q8 && K[g].moe_down_d8_sh) {
+                    if (!asym_experts && ab_b2_back && local_ff == 512u && D == 3072u && K[g].moe_gu_16r && K[g].moe_mid_f32_to_q8 && K[g].moe_down_d8_sh) {
                         struct Gu8KA  { uint64_t wgu, xq, xds, tids, mf32; uint32_t lff; };
                         struct QKA    { uint64_t mf32, mq, md; uint32_t nblk; };
                         struct DnShKA { uint64_t wd, wds, mq, md, tids, tw, shwq, shwdm, shq, shds, out; uint32_t D, sh_st, dn_wst, dn_sst; uint64_t ptx; };
@@ -2981,10 +3036,10 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                                              local_ff, D, lw.w_sh_down.rows, lw.w_sh_down.row_stride_bytes,
                                              moe_back_sense - reps_of(8u) + 1u + r,
                                              lw.dn_d8_w_stride, lw.dn_d8_s_stride, 0u, ptx_moe};
-                            VJ_CHECK(rt.enqueue_kernel(g, *(use_s224 ? K[g].moe_m1_back_s224 : K[g].moe_m1_back), opt.moe_back_wgs * 256u, 1, 1, 256, 1, 1, &bka, sizeof(bka), true));
+                            VJ_CHECK(rt.enqueue_kernel(g, *(asym_experts ? K[g].moe_m1_back_asym : (use_s224 ? K[g].moe_m1_back_s224 : K[g].moe_m1_back)), opt.moe_back_wgs * 256u, 1, 1, 256, 1, 1, &bka, sizeof(bka), true));
                         }
                     }
-                } else if ((is_prefill_moe || (opt.gu_grp_verify && M >= 8u)) && lw.w_gu_iq2s_va != 0u) {
+                } else if (!asym_experts && (is_prefill_moe || (opt.gu_grp_verify && M >= 8u)) && lw.w_gu_iq2s_va != 0u) {
                     // Deduplicated single MoE expert sort: when grouped Down is active, vj_moe_route_group_kernel
                     // produces the exact same (exp_off, exp_cnt, routes) tables needed by Gate+Up AND the work items
                     // needed by grouped Down, eliminating 96 serial 1-WG sort launches per prefill chunk.
@@ -3085,7 +3140,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                         struct GuLruKA { uint64_t wgu, cw, cs, e2s, xq, xd, tids, mq, md; uint32_t M, lff, wst, sst; };
                         const GuLruKA lka{lw.w_gu_iq2s_va, lru_w_va[g][il], lru_s_va[g][il], lru_e2s_va[g][il],
                                           S[g].x_q8_va, S[g].x_ds_va, S[g].top_ids_va, S[g].moe_q8_va, S[g].moe_d_va,
-                                          M, local_ff, lru_lay.w_row_stride_bytes, lru_lay.s_row_stride_bytes};
+                                          M, local_ff, lru_lay[g].w_row_stride_bytes, lru_lay[g].s_row_stride_bytes};
                         VJ_CHECK(rt.enqueue_kernel(g, *K[g].moe_gu_lru, 8u * (local_ff / 32u) * 256u, M, 1, 256, 1, 1, &lka, sizeof(lka), true));
                         if (g == 0u && M >= 4u) {
                             struct CpU32KA { uint64_t dst, src, n; };
@@ -3124,6 +3179,20 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                             VJ_CHECK(rt.enqueue_kernel(g, *K[g].dgrp_f32, (D / 32u) * 256u, icap, 1, 256, 1, 1, &gf, sizeof(gf), true));
                             VJ_CHECK(rt.enqueue_kernel(g, *K[g].dgrp_comb_f32, ((D + 15u) / 16u) * 256u, M, 1, 256, 1, 1, &cb, sizeof(cb), true));
                         }
+                    } else if (asym_experts) {
+                        struct AsymDnKA {
+                            uint64_t wq, ws, mq, md, tids, tw, shd, out;
+                            uint32_t M, D, wst, sst, lff, pad;
+                            uint64_t ptx;
+                        };
+                        static_assert(sizeof(AsymDnKA) == 96u, "asymmetric Down kernarg ABI");
+                        const bool prepush = !opt.ab_no_prepush && M <= 16u && !ar_ts_on && !opt.ar_wire_int8;
+                        const uint64_t ptx = prepush ? pay_base + (1u - g) * kfd::kArGpuBytes + (ar_epoch & 1u) * kfd::kArSlotBytes : 0u;
+                        const AsymDnKA dka{lw.w_dn_d8_w_va, lw.w_dn_d8_s_va, S[g].moe_q8_va, S[g].moe_d_va,
+                            S[g].top_ids_va, S[g].top_w_va, S[g].sh_down_va, S[g].partial_va,
+                            M, D, lw.dn_d8_w_stride, lw.dn_d8_s_stride, local_ff, 0u, ptx};
+                        VJ_CHECK(rt.enqueue_kernel(g, *K[g].moe_down_asym, ((D + 15u) / 16u) * 256u, M, 1,
+                                                  256, 1, 1, &dka, sizeof(dka), true));
                     } else if (!opt.ab_no_prepush && M <= 16u && !ar_ts_on && !opt.ar_wire_int8 && K[g].moe_down_d8_pp != nullptr) {
                         const uint64_t ptx_dn = pay_base + (1u - g) * kfd::kArGpuBytes + (ar_epoch & 1u) * kfd::kArSlotBytes;
                         struct DnPpKA { uint64_t wq, ws, mq, md, tids, tw, shd, out; uint32_t M, D, wst, sst; uint64_t ptx; };
@@ -3151,8 +3220,9 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                 gcap_dump("moe_top_w", S[0].top_w_va, static_cast<uint64_t>(M) * 8ULL * 4ULL);
                 gcap_dump("moe_partial_out", S[0].partial_va, static_cast<uint64_t>(M) * D * 4ULL);
             }
-            const bool ep_pushed_moe_dn = (!opt.ab_no_prepush && !fuse_back && !(is_prefill_moe || (opt.gu_grp_verify && M >= 8u)) && !use_dgrp &&
-                                           M <= 16u && !ar_ts_on && !opt.ar_wire_int8 && K[0].moe_down_d8_pp != nullptr);
+            // Both Down paths publish the same [M,D] FP16 payload, independent of the local intermediate width.
+            const bool ep_pushed_moe_dn = (!opt.ab_no_prepush && !fuse_back && (asym_experts || !(is_prefill_moe || (opt.gu_grp_verify && M >= 8u))) && !use_dgrp &&
+                                           M <= 16u && !ar_ts_on && !opt.ar_wire_int8 && (asym_experts || K[0].moe_down_d8_pp != nullptr));
             const bool ep_pushed_moe = (!opt.ab_no_prepush && fuse_back && M == 1u && !ar_ts_on && !opt.ar_wire_int8) || ep_pushed_moe_dn;
             enq_p2p_ar_rms(il * 2u + 1u, next_w0, next_w1, (il + 1u < 48u || compute_logits) ? 1u : 0u, ep_pushed_moe);
             st_mark(kStAr, -1);
@@ -3219,8 +3289,9 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                     if (a.evicted >= 0 && a.evicted < 256) lru_e2s_host[a.layer][a.evicted] = -1;
                     lru_e2s_host[a.layer][a.expert] = static_cast<int32_t>(a.slot);
                     for (size_t g = 0; g < 2; ++g) {
+                        const uint32_t local_ff = ff_size[g];
                         const RepKA rka{layers[g][a.layer].w_gu_iq2s_va, lru_w_va[g][a.layer], lru_s_va[g][a.layer],
-                                        a.expert, a.slot, local_ff, lru_lay.w_row_stride_bytes, lru_lay.s_row_stride_bytes};
+                                        a.expert, a.slot, local_ff, lru_lay[g].w_row_stride_bytes, lru_lay[g].s_row_stride_bytes};
                         VJ_CHECK(rt.enqueue_kernel(g, *K[g].moe_gu_repack, local_ff * 128u, 1, 1, 128, 1, 1, &rka, sizeof(rka), true));
                     }
                     lru_cache->commit(a);
@@ -3264,6 +3335,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
 
     // Quick stage micro-profiler (measures exact M=1 ms per component across 48 layers!)
     auto run_m1_profile = [&]() {
+        const uint32_t local_ff = ff_size[0];
         auto time_fn = [&](int iters, auto&& fn) -> double {
             fn();
             auto t0 = std::chrono::steady_clock::now();
@@ -3315,6 +3387,15 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         }); });
         double t_moe_gu  = time_fn(8, [&]() { run_g0([&]() {
             for (int i = 0; i < 48; ++i) {
+                if (asym_experts && layers[0][i].w_gu_d8_w_va != 0u) {
+                    const auto& lw = layers[0][i];
+                    struct GuD8KA { uint64_t wq, ws, xq, xd, tids, mq, md; uint32_t M, lff, wst, sst; };
+                    const GuD8KA ka{lw.w_gu_d8_w_va, lw.w_gu_d8_s_va, S[0].x_q8_va, S[0].x_ds_va,
+                        S[0].top_ids_va, S[0].moe_q8_va, S[0].moe_d_va, 1u, local_ff, lw.gu_d8_w_stride, lw.gu_d8_s_stride};
+                    const auto* gu = (lw.gu_d8_w_stride == 2304u && K[0].moe_gu_q3) ? K[0].moe_gu_q3 : K[0].moe_gu_d8;
+                    VJ_CHECK(rt.enqueue_kernel(0, *gu, 8u * (local_ff / 32u) * 256u, 1, 1, 256, 1, 1, &ka, sizeof(ka), true));
+                    continue;
+                }
                 struct GuKA { uint64_t wgu, xq, xd, tids, mq, md; uint32_t M, lff; };
                 GuKA gka{layers[0][i].w_gu_iq2s_va, S[0].x_q8_va, S[0].x_ds_va, S[0].top_ids_va, S[0].moe_q8_va, S[0].moe_d_va, 1u, local_ff};
                 VJ_CHECK(rt.enqueue_kernel(0, *K[0].moe_gu_iq2s, 8u * (local_ff / 32u) * 256u, 1, 1, 256, 1, 1, &gka, sizeof(gka), true));
@@ -3322,6 +3403,15 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         }); });
         double t_moe_dn  = time_fn(8, [&]() { run_g0([&]() {
             for (int i = 0; i < 48; ++i) {
+                if (asym_experts) {
+                    struct AsymDnKA { uint64_t wq, ws, mq, md, tids, tw, shd, out; uint32_t M, D, wst, sst, lff, pad; uint64_t ptx; };
+                    const auto& lw = layers[0][i];
+                    const AsymDnKA dka{lw.w_dn_d8_w_va, lw.w_dn_d8_s_va, S[0].moe_q8_va, S[0].moe_d_va,
+                        S[0].top_ids_va, S[0].top_w_va, S[0].sh_down_va, S[0].partial_va,
+                        1u, D, lw.dn_d8_w_stride, lw.dn_d8_s_stride, local_ff, 0u, 0u};
+                    VJ_CHECK(rt.enqueue_kernel(0, *K[0].moe_down_asym, ((D + 15u) / 16u) * 256u, 1, 1, 256, 1, 1, &dka, sizeof(dka), true));
+                    continue;
+                }
                 struct DnKA { uint64_t wq, ws, mq, md, tids, tw, shd, out; uint32_t M, D, wst, sst; };
                 DnKA dka{layers[0][i].w_dn_d8_w_va, layers[0][i].w_dn_d8_s_va, S[0].moe_q8_va, S[0].moe_d_va, S[0].top_ids_va, S[0].top_w_va, S[0].sh_down_va,
                          S[0].partial_va, 1u, D, layers[0][i].dn_d8_w_stride, layers[0][i].dn_d8_s_stride};
@@ -3406,7 +3496,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                 return double(w.rows) * (double(w.cols) * 0.5 + double(w.cols / 32u) * 4.0);
             };
             const double gu_d8_row_b = double(dot8_gu_iq2s_layout(1u, D).read_bytes_per_row());
-            const double dn_d8_row_b = double(dot8_iq3_layout(1u, local_ff).read_bytes_per_row());
+            const double dn_d8_row_b = double((asym_experts ? dot8_iq3_asym_layout(1u, local_ff) : dot8_iq3_layout(1u, local_ff)).read_bytes_per_row());
             double b_gdn_qkv = 0, b_gdn_out = 0, b_gqa_qkv = 0, b_gqa_o = 0, b_front = 0, b_back = 0;
             uint32_t n_gdn = 0, n_gqa = 0;
             for (uint32_t il = 0; il < 48u; ++il) {
@@ -3697,6 +3787,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         enq_ar_mtp(60u, mtp[0].post_attn_norm_va, mtp[1].post_attn_norm_va, 1u);
 
         for (size_t g = 0; g < 2; ++g) {
+            const uint32_t local_ff = ff_size[g];
             const auto& ml = mtp[g];
             struct RLogKA { uint64_t wr, wsh, xn, lout, shg; uint32_t M, D; };
             RLogKA rlka{ml.w_router_f16_va, ml.w_sh_gate_va, S[g].x_norm_va, S[g].router_log_va, S[g].sh_gate_sc_va, 1u, D};
@@ -3717,11 +3808,19 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             VJ_CHECK(rt.enqueue_kernel(g, *K[g].moe_gu_q4a8, 8u * (local_ff / 32u) * 256u, 1, 1, 256, 1, 1, &gka, sizeof(gka), true));
             enq_q4_m1(g, ml.w_sh_down, S[g].sh_q8_va, S[g].sh_ds_va, S[g].sh_down_va, false);
 
-            struct DnQ4KA { uint64_t wdq, wddm, mq, mds, tids, tw, shd, out; uint32_t M, D, stride; };
-            DnQ4KA dka{ml.w_exp_down.qs_va, ml.w_exp_down.dm_va, S[g].moe_q8_va, S[g].mtp_moe_ds_va,
-                       S[g].top_ids_va, S[g].top_w_va, S[g].sh_down_va, S[g].partial_va,
-                       1u, D, ml.w_exp_down.row_stride_bytes};
-            VJ_CHECK(rt.enqueue_kernel(g, *K[g].moe_down_q4a8, ((D + 15u) / 16u) * 256u, 1, 1, 256, 1, 1, &dka, sizeof(dka), true));
+            if (asym_experts) {
+                struct DnQ4KA { uint64_t wdq, wddm, mq, mds, tids, tw, shd, out; uint32_t M, D, stride, lff; };
+                const DnQ4KA dka{ml.w_exp_down.qs_va, ml.w_exp_down.dm_va, S[g].moe_q8_va, S[g].mtp_moe_ds_va,
+                    S[g].top_ids_va, S[g].top_w_va, S[g].sh_down_va, S[g].partial_va,
+                    1u, D, ml.w_exp_down.row_stride_bytes, local_ff};
+                VJ_CHECK(rt.enqueue_kernel(g, *K[g].moe_down_asym_q4, ((D + 15u) / 16u) * 256u, 1, 1, 256, 1, 1, &dka, sizeof(dka), true));
+            } else {
+                struct DnQ4KA { uint64_t wdq, wddm, mq, mds, tids, tw, shd, out; uint32_t M, D, stride; };
+                DnQ4KA dka{ml.w_exp_down.qs_va, ml.w_exp_down.dm_va, S[g].moe_q8_va, S[g].mtp_moe_ds_va,
+                           S[g].top_ids_va, S[g].top_w_va, S[g].sh_down_va, S[g].partial_va,
+                           1u, D, ml.w_exp_down.row_stride_bytes};
+                VJ_CHECK(rt.enqueue_kernel(g, *K[g].moe_down_q4a8, ((D + 15u) / 16u) * 256u, 1, 1, 256, 1, 1, &dka, sizeof(dka), true));
+            }
         }
         enq_ar_mtp(61u, mtp[0].shared_head_norm_va, mtp[1].shared_head_norm_va, compute_logits ? 1u : 0u);
 
@@ -4254,6 +4353,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
 
     // ---- Pillar 3: --dump-golden-layers <dir> (1 GDN L0 + 1 GQA L3 fixture for vegajet_layer_test) ----
     if (!opt.dump_golden_layers_dir.empty()) {
+        const uint32_t local_ff = ff_size[0];
         namespace fs = std::filesystem;
         std::error_code ec;
         fs::create_directories(fs::path(opt.dump_golden_layers_dir) / "weights", ec);
@@ -4997,8 +5097,9 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                 return double(w.rows) * (double(w.cols) * 0.5 + double(w.cols / 32u) * 4.0);
             };
             const double gu_d8_row_b = double(dot8_gu_iq2s_layout(1u, D).read_bytes_per_row());
-            const double dn_d8_row_b = double(dot8_iq3_layout(1u, local_ff).read_bytes_per_row());
             for (size_t g = 0; g < 2; ++g) {
+                const uint32_t local_ff = ff_size[g];
+                const double dn_d8_row_b = double((asym_experts ? dot8_iq3_asym_layout(1u, local_ff) : dot8_iq3_layout(1u, local_ff)).read_bytes_per_row());
                 double bg = double(voc_rows[g]) * (double(D) + double(D / 32u) * 2.0);
                 for (uint32_t il = 0; il < 48u; ++il) {
                     const auto& lw = layers[g][il];
