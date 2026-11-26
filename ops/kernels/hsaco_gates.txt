@@ -32,6 +32,7 @@ ornith_gdn_conv_l2_gate_kernel tiled
 ornith_gdn_recur_quant_kernel tiled
 ornith_gdn_wy_prefill_quant_kernel tiled 70
 ornith_attn_qkv_prep_kernel tiled
+ornith_tree_attn_qkv_prep_kernel tiled
 ornith_attn_flash_quant_kernel tiled
 ornith_attn_prep_flash_m1_kernel tiled
 ornith_moe_router_fp16_logits_kernel tiled
@@ -95,6 +96,7 @@ ornith_moe_mid_f32_to_q8_kernel tiled
 ornith_moe_down_d8_sh_m1_kernel stream
 vj_spec_flash_partial_kernel stream
 vj_spec_flash_merge_quant_kernel stream
+vj_tree_flash_partial_kernel stream
 vj_flash_splitkv_any_partial_kernel stream
 vj_flash_splitkv_any_merge_quant_kernel stream
 vj_spec_gdn_verify_kernel stream

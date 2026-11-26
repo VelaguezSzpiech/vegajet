@@ -72,6 +72,14 @@ __device__ __forceinline__ float i8_at(uint32_t w, uint32_t k) {
     return static_cast<float>(static_cast<int8_t>((w >> (8u * k)) & 0xFFu));
 }
 
+// S3 tree verify: logical serial index t -> physical KV row (j-th set ancestor bit for the tree suffix).
+__device__ __forceinline__ uint32_t tree_phys_row(uint32_t t, uint32_t pos0, uint32_t mask) {
+    if (t < pos0) return t;
+    #pragma nounroll
+    for (uint32_t j = t - pos0; j > 0u; --j) mask &= mask - 1u;
+    return pos0 + static_cast<uint32_t>(__builtin_ctz(mask));
+}
+
 } // namespace spec_flash_dev
 } // namespace vegajet
 
@@ -244,6 +252,143 @@ void vj_spec_flash_merge_quant_kernel(
     const float inv_d    = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
     out_q8[oi] = static_cast<int8_t>(max(-127, min(127, __float2int_rn(y_d * inv_d))));
     if ((d & 31u) == 0u) out_ds[(static_cast<uint64_t>(m) * n_q_local + h) * 8u + (d >> 5)] = make_float2(sc, bsum);
+}
+
+// ============================================================================
+// S3 tree verify (VEGAJET_V12_TREE_VERIFY, opt-in): ancestor-masked copy of vj_spec_flash_partial_kernel.
+// Row m is a tree node: KV at physical row pos0 + m, logical position pos0 + depth[m]. Row m attends over its
+// LOGICAL serial context [0, L), L = pos0 + depth[m] + 1: logical t < pos0 is physical row t, logical
+// t = pos0 + j is physical row pos0 + (j-th set bit of mask[m]) (ancestors are parent-before-child, so the
+// set bits are in depth order; bit m = self). chunk_len is derived per row from L with the serial M = 1
+// thresholds (32 <= 1920, 64 <= 3840, 128 <= 7680, else 256), so chunk boundaries, per-chunk arithmetic and the
+// merge order equal a serial M = 1 decode of that path. The chunk_len argument is ignored (kept for the ABI).
+// Host contract: M <= 32; mask[m] has bit m set, no higher bit, popcount == depth[m] + 1;
+//   n_chunks >= max over rows of ceil(L / chunk_len(L)) (larger is fine: extra chunks are identity states).
+//   A row that breaks this writes identity states for all chunks (zero attention), never reads out of bounds.
+// Merge: the unchanged vj_spec_flash_merge_quant_kernel with the same n_chunks (it skips identity chunks).
+// ============================================================================
+extern "C" __global__ __launch_bounds__(512, 2)
+void vj_tree_flash_partial_kernel(
+    const float*   __restrict__ q_all,      // [M, n_q_local, 256]
+    const uint8_t* __restrict__ k_cache_q8, // [pos, n_kv_local, 272]
+    const uint8_t* __restrict__ v_cache_q8,
+    float*         __restrict__ part_o,     // [M, n_q_local, n_chunks, 256]
+    float*         __restrict__ part_ml,    // [M, n_q_local, n_chunks, 2]
+    uint32_t M,
+    uint32_t pos0,
+    uint32_t n_q_local,
+    uint32_t n_kv_local,
+    uint32_t n_chunks,
+    uint32_t /*chunk_len: ignored, per row*/,
+    const uint32_t* __restrict__ tree_mask,    // [M] ancestor-plus-self bits
+    const uint32_t* __restrict__ tree_depth) { // [M] logical depth (anchor = 0)
+    using namespace vegajet::spec_flash_dev;
+    const uint32_t c    = blockIdx.x;
+    const uint32_t m    = blockIdx.y;
+    const uint32_t kvh  = blockIdx.z;
+    if (m >= M || c >= n_chunks || kvh >= n_kv_local || n_q_local != n_kv_local * 16u) return;
+
+    const uint32_t wave = threadIdx.x >> 6;
+    const uint32_t lane = threadIdx.x & 63u;
+    const uint32_t l32  = lane & 31u;
+    const uint32_t h    = kvh * 16u + wave * 2u + (lane >> 5);
+    const uint32_t mask    = tree_mask[m];
+    const uint32_t depth   = tree_depth[m];
+    const uint32_t seqlen  = pos0 + depth + 1u;  // logical serial span of this row
+    const uint32_t chunk_len = (seqlen <= 1920u) ? 32u : ((seqlen <= 3840u) ? 64u : ((seqlen <= 7680u) ? 128u : 256u));
+    const bool row_ok = M <= 32u && (mask >> m) == 1u && static_cast<uint32_t>(__builtin_popcount(mask)) == depth + 1u &&
+                        (seqlen + chunk_len - 1u) / chunk_len <= n_chunks;
+    const uint32_t t_begin = c * chunk_len;
+    const uint32_t t_end   = row_ok ? min(t_begin + chunk_len, seqlen) : 0u;
+    const uint64_t st_idx  = (static_cast<uint64_t>(m) * n_q_local + h) * n_chunks + c;
+
+    if (t_begin >= t_end) {  // empty chunk (row's logical span ends earlier) or malformed row: identity state
+        if (l32 == 0u) {
+            __builtin_nontemporal_store(-1e30f, part_ml + st_idx * 2u);
+            __builtin_nontemporal_store(0.0f, part_ml + st_idx * 2u + 1u);
+        }
+        return;
+    }
+
+    float q[8];
+    {
+        const float4* q4 = reinterpret_cast<const float4*>(q_all + (static_cast<uint64_t>(m) * n_q_local + h) * 256u + l32 * 8u);
+        const float4 a = q4[0], b = q4[1];
+        q[0] = a.x; q[1] = a.y; q[2] = a.z; q[3] = a.w; q[4] = b.x; q[5] = b.y; q[6] = b.z; q[7] = b.w;
+    }
+    float o[8];
+    #pragma unroll
+    for (uint32_t i = 0; i < 8u; ++i) o[i] = 0.0f;
+    float m_run = -1e30f, l_run = 0.0f;
+    const uint32_t row_stride = n_kv_local * 272u;
+    const uint32_t qs_off = kvh * 272u + 16u + l32 * 8u;
+    const uint32_t sc_off = kvh * 272u + 2u * (l32 >> 2);
+
+    #pragma nounroll
+    for (uint32_t t0 = t_begin; t0 < t_end; t0 += 4u) {
+        // K and V rows of 4 positions requested together (tail re-reads the last valid row, masked below).
+        // KV rows are multi-hit (8 waves of this WG, other verify rows m): plain cached loads.
+        uint2 kw[4], vw[4];
+        uint16_t ks[4], vs[4];
+        uint32_t pr[4];  // physical KV rows of the 4 logical positions (wave-uniform: forced to SGPRs)
+        #pragma unroll
+        for (uint32_t j = 0; j < 4u; ++j)
+            pr[j] = __builtin_amdgcn_readfirstlane(tree_phys_row(min(t0 + j, t_end - 1u), pos0, mask));
+        #pragma unroll
+        for (uint32_t j = 0; j < 4u; ++j) {
+            const uint64_t ro = static_cast<uint64_t>(pr[j]) * row_stride;
+            kw[j] = *reinterpret_cast<const uint2*>(k_cache_q8 + ro + qs_off);
+            ks[j] = *reinterpret_cast<const uint16_t*>(k_cache_q8 + ro + sc_off);
+        }
+        #pragma unroll
+        for (uint32_t j = 0; j < 4u; ++j) {
+            const uint64_t ro = static_cast<uint64_t>(pr[j]) * row_stride;
+            vw[j] = *reinterpret_cast<const uint2*>(v_cache_q8 + ro + qs_off);
+            vs[j] = *reinterpret_cast<const uint16_t*>(v_cache_q8 + ro + sc_off);
+        }
+        float s[4];
+        #pragma unroll
+        for (uint32_t j = 0; j < 4u; ++j) {
+            float a0 = 0.0f, a1 = 0.0f;
+            #pragma unroll
+            for (uint32_t k = 0; k < 4u; k += 2u) {
+                a0 = fmaf(q[k], i8_at(kw[j].x, k), a0);
+                a1 = fmaf(q[k + 1u], i8_at(kw[j].x, k + 1u), a1);
+                a0 = fmaf(q[4u + k], i8_at(kw[j].y, k), a0);
+                a1 = fmaf(q[5u + k], i8_at(kw[j].y, k + 1u), a1);
+            }
+            // The K scale is per block-32 = per 4 lanes: apply it before the cross-lane sum.
+            s[j] = block32_sum((a0 + a1) * fp16_to_f32(ks[j])) * 0.0625f;
+        }
+        float m_new = m_run;
+        #pragma unroll
+        for (uint32_t j = 0; j < 4u; ++j)
+            if (t0 + j < t_end) m_new = fmaxf(m_new, s[j]);
+        const float alpha = __expf(m_run - m_new);
+        l_run *= alpha;
+        #pragma unroll
+        for (uint32_t i = 0; i < 8u; ++i) o[i] *= alpha;
+        #pragma unroll
+        for (uint32_t j = 0; j < 4u; ++j) {
+            const float beta = (t0 + j < t_end) ? __expf(s[j] - m_new) : 0.0f;
+            l_run += beta;
+            const float bv = beta * fp16_to_f32(vs[j]);
+            #pragma unroll
+            for (uint32_t k = 0; k < 4u; ++k) {
+                o[k]      = fmaf(bv, i8_at(vw[j].x, k), o[k]);
+                o[4u + k] = fmaf(bv, i8_at(vw[j].y, k), o[4u + k]);
+            }
+        }
+        m_run = m_new;
+    }
+
+    float* po = part_o + st_idx * 256u + l32 * 8u;
+    #pragma unroll
+    for (uint32_t i = 0; i < 8u; ++i) __builtin_nontemporal_store(o[i], po + i);
+    if (l32 == 0u) {
+        __builtin_nontemporal_store(m_run, part_ml + st_idx * 2u);
+        __builtin_nontemporal_store(l_run, part_ml + st_idx * 2u + 1u);
+    }
 }
 
 // ============================================================================

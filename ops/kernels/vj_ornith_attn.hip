@@ -1116,6 +1116,110 @@ void ornith_attn_qkv_prep_kernel(
 }
 
 // ============================================================================
+// 6b. S3 tree verify (VEGAJET_V12_TREE_VERIFY, opt-in): copy of ornith_attn_qkv_prep_kernel whose RoPE uses the
+//     logical position pos0 + depth[m] while K/V still go to physical row pos0 + m. Same args + depths appended.
+// ============================================================================
+extern "C" __global__ __launch_bounds__(256, 4)
+void ornith_tree_attn_qkv_prep_kernel(
+    const float* __restrict__ qkv_fused,
+    const float* __restrict__ q_norm_w,
+    const float* __restrict__ k_norm_w,
+    float*       __restrict__ q_out,
+    float*       __restrict__ gate_out,
+    uint8_t*     __restrict__ k_cache_q8,
+    uint8_t*     __restrict__ v_cache_q8,
+    uint32_t M,
+    uint32_t pos0,
+    uint32_t n_q_local,
+    uint32_t n_kv_local,
+    uint32_t rope_dims,
+    float    rope_base,
+    float    eps,
+    const uint32_t* __restrict__ tree_depth) {  // [M] logical depth (anchor = 0)
+    const uint32_t h_idx = blockIdx.x;
+    const uint32_t m     = blockIdx.y;
+    const uint32_t d     = threadIdx.x;
+    if (m >= M) return;
+
+    __shared__ float sm_v[256];
+    __shared__ float sm_sq[4];
+    const uint32_t wave = d >> 6;
+    const uint32_t lane = d & 63u;
+    const float pos_f = static_cast<float>(pos0 + tree_depth[m]);  // logical RoPE position
+    const uint32_t half_r = rope_dims >> 1;
+    const uint32_t qg_tot = n_q_local * 512u;
+    const uint32_t kv_tot = n_kv_local * 256u;
+    const float* row = qkv_fused + static_cast<uint64_t>(m) * (qg_tot + 2u * kv_tot);
+
+    if (h_idx < n_q_local) {
+        const float* qg = row + h_idx * 512u;
+        const float qv  = qg[d];
+        gate_out[(static_cast<uint64_t>(m) * n_q_local + h_idx) * 256u + d] = qg[256u + d];
+
+        float sq = vegajet::ornith_dev::wave64_sum(qv * qv);
+        if (lane == 0u) sm_sq[wave] = sq;
+        __syncthreads();
+        const float inv_r = rsqrtf((sm_sq[0] + sm_sq[1] + sm_sq[2] + sm_sq[3]) * (1.0f / 256.0f) + eps);
+        sm_v[d] = qv * inv_r * q_norm_w[d];
+        __syncthreads();
+
+        float q_rot = sm_v[d];
+        if (d < rope_dims) {
+            const uint32_t p = (d < half_r) ? d : (d - half_r);
+            const float theta = pos_f * __powf(rope_base, -2.0f * static_cast<float>(p) / static_cast<float>(rope_dims));
+            float s_th, c_th;
+            __sincosf(theta, &s_th, &c_th);
+            q_rot = (d < half_r) ? (sm_v[p] * c_th - sm_v[p + half_r] * s_th)
+                                 : (sm_v[p] * s_th + sm_v[p + half_r] * c_th);
+        }
+        q_out[(static_cast<uint64_t>(m) * n_q_local + h_idx) * 256u + d] = q_rot;
+    } else if (h_idx < n_q_local + n_kv_local) {
+        const uint32_t kv_h = h_idx - n_q_local;
+        const float* kr = row + qg_tot + kv_h * 256u;
+        const float* vr = row + qg_tot + kv_tot + kv_h * 256u;
+        const float kv  = kr[d];
+
+        float sq = vegajet::ornith_dev::wave64_sum(kv * kv);
+        if (lane == 0u) sm_sq[wave] = sq;
+        __syncthreads();
+        const float inv_r = rsqrtf((sm_sq[0] + sm_sq[1] + sm_sq[2] + sm_sq[3]) * (1.0f / 256.0f) + eps);
+        sm_v[d] = kv * inv_r * k_norm_w[d];
+        __syncthreads();
+
+        float k_rot = sm_v[d];
+        if (d < rope_dims) {
+            const uint32_t p = (d < half_r) ? d : (d - half_r);
+            const float theta = pos_f * __powf(rope_base, -2.0f * static_cast<float>(p) / static_cast<float>(rope_dims));
+            float s_th, c_th;
+            __sincosf(theta, &s_th, &c_th);
+            k_rot = (d < half_r) ? (sm_v[p] * c_th - sm_v[p + half_r] * s_th)
+                                 : (sm_v[p] * s_th + sm_v[p + half_r] * c_th);
+        }
+
+        const uint64_t slot_off = (static_cast<uint64_t>(pos0 + m) * n_kv_local + kv_h) * 272ULL;
+        uint8_t* kc = k_cache_q8 + slot_off;
+        uint8_t* vc = v_cache_q8 + slot_off;
+        const uint32_t blk = d >> 5;
+        const uint32_t sub = d & 31u;
+        {
+            const float amax = vegajet::ornith_dev::block32_max(fabsf(k_rot));
+            const float sc   = amax * (1.0f / 127.0f);
+            const float inv  = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+            reinterpret_cast<int8_t*>(kc + 16u)[d] = static_cast<int8_t>(max(-127, min(127, __float2int_rn(k_rot * inv))));
+            if (sub == 0u) reinterpret_cast<uint16_t*>(kc)[blk] = __half_as_ushort(__float2half(sc));
+        }
+        {
+            const float vv   = vr[d];
+            const float amax = vegajet::ornith_dev::block32_max(fabsf(vv));
+            const float sc   = amax * (1.0f / 127.0f);
+            const float inv  = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+            reinterpret_cast<int8_t*>(vc + 16u)[d] = static_cast<int8_t>(max(-127, min(127, __float2int_rn(vv * inv))));
+            if (sub == 0u) reinterpret_cast<uint16_t*>(vc)[blk] = __half_as_ushort(__float2half(sc));
+        }
+    }
+}
+
+// ============================================================================
 // 7. Causal Wave64 FlashAttention on Q8_0 KV Cache + Sigmoid(Gate) + INT8 Quant (+ out_ds)
 // ============================================================================
 extern "C" __global__ __launch_bounds__(256, 4)
