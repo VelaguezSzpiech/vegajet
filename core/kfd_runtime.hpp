@@ -128,6 +128,7 @@ struct KfdBuffer {
     uint32_t flags = 0;
     bool     is_userptr = false;
     bool     is_hugetlb = false;
+    std::vector<uint32_t> mapped_gpu_ids;  // exact successful MAP prefix, not all runtime GPUs
 };
 
 // Hot-tensor VA clustering (opt-in). A tiered arena packs every always-touched tensor (dense projections,
@@ -313,7 +314,7 @@ public:
 
     const KfdBuffer& host_pinned_arena() const { return host_pinned_arena_; }
     bool alloc_userptr_pinned(uint64_t size, KfdBuffer& out, bool map_all_gpus = true);
-    void free_buffer(KfdBuffer& buf);
+    bool free_buffer(KfdBuffer& buf);
 
     // AQL kernel dispatch
     bool enqueue_kernel(size_t gpu_idx, const LoadedKernel& kernel,
@@ -351,7 +352,7 @@ private:
 #ifndef VEGAJET_CPU_ONLY
     uint64_t reserve_va(uint64_t size, uint64_t align = 0x200000ULL);
     bool alloc_vram(size_t gpu_idx, uint64_t size, uint32_t extra_flags, KfdBuffer& out, bool map_all_gpus = false);
-    bool map_to_gpus(const KfdBuffer& buf, const std::vector<uint32_t>& gpu_ids);
+    bool map_to_gpus(KfdBuffer& buf, const std::vector<uint32_t>& gpu_ids);
     bool create_aql_queue(size_t gpu_idx);
     void destroy_aql_queue(size_t gpu_idx);
     bool setup_allreduce_mailbox();
@@ -371,6 +372,7 @@ private:
     std::vector<KfdArena> vram_arenas_;
     std::vector<KfdAqlQueue> queues_;
     std::vector<KfdBuffer> code_buffers_;
+    std::unordered_map<uint64_t, KfdBuffer> retained_buffers_;  // failed cleanup, retry before closing KFD
     std::vector<LoadedModule> loaded_modules_;
     std::string last_hsaco_dir_;
     uint64_t reload_generation_ = 0;
