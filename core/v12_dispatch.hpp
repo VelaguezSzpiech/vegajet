@@ -25,6 +25,9 @@ inline bool fused_verify_resident(bool metadata, uint32_t n_cu, uint32_t vgpr, u
     const uint32_t per_cu = std::min(16u, std::min(occ.resident_wgs_per_cu, wave_cap));
     return static_cast<uint64_t>(per_cu) * n_cu >= wgs;
 }
+inline bool collective_slice_needs_drain(uint32_t offset, uint32_t rows, uint32_t total) {
+    return offset < total && rows != 0u && rows < total - offset;
+}
 inline uint32_t eh_grid_x(uint32_t rows) { return rows * 256u; }
 inline bool kv_span_fits(uint32_t pos, uint32_t rows, uint32_t max_ctx) {
     return rows != 0u && pos < max_ctx && rows <= max_ctx - pos;

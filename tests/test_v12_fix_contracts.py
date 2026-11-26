@@ -90,6 +90,53 @@ class FixContracts(unittest.TestCase):
             self.assertIn('const uint32_t ep = ' + stage + '_collective.epoch;', batch)
             self.assertIn('const uint32_t pp = ' + stage + '_collective.parity;', batch)
 
+    def test_slice_protocol_all_schedules(self):
+        # Abstract publication/observation model, not GPU execution. A host drain
+        # gates the next publish on BOTH observations, including delayed rank B.
+        def explore(slices, fence):
+            seen, pending, deadlocks, complete = set(), [((0, 0), (0, 0))], 0, 0
+            while pending:
+                state = pending.pop()
+                if state in seen:
+                    continue
+                seen.add(state)
+                pc, flags = state
+                if pc == (2 * slices, 2 * slices):
+                    complete += 1
+                    continue
+                successors = []
+                for rank in range(2):
+                    step = pc[rank]
+                    if step == 2 * slices:
+                        continue
+                    epoch = step // 2 + 1
+                    new_flags = list(flags)
+                    if step % 2 == 0:
+                        if fence and min(pc) < 2 * (epoch - 1):
+                            continue
+                        new_flags[1 - rank] = epoch
+                    elif flags[rank] != epoch:
+                        continue
+                    new_pc = list(pc)
+                    new_pc[rank] += 1
+                    successors.append((tuple(new_pc), tuple(new_flags)))
+                deadlocks += not successors
+                pending.extend(successors)
+            return deadlocks, complete
+        for slices in (2, 3):
+            self.assertGreater(explore(slices, False)[0], 0)  # regression counterexample
+            deadlocks, complete = explore(slices, True)
+            self.assertEqual(deadlocks, 0)
+            self.assertEqual(complete, 1)
+
+    def test_sliced_collectives_drain_both_ranks_before_reuse(self):
+        src = (ROOT / 'models/ornith/ornith_gpu.cpp').read_text()
+        ar = src[src.index('        auto enq_p2p_ar_rms ='):src.index('        const bool use_m1_super')]
+        self.assertIn('dispatch::collective_slice_needs_drain(m0, mc, M)', ar)
+        self.assertIn('!rt.submit_batch(0) || !rt.submit_batch(1) ||', ar)
+        self.assertIn('!rt.wait_idle(0) || !rt.wait_idle(1)', ar)
+        self.assertIn('fail_run("all-reduce slice completion failed or timed out before mailbox reuse")', ar)
+
     def test_verify_barrier_is_fail_closed(self):
         src = (ROOT / 'ops/kernels/vj_spec_gdn.hip').read_text()
         self.assertIn('if (!grid_barrier_wbinvl1(nq_bar, gridDim.x, sense, {fault_va, sense})) return;', src)
