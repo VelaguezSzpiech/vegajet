@@ -17,8 +17,12 @@ mkdir -p "$OUT"
 
 # Add a fixed prompt with EXTRA="--prompt '...'" to test normal text as well as the default prompt.
 EXTRA=${EXTRA:-}
-GPUS=${GPUS:?set GPUS=<bdf0>,<bdf1> (two MI50s, from vegajet serve --gpu list)}
-EXTRA="$EXTRA --gpu $GPUS"
+GPUS=${GPUS:-}
+if [[ -n $GPUS ]]; then
+  EXTRA="$EXTRA --gpu $GPUS"
+else
+  echo "WARNING: GPUS is not set; the engine selects the cards. Set GPUS=<bdf0>,<bdf1> (vegajet serve --gpu list)." >&2
+fi
 
 failed=0
 run() { # name, env, args...

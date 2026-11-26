@@ -9,3 +9,5 @@
 | 2026-11-26 | same | GPU build ROCm 7.12 + hsaco gate | 24/24 code objects PASS (22 base + 2 v1.2 variants), 0 FAIL |
 | 2026-11-26 | 618bf04 (all levers + review fixes + runtime/parser fixes) | CPU build + ctest | 100% tests passed, 0 failed out of 114 |
 | 2026-11-26 | same | GPU build ROCm 7.12 + hsaco gate | 25/25 code objects PASS, 0 FAIL |
+| 2026-11-26 | 098e5f8+server fixes | CPU build + ctest | 100% tests passed, 0 failed out of 115 |
+| 2026-11-26 | same | GPU build ROCm 7.12 + hsaco gate | 25/25 code objects PASS, 0 FAIL |
