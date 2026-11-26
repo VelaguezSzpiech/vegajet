@@ -130,6 +130,91 @@ void ring_ref(const float* S0, const float* conv, const float* dec, const float*
     }
 }
 
+
+// ---- v1.2 S5: the fused launch's second phase must be a one-wave-per-(token, head) norm+quant ----
+constexpr uint32_t NQ_STRIDE = 10304u, NQ_ZOFF = 6144u;
+constexpr float    NQ_EPS    = 1e-6f;
+
+// XOR butterfly over n lanes with offsets n/2 .. 1 (block32_sum / wave64_sum / the 16-lane shfl_xor trees).
+float bfly(float* v, uint32_t n) {
+    for (uint32_t off = n / 2u; off > 0u; off >>= 1u) {
+        std::vector<float> t(v, v + n);
+        for (uint32_t i = 0u; i < n; ++i) v[i] = t[i] + t[i ^ off];
+    }
+    return v[0];
+}
+float bfly_max(float* v, uint32_t n) {
+    for (uint32_t off = n / 2u; off > 0u; off >>= 1u) {
+        std::vector<float> t(v, v + n);
+        for (uint32_t i = 0u; i < n; ++i) v[i] = std::fmax(t[i], t[i ^ off]);
+    }
+    return v[0];
+}
+
+// One (token, head) item: raw o -> gated RMSNorm * w * SiLU(z) -> block-32 INT8 with (d, bsum) per block.
+// exp/std math is emulated with std::exp, so this pins index and reduction order, not the transcendental.
+void nq_head(const float* o, const float* gab, const float* nw, uint32_t nv, uint32_t m, uint32_t hv,
+             int8_t* q8, float* ds) {
+    const float* ob = o + (uint64_t(m) * nv + hv) * HD;
+    float fo[128];
+    for (uint32_t j = 0u; j < HD; ++j) fo[j] = ob[j];
+    float sq[64];
+    for (uint32_t l = 0u; l < 64u; ++l) sq[l] = fo[2u * l] * fo[2u * l] + fo[2u * l + 1u] * fo[2u * l + 1u];
+    const float inv_r = 1.0f / std::sqrt(bfly(sq, 64u) * (1.0f / 128.0f) + NQ_EPS);
+
+    float y[128];
+    const float* zp = gab + uint64_t(m) * NQ_STRIDE + NQ_ZOFF + hv * HD;
+    for (uint32_t j = 0u; j < HD; ++j) {
+        const float z = zp[j];
+        y[j] = (fo[j] * inv_r * nw[j]) * (z / (1.0f + std::exp(-z)));
+    }
+    int8_t* oq = q8 + (uint64_t(m) * nv + hv) * HD;
+    for (uint32_t blk = 0u; blk < 4u; ++blk) {          // one block-32 per 16-lane shfl group
+        float am[16], bs[16];
+        for (uint32_t i = 0u; i < 16u; ++i) {
+            const float y0 = y[blk * 32u + 2u * i], y1 = y[blk * 32u + 2u * i + 1u];
+            am[i] = std::fmax(std::fabs(y0), std::fabs(y1));
+            bs[i] = y0 + y1;
+        }
+        const float amax = bfly_max(am, 16u), bsum = bfly(bs, 16u);
+        const float d     = amax * (1.0f / 127.0f);
+        const float inv_d = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+        for (uint32_t i = 0u; i < 16u; ++i) {
+            oq[blk * 32u + 2u * i]      = int8_t(std::max(-127, std::min(127, int(std::nearbyint(y[blk * 32u + 2u * i] * inv_d)))));
+            oq[blk * 32u + 2u * i + 1u] = int8_t(std::max(-127, std::min(127, int(std::nearbyint(y[blk * 32u + 2u * i + 1u] * inv_d)))));
+        }
+        ds[(uint64_t(m) * nv + hv) * 8u + blk * 2u]      = d;
+        ds[(uint64_t(m) * nv + hv) * 8u + blk * 2u + 1u] = bsum;
+    }
+}
+
+// Two dispatches: vj_spec_gdn_norm_quant_kernel, grid ceil(M*nv/4) WGs x 4 waves.
+void nq_two_dispatch(const float* o, const float* gab, const float* nw, uint32_t M, uint32_t nv,
+                     int8_t* q8, float* ds) {
+    const uint32_t wgs = (M * nv + 3u) / 4u;
+    for (uint32_t wg = 0u; wg < wgs; ++wg)
+        for (uint32_t wave = 0u; wave < 4u; ++wave) {
+            const uint32_t idx = wg * 4u + wave;
+            if (idx >= M * nv) continue;
+            nq_head(o, gab, nw, nv, idx / nv, idx % nv, q8, ds);
+        }
+}
+
+// Fused launch: same wave map, but the grid is the verify grid (nv*4 = 128 WGs, nv*4*4 >= M*nv work items)
+// and one grid barrier separates the phases. Returns the number of items written.
+uint32_t nq_fused_phase(const float* o, const float* gab, const float* nw, uint32_t M, uint32_t nv,
+                        int8_t* q8, float* ds) {
+    uint32_t written = 0;
+    for (uint32_t wg = 0u; wg < nv * 4u; ++wg)
+        for (uint32_t wave = 0u; wave < 4u; ++wave) {
+            const uint32_t idx = wg * 4u + wave;
+            if (idx >= M * nv) continue;
+            nq_head(o, gab, nw, nv, idx / nv, idx % nv, q8, ds);
+            ++written;
+        }
+    return written;
+}
+
 } // namespace
 
 int main() {
@@ -170,6 +255,17 @@ int main() {
             VJ_CHECK(std::memcmp(o.data(), o_ref.data(), o.size() * 4) == 0);                       // per-token o
             VJ_CHECK(std::memcmp(&slotB[ly * SL], ref_states[ly][M - 1].data(), SL * 4) == 0);       // S_M
             VJ_CHECK(std::memcmp(&slotA[ly * SL], &S0[ly * SL], SL * 4) == 0);                       // S_0 kept
+            // v1.2 S5: the fused verify+norm/quant launch must reproduce the two-dispatch nq output exactly.
+            std::vector<float> gab(size_t(M) * NQ_STRIDE), nw(HD);
+            for (auto& v : gab) v = nd(rng);
+            for (auto& v : nw) v = 0.5f + ud(rng);
+            std::vector<int8_t> q8a(size_t(M) * NV * HD), q8b(q8a.size(), 0);
+            std::vector<float> dsa(size_t(M) * NV * 8u), dsb(dsa.size(), 0.0f);
+            nq_two_dispatch(o.data(), gab.data(), nw.data(), M, NV, q8a.data(), dsa.data());
+            const uint32_t nq_written = nq_fused_phase(o.data(), gab.data(), nw.data(), M, NV, q8b.data(), dsb.data());
+            VJ_CHECK(nq_written == M * NV);                                        // every (token, head) exactly once
+            VJ_CHECK(std::memcmp(q8a.data(), q8b.data(), q8a.size()) == 0);        // INT8 payload identical
+            VJ_CHECK(std::memcmp(dsa.data(), dsb.data(), dsa.size() * 4u) == 0);   // (d, bsum) identical
             ++n;
         }
         // Reject at every prefix n: one in-place recompute over all layers from the records.

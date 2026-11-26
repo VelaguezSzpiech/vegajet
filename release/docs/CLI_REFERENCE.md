@@ -324,6 +324,7 @@ Exit codes: 0 ok (end of input or `/quit`), 1 server unreachable (`GET /health` 
 | `VEGAJET_GU_DOT8_LAYERS` | Ornith GPU bench | Number of Gate+Up layers to promote to DOT8 (overrides the automatic choice; `0` = automatic). |
 | `VEGAJET_GU_Q3` | Ornith GPU bench | `1` (any value > 0): routed Gate+Up as lossless 3-bit VJ_Q3_IQ2S in place on all 48 layers. Off by default. |
 | `VEGAJET_V12_NARROW_VERIFY` | Ornith GPU bench | `1`: v1.2 S4, the M=2..16 verify batches use the narrow multi-column Q4A8 GEMV (`ornith_gemv_q4a8_mn_kernel`, one weight pass for all draft rows) instead of the m8/m12/m16 GEMMs. Off by default. |
+| `VEGAJET_V12_VERIFY_FUSED_NQ` | Ornith GPU bench | `1`: v1.2 S5, the spec-verify path runs the GDN verify and its norm+quant in one launch (one grid barrier) instead of two dispatches per GDN layer. Off by default. |
 | `HOME` | doctor, roofline profile | Location of `~/.config/vegajet/hw_profile.json` (unset: a file under `/tmp`). |
 
 ## Exit codes

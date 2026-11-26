@@ -260,3 +260,229 @@ void vj_spec_gdn_norm_quant_kernel(
     oq[j0 + 1u] = static_cast<int8_t>(max(-127, min(127, __float2int_rn(y1 * inv_d))));
     if ((lane & 15u) == 0u) out_ds[(static_cast<uint64_t>(m) * nv + hv) * 4u + (lane >> 4)] = make_float2(d, bsum);
 }
+
+// ---------------------------------------------------------------------------------------------------
+// v1.2 S5: verify + gated-RMSNorm/INT8-quant in ONE launch (VEGAJET_V12_VERIFY_FUSED_NQ=1, default off).
+//
+// Same arithmetic as vj_spec_gdn_verify_kernel followed by vj_spec_gdn_norm_quant_kernel: the verify phase
+// below is a verbatim copy of that kernel (same per-token order, same o_out layout), then a single grid
+// barrier (gridDim.x = nv*4 = 128 WGs, all resident at 3 WGs/CU on 60 CUs) makes every WG's raw o visible,
+// and the norm+quant phase is a verbatim copy of the one-wave-per-(token, head) kernel. Result is therefore
+// bit-identical to the two-dispatch pair; only the second dispatch (~1.1 us) disappears.
+//
+// Per-layer, not per-step: the norm+quant output feeds the ssm_out GEMV of the SAME layer, so it cannot be
+// deferred into one launch over all GDN layers (unlike the recompute pass at grid.y = n_layers, which
+// produces no output). 36 launches/step instead of 72.
+//
+// Not used for recompute-on-reject: the fused variant requires q_src/o_out (uniform guard below, so no WG
+// reaches the barrier when it bails out).
+__device__ __forceinline__ uint32_t ld_glc_u32(const uint32_t* p) {
+    uint32_t v;
+    asm volatile("global_load_dword %0, %1, off glc slc\n\ts_waitcnt vmcnt(0)\n" : "=v"(v) : "v"(p) : "memory");
+    return v;
+}
+
+__device__ __forceinline__ void grid_barrier_wbinvl1(uint32_t* bar, uint32_t n_wgs, uint32_t sense) {
+    asm volatile("s_waitcnt vmcnt(0)\n" ::: "memory");
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+        const uint32_t arr = __atomic_fetch_add(&bar[0], 1u, __ATOMIC_RELAXED) + 1u;
+        if (arr == n_wgs) {
+            __atomic_store_n(&bar[0], 0u, __ATOMIC_RELAXED);
+            asm volatile("s_waitcnt vmcnt(0)\n" ::: "memory");
+            __atomic_store_n(&bar[16], sense, __ATOMIC_RELEASE);
+        } else {
+            #pragma nounroll
+            for (uint32_t spin = 0u; spin < 5000000u; ++spin) {
+                if (ld_glc_u32(&bar[16]) == sense) break;
+                __builtin_amdgcn_s_sleep(2);
+            }
+        }
+        asm volatile("buffer_wbinvl1\n" ::: "memory");
+    }
+    __syncthreads();
+}
+
+extern "C" __global__ __launch_bounds__(256, 3)
+void vj_spec_gdn_verify_fused_nq_kernel(
+    const float* S_in,                       // may alias S_out
+    float*       S_out,
+    const float* __restrict__ q_src,         // required (verify pass only)
+    const float* __restrict__ k_src,
+    const float* __restrict__ v_src,
+    const float* __restrict__ dec_in,        // [M][nv]
+    const float* __restrict__ beta_in,       // [M][nv]
+    float*       __restrict__ o_out,         // required: [M][nv][128] raw o
+    float*       __restrict__ rec_kv,        // nullable: [M][(nk+nv)*128]
+    float*       __restrict__ rec_dec,       // nullable
+    float*       __restrict__ rec_beta,      // nullable
+    const float* __restrict__ qkv_gab_in,    // z gate rows: [M][stride_in], z at z_off + hv*128
+    const float* __restrict__ ssm_norm_w,    // [128]
+    int8_t*      __restrict__ out_q8,        // [M][nv][128]
+    float2*      __restrict__ out_ds,        // [M][nv][4]
+    uint32_t*    __restrict__ nq_bar,        // 64 u32 scratch: [0] arrivals, [16] sense release
+    uint32_t M,
+    uint32_t nk,
+    uint32_t nv,
+    uint32_t src_stride,                     // floats between token rows of q/k/v sources
+    uint32_t rec_stride,                     // floats between token rows of rec_kv
+    uint32_t layer_base,
+    uint32_t s_layer_stride,
+    uint32_t src_layer_stride,
+    uint32_t gb_layer_stride,
+    uint32_t rec_layer_stride,
+    uint32_t rec_gb_layer_stride,
+    uint32_t stride_in,                      // qkv_gab row stride (floats)
+    uint32_t z_off,                          // z gate column offset of the head block
+    uint32_t sense,
+    float    eps) {
+    using namespace vegajet::spec_gdn_dev;
+    if (q_src == nullptr || o_out == nullptr || M == 0u || M > VJ_SPEC_GDN_MAX_M || gridDim.y != 1u) return;
+    const uint32_t hv   = blockIdx.x >> 2;
+    const uint32_t part = blockIdx.x & 3u;
+    const uint32_t tid  = threadIdx.x;
+    const uint32_t c    = tid & 31u;
+    const uint32_t rg   = tid >> 5;
+    const uint32_t col0 = part * 32u;
+    if (hv >= nv) return;
+    const uint32_t hk  = hv % nk;
+    const uint64_t lid = static_cast<uint64_t>(layer_base);
+
+    __shared__ float sm_q[VJ_SPEC_GDN_MAX_M * 128];
+    __shared__ float sm_k[VJ_SPEC_GDN_MAX_M * 128];
+    __shared__ float sm_v[VJ_SPEC_GDN_MAX_M * 32];
+    __shared__ float sm_g[VJ_SPEC_GDN_MAX_M];
+    __shared__ float sm_b[VJ_SPEC_GDN_MAX_M];
+    __shared__ float sm_p[8 * 32];
+    __shared__ float sm_o[8 * 32];
+    __shared__ float sm_dv[32];
+
+    // ---- stage all M tokens' inputs in LDS (and record them for recompute-on-reject) ----
+    {
+        const float* ks = k_src + lid * src_layer_stride;
+        const float* vs = v_src + lid * src_layer_stride;
+        float* rk = rec_kv ? rec_kv + lid * rec_layer_stride : nullptr;
+        const bool rec_k = rk != nullptr && part == 0u && hv < nk;
+        for (uint32_t e = tid; e < M * 128u; e += 256u) {
+            const uint32_t m = e >> 7, i = e & 127u;
+            const float kv = ks[static_cast<uint64_t>(m) * src_stride + hk * 128u + i];
+            sm_k[e] = kv;
+            sm_q[e] = q_src[lid * src_layer_stride + static_cast<uint64_t>(m) * src_stride + hk * 128u + i];
+            if (rec_k) rk[static_cast<uint64_t>(m) * rec_stride + hv * 128u + i] = kv;
+        }
+        for (uint32_t e = tid; e < M * 32u; e += 256u) {
+            const uint32_t m = e >> 5, cc = e & 31u;
+            const float vv = vs[static_cast<uint64_t>(m) * src_stride + hv * 128u + col0 + cc];
+            sm_v[e] = vv;
+            if (rk) rk[static_cast<uint64_t>(m) * rec_stride + nk * 128u + hv * 128u + col0 + cc] = vv;
+        }
+        if (tid < M) {
+            const float g = dec_in[lid * gb_layer_stride + static_cast<uint64_t>(tid) * nv + hv];
+            const float b = beta_in[lid * gb_layer_stride + static_cast<uint64_t>(tid) * nv + hv];
+            sm_g[tid] = g;
+            sm_b[tid] = b;
+            if (rec_dec && part == 0u) {
+                rec_dec[lid * rec_gb_layer_stride + static_cast<uint64_t>(tid) * nv + hv] = g;
+                rec_beta[lid * rec_gb_layer_stride + static_cast<uint64_t>(tid) * nv + hv] = b;
+            }
+        }
+    }
+
+    // ---- S_0: this thread's 16 rows of one column, read once ----
+    const uint32_t i_beg = rg * 16u;
+    const uint32_t col   = col0 + c;
+    const uint64_t s_off = lid * s_layer_stride + static_cast<uint64_t>(hv) * 16384u + (i_beg + 8u) * 128u + col;
+    const float* S_thr_in = S_in + s_off;
+    float s_reg[16];
+    #pragma unroll
+    for (uint32_t r = 0u; r < 16u; ++r) s_reg[r] = __builtin_nontemporal_load(S_thr_in + (static_cast<int32_t>(r) - 8) * 128);
+    __syncthreads();
+
+    uint32_t m = 0u;
+    #pragma nounroll
+    do {
+        const float* km = sm_k + m * 128u + i_beg;
+        float p = 0.0f;
+        #pragma unroll
+        for (uint32_t r = 0u; r < 16u; ++r) p = fmaf(s_reg[r], km[r], p);
+        sm_p[rg * 32u + c] = p;
+        __syncthreads();  // A: pred partials of token m visible; o partials of token m-1 visible
+
+        if (tid < 32u) {
+            const float pred = sum8(sm_p, tid);
+            const float vj = sm_v[m * 32u + tid];
+            sm_dv[tid] = sm_b[m] * (vj - sm_g[m] * pred);
+        } else if (tid >= 64u && tid < 96u && m > 0u) {
+            o_out[(static_cast<uint64_t>(m - 1u) * nv + hv) * 128u + col0 + (tid - 64u)] = sum8(sm_o, tid - 64u);
+        }
+        __syncthreads();  // B: dv visible; sm_o free for token m
+
+        const float dv = sm_dv[c];
+        const float g_exp = sm_g[m];
+        const float* qm = sm_q + m * 128u + i_beg;
+        float o = 0.0f;
+        #pragma unroll
+        for (uint32_t r = 0u; r < 8u; ++r) {
+            s_reg[r] = fmaf(km[r], dv, g_exp * s_reg[r]);
+            o = fmaf(s_reg[r], qm[r], o);
+        }
+        __builtin_amdgcn_sched_barrier(0);
+        #pragma unroll
+        for (uint32_t r = 8u; r < 16u; ++r) {
+            s_reg[r] = fmaf(km[r], dv, g_exp * s_reg[r]);
+            o = fmaf(s_reg[r], qm[r], o);
+        }
+        sm_o[rg * 32u + c] = o;
+    } while (++m < M);
+    __syncthreads();
+    if (tid >= 64u && tid < 96u)
+        o_out[(static_cast<uint64_t>(M - 1u) * nv + hv) * 128u + col0 + (tid - 64u)] = sum8(sm_o, tid - 64u);
+
+    // ---- S_M: written once ----
+    float* S_thr_out = S_out + s_off;
+    #pragma unroll
+    for (uint32_t r = 0u; r < 16u; ++r) S_thr_out[(static_cast<int32_t>(r) - 8) * 128] = s_reg[r];
+
+    // ---- one grid barrier over all nv*4 WGs: every WG's raw o is now visible ----
+    grid_barrier_wbinvl1(nq_bar, gridDim.x, sense);
+
+    // ---- norm + quant phase: verbatim vj_spec_gdn_norm_quant_kernel (one wave per (token, head)) ----
+    {
+        const uint32_t wave = tid >> 6;
+        const uint32_t lane = tid & 63u;
+        const uint32_t idx  = blockIdx.x * 4u + wave;
+        if (idx >= M * nv) return;
+        const uint32_t mm = idx / nv;
+        const uint32_t hh = idx - mm * nv;
+        const uint32_t j0 = lane * 2u;
+
+        const float* ob = o_out + (static_cast<uint64_t>(mm) * nv + hh) * 128u;
+        const float fo0 = __builtin_nontemporal_load(ob + j0);
+        const float fo1 = __builtin_nontemporal_load(ob + j0 + 1u);
+        const float total_sq = wave64_sum(fo0 * fo0 + fo1 * fo1);
+        const float inv_r = rsqrtf(total_sq * (1.0f / 128.0f) + eps);
+        const float* zp = qkv_gab_in + static_cast<uint64_t>(mm) * stride_in + z_off + hh * 128u;
+        const float z0 = zp[j0], z1 = zp[j0 + 1u];
+        const float y0 = (fo0 * inv_r * ssm_norm_w[j0])      * (z0 / (1.0f + __expf(-z0)));
+        const float y1 = (fo1 * inv_r * ssm_norm_w[j0 + 1u]) * (z1 / (1.0f + __expf(-z1)));
+
+        float amax = fmaxf(fabsf(y0), fabsf(y1));
+        amax = fmaxf(amax, __shfl_xor(amax, 8, 16));
+        amax = fmaxf(amax, __shfl_xor(amax, 4, 16));
+        amax = fmaxf(amax, __shfl_xor(amax, 2, 16));
+        amax = fmaxf(amax, __shfl_xor(amax, 1, 16));
+
+        float bsum = y0 + y1;
+        bsum += __shfl_xor(bsum, 8, 16);
+        bsum += __shfl_xor(bsum, 4, 16);
+        bsum += __shfl_xor(bsum, 2, 16);
+        bsum += __shfl_xor(bsum, 1, 16);
+
+        const float d     = amax * (1.0f / 127.0f);
+        const float inv_d = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+        int8_t* oq = out_q8 + (static_cast<uint64_t>(mm) * nv + hh) * 128u;
+        oq[j0]      = static_cast<int8_t>(max(-127, min(127, __float2int_rn(y0 * inv_d))));
+        oq[j0 + 1u] = static_cast<int8_t>(max(-127, min(127, __float2int_rn(y1 * inv_d))));
+        if ((lane & 15u) == 0u) out_ds[(static_cast<uint64_t>(mm) * nv + hh) * 4u + (lane >> 4)] = make_float2(d, bsum);
+    }
+}

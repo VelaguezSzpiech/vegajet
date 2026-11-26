@@ -242,6 +242,7 @@ struct GpuStateDev {
     std::vector<uint64_t> gdn_ssm_ring_va;
     uint64_t spec_gdn_s_slot_va[2] = {0, 0}; // --spec-gdn: 2 contiguous [36][32][128][128] FP32 slots
     uint64_t spec_gdn_o_va         = 0;      // [12][32][128] FP32
+    uint64_t spec_nq_bar_va        = 0;      // v1.2 S5: 64 u32 grid barrier for the fused verify+nq launch
     uint64_t spec_gdn_rec_kv_va    = 0;      // [36][12][40*128] FP32
     uint64_t spec_gdn_rec_dec_va   = 0;      // [36][12][32] FP32
     uint64_t spec_gdn_rec_beta_va  = 0;      // [36][12][32] FP32
@@ -309,6 +310,7 @@ struct KernelTable {
     const kfd::LoadedKernel* moe_down_d8_pp = nullptr;
     const kfd::LoadedKernel* spec_gdn_ver = nullptr;
     const kfd::LoadedKernel* spec_gdn_nq = nullptr;
+    const kfd::LoadedKernel* spec_gdn_ver_nq = nullptr;  // v1.2 S5: verify + norm/quant in one launch
     const kfd::LoadedKernel* spec_flash_part = nullptr;
     const kfd::LoadedKernel* spec_flash_merge = nullptr;
     const kfd::LoadedKernel* flash_skv_p1 = nullptr;
@@ -934,6 +936,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             K[g].moe_down_d8_pp   = need_k("vj_moe_down_dot8_prepush_kernel");
             K[g].spec_gdn_ver = opt.spec_gdn ? need_k("vj_spec_gdn_verify_kernel") : rt.get_kernel(g, "vj_spec_gdn_verify_kernel");
             K[g].spec_gdn_nq  = opt.spec_gdn ? need_k("vj_spec_gdn_norm_quant_kernel") : rt.get_kernel(g, "vj_spec_gdn_norm_quant_kernel");
+            K[g].spec_gdn_ver_nq = rt.get_kernel(g, "vj_spec_gdn_verify_fused_nq_kernel");  // v1.2 S5 (optional)
             K[g].flash_skv_p1 = need_k("vj_flash_splitkv_any_partial_kernel");
             K[g].flash_skv_p2 = need_k("vj_flash_splitkv_any_merge_quant_kernel");
             K[g].spec_flash_part  = opt.spec_flash ? need_k("vj_spec_flash_partial_kernel") : rt.get_kernel(g, "vj_spec_flash_partial_kernel");
@@ -1872,6 +1875,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             S[g].spec_gdn_s_slot_va[0] = alloc(all_s_bytes, 4096);
             S[g].spec_gdn_s_slot_va[1] = alloc(all_s_bytes, 4096);
             S[g].spec_gdn_o_va         = alloc(16ULL * 32ULL * 128ULL * 4ULL, 4096);
+            S[g].spec_nq_bar_va        = alloc(256u, 256);
             S[g].spec_gdn_rec_kv_va    = alloc(36ULL * 16ULL * 40ULL * 128ULL * 4ULL, 4096);
             S[g].spec_gdn_rec_dec_va   = alloc(36ULL * 16ULL * 32ULL * 4ULL, 4096);
             S[g].spec_gdn_rec_beta_va  = alloc(36ULL * 16ULL * 32ULL * 4ULL, 4096);
@@ -1981,7 +1985,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                 res.load_sec, res.vram_gib_gpu0, res.vram_gib_gpu1,
                 (30.50 - res.vram_gib_gpu0) + (30.50 - res.vram_gib_gpu1));
 
-    uint32_t ar_epoch = 1u, ring_head = 0u, conv_head = 0u, spec_gdn_active = 0u, last_dispatches = 0, moe_sense = 0u, gdn_sense = 0u, moe_back_sense = 0u, super_sense = 0u;
+    uint32_t ar_epoch = 1u, ring_head = 0u, conv_head = 0u, spec_gdn_active = 0u, last_dispatches = 0, moe_sense = 0u, gdn_sense = 0u, moe_back_sense = 0u, super_sense = 0u, spec_nq_sense = 0u;
     // Stage profiler: when prof_stage != 0 the matching idempotent stage is enqueued prof_reps times per layer, so
     // (t(reps) - t(1)) / (reps - 1) is that stage's in-situ cost per token. Outputs are unchanged.
     uint32_t prof_stage = 0u, prof_reps = 1u;
@@ -1999,6 +2003,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             zero_buf(S[g].ar_bar_va, 256u);
             zero_buf(S[g].moe_bar_va, 256u);
             zero_buf(S[g].gdn_bar_va, 8192u);
+            if (S[g].spec_nq_bar_va) zero_buf(S[g].spec_nq_bar_va, 256u);
             zero_buf(S[g].super_bar_va, 2048u);
             if (S[g].pf_gdn_bar_va)  zero_buf(S[g].pf_gdn_bar_va, 256u);
             if (S[g].pf_gu_queue_va) zero_buf(S[g].pf_gu_queue_va, 256u);
@@ -2291,8 +2296,9 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         const bool ab_f2_front = (std::getenv("VEGAJET_AB_F2_FRONT") != nullptr && std::getenv("VEGAJET_AB_F2_FRONT")[0] == '1');
         const bool ab_b2_back  = (std::getenv("VEGAJET_AB_B2_BACK") != nullptr && std::getenv("VEGAJET_AB_B2_BACK")[0] == '1');
         const bool ab_enable_super = !(std::getenv("VEGAJET_ENABLE_SUPER") != nullptr && std::getenv("VEGAJET_ENABLE_SUPER")[0] == '0');
-        // v1.2 S4 lever, default off (unset or any value other than "1" keeps the m8/m12/m16 path).
+        // v1.2 levers, both default off (unset or any value other than "1" keeps the old path).
         const bool v12_narrow_verify = (std::getenv("VEGAJET_V12_NARROW_VERIFY") != nullptr && std::getenv("VEGAJET_V12_NARROW_VERIFY")[0] == '1');
+        const bool v12_fused_nq      = (std::getenv("VEGAJET_V12_VERIFY_FUSED_NQ") != nullptr && std::getenv("VEGAJET_V12_VERIFY_FUSED_NQ")[0] == '1');
 
         auto enq_gemm_q4 = [&](size_t g, const Q4A8WeightDev& w, uint64_t xq, uint64_t xds, uint64_t y, bool barrier = true, uint64_t peer_tx = 0ULL) {
             if (M == 1u) {
@@ -2626,11 +2632,29 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                             S[g].spec_gdn_o_va, S[g].spec_gdn_rec_kv_va, S[g].spec_gdn_rec_dec_va, S[g].spec_gdn_rec_beta_va,
                             M, 8u, 32u, 6144u, 40u * 128u, gi, 0u, 0u, 0u, 16u * 40u * 128u, 16u * 32u
                         };
+                        if (v12_fused_nq && K[g].spec_gdn_ver_nq != nullptr && S[g].spec_nq_bar_va != 0) {
+                            // v1.2 S5: verify + norm/quant in one launch (grid barrier inside).
+                            struct SpecGdnNqKA {
+                                uint64_t sin, sout, qsrc, ksrc, vsrc, dec, beta, oout, rkv, rdec, rbeta;
+                                uint64_t gab, nw, oq, od, bar;
+                                uint32_t M, nk, nv, s_strd, r_strd, lbase, s_lstrd, src_lstrd, gb_lstrd, r_lstrd, rgb_lstrd;
+                                uint32_t strd_in, zoff, sense; float eps;
+                            };
+                            if (g == 0) ++spec_nq_sense;
+                            const SpecGdnNqKA fnka{
+                                sgka.sin, sgka.sout, sgka.qsrc, sgka.ksrc, sgka.vsrc, sgka.dec, sgka.beta, sgka.oout,
+                                sgka.rkv, sgka.rdec, sgka.rbeta,
+                                S[g].gdn_qkv_gab_va, lw.ssm_norm_va, S[g].mid_q8_va, S[g].mid_ds_va, S[g].spec_nq_bar_va,
+                                M, 8u, 32u, 6144u, 40u * 128u, gi, 0u, 0u, 0u, 16u * 40u * 128u, 16u * 32u,
+                                10304u, 6144u, spec_nq_sense, eps};
+                            VJ_CHECK(rt.enqueue_kernel(g, *K[g].spec_gdn_ver_nq, 128u * 256u, 1, 1, 256, 1, 1, &fnka, sizeof(fnka), true));
+                        } else {
                         VJ_CHECK(rt.enqueue_kernel(g, *K[g].spec_gdn_ver, 128u * 256u, 1, 1, 256, 1, 1, &sgka, sizeof(sgka), true));
                         struct SpecGdnNormKA { uint64_t ob, gab, nw, oq, od; uint32_t M, nv, strd, zoff; float eps; };
                         const SpecGdnNormKA snka{S[g].spec_gdn_o_va, S[g].gdn_qkv_gab_va, lw.ssm_norm_va,
                                                  S[g].mid_q8_va, S[g].mid_ds_va, M, 32u, 10304u, 6144u, eps};
                         VJ_CHECK(rt.enqueue_kernel(g, *K[g].spec_gdn_nq, ((M * 32u + 3u) / 4u) * 256u, 1, 1, 256, 1, 1, &snka, sizeof(snka), true));
+                        }
                     } else if (std::getenv("VEGAJET_PREFILL_CODEX_GDN") != nullptr &&
                                std::strcmp(std::getenv("VEGAJET_PREFILL_CODEX_GDN"), "1") == 0 &&
                                K[g].pf_gdn_wy_codex && K[g].pf_gdn_nq_codex && use_wy && M >= 16u && !use_ring) {
