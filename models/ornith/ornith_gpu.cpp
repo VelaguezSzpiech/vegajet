@@ -2288,6 +2288,14 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         if (!guard::token_id_in_range(id, static_cast<uint32_t>(hp.vocab)))
             fail_run(std::string(where) + ": token id " + std::to_string(id) + " is outside the vocabulary");
     };
+    auto require_kv_span = [&](uint32_t pos, uint32_t rows) {
+        if (!dispatch::kv_span_fits(pos, rows, opt.max_ctx))
+            fail_run("KV position or batch exceeds configured context capacity");
+    };
+    auto require_split_scratch = [&](uint32_t rows, uint32_t heads, uint32_t chunks) {
+        if (!dispatch::split_scratch_fits(rows, heads, chunks, kMaxSpecBatch * 60u, 16u))
+            fail_run("split attention scratch capacity exceeded");
+    };
     auto device_fault_check = [&](const char* where) -> bool {
         for (size_t g = 0; g < 2; ++g) {
             const uint32_t* slot = io_fault_host + g * guard::kFaultWords;
@@ -2316,6 +2324,8 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         // Unwind the driver before callbacks, recurrent commits or drafter catch-up.
         run_state.check();
         if (device_faulted) fail_run(res.error);
+        require_kv_span(pos0, M);
+        if (M > max_batch || M > 1024u) fail_run("token batch exceeds staging capacity");
         // v1.2 C3: never turn an out-of-range token id into an embedding address offset.
         const uint32_t n_vocab = static_cast<uint32_t>(hp.vocab);
         for (const int32_t t : toks) {
@@ -2852,7 +2862,8 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                     } else if (opt.spec_flash && K[g].spec_flash_part && (use_ring ? M <= 16u : M < 16u)) {
                         const uint32_t span = pos0 + M;
                         const uint32_t chunk_len = (span <= 1920u) ? 32u : ((span <= 3840u) ? 64u : ((span <= 7680u) ? 128u : 256u));
-                        const uint32_t n_chunks  = std::max<uint32_t>(1u, (span + chunk_len - 1u) / chunk_len);
+                        const uint32_t n_chunks = 1u + (span - 1u) / chunk_len;
+                        require_split_scratch(M, n_q_local, n_chunks);
                         struct SfPartKA { uint64_t qo, kc, vc, po, pml; uint32_t M, pos0, nq, nkv, nc, cl; };
                         struct SfMrgKA  { uint64_t po, pml, go, oq, od; uint32_t M, nq, nc; };
                         const SfPartKA pka2{S[g].q_buf_va, S[g].attn_k_cache_va[ai], S[g].attn_v_cache_va[ai],
@@ -3739,6 +3750,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
     auto step_mtp = [&](int32_t tok_id, uint32_t pos, uint64_t h_in0, uint64_t h_in1,
                         bool compute_logits, bool do_submit, uint32_t tok_slot) -> int32_t {
         require_token(tok_id, "MTP embedding");
+        require_kv_span(pos, 1u);
         if (tok_slot >= 1024u) fail_run("MTP token staging capacity exceeded");
         io_toks_host[tok_slot] = tok_id;
         __atomic_thread_fence(__ATOMIC_RELEASE);
@@ -3802,7 +3814,8 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             if (opt.spec_flash && K[g].spec_flash_part) {
                 const uint32_t span = pos + 1u;
                 const uint32_t chunk_len = (span <= 1920u) ? 32u : ((span <= 3840u) ? 64u : ((span <= 7680u) ? 128u : 256u));
-                const uint32_t n_chunks  = std::max<uint32_t>(1u, (span + chunk_len - 1u) / chunk_len);
+                const uint32_t n_chunks = 1u + (span - 1u) / chunk_len;
+                require_split_scratch(1u, 16u, n_chunks);
                 struct SfPartKA { uint64_t qo, kc, vc, po, pml; uint32_t M, pos0, nq, nkv, nc, cl; };
                 struct SfMrgKA  { uint64_t po, pml, go, oq, od; uint32_t M, nq, nc; };
                 const SfPartKA pka2{S[g].q_buf_va, S[g].mtp_k_cache_va, S[g].mtp_v_cache_va,
@@ -3921,6 +3934,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         for (int32_t id : toks) require_token(id, "MTP batch embedding");
         const uint32_t n = static_cast<uint32_t>(toks.size());
         if (n == 0u) return true;
+        require_kv_span(pos0, n);
         if (n == 1u || !v12_batch_ok) {
             for (uint32_t j = 0; j < n; ++j)
                 (void) step_mtp(toks[j], pos0 + j, hs0[j], hs1[j], false, false, j);
@@ -3995,7 +4009,8 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             if (opt.spec_flash && K[g].spec_flash_part) {
                 const uint32_t span = pos0 + M;
                 const uint32_t chunk_len = (span <= 1920u) ? 32u : ((span <= 3840u) ? 64u : ((span <= 7680u) ? 128u : 256u));
-                const uint32_t n_chunks  = std::max<uint32_t>(1u, (span + chunk_len - 1u) / chunk_len);
+                const uint32_t n_chunks = 1u + (span - 1u) / chunk_len;
+                require_split_scratch(M, 16u, n_chunks);
                 struct SfPartKA { uint64_t qo, kc, vc, po, pml; uint32_t M, pos0, nq, nkv, nc, cl; };
                 struct SfMrgKA  { uint64_t po, pml, go, oq, od; uint32_t M, nq, nc; };
                 const SfPartKA pka2{S[g].q_buf_va, S[g].mtp_k_cache_va, S[g].mtp_v_cache_va,
