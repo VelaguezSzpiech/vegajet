@@ -38,7 +38,14 @@ inline GenerateResult run_engine(IEngine& engine, const std::vector<int32_t>& pr
         res.prefill_ms = ev.prefill_ms;
         res.decode_ms = ev.decode_ms;
         const bool eos_token = ev.token_id >= 0 && ev.token_id == eos_id;
-        if (!ev.text.empty() && !eos_token && !sink(ev.text)) return false;
+        if (!ev.text.empty() && !eos_token) {
+            const SinkResult sr = sink(ev.text);
+            if (!sr) {
+                // S-M2: the metrics layer records Cancelled as status 499 + cancelled_total.
+                if (sr.client_gone) res.finish = FinishReason::Cancelled;
+                return false;
+            }
+        }
         if (ev.is_eos) {
             res.finish = (!eos_token && static_cast<int32_t>(ev.completion_tokens) >= r.max_tokens) ? FinishReason::Length
                                                                                                    : FinishReason::Stop;

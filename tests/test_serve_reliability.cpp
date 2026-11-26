@@ -9,15 +9,18 @@
 //         SSE chunk.
 //   S-M4  max_tokens is capped (--max-tokens-cap) and an over-long prompt answers 400/413 with a clear message.
 //   S-M5  an optional bearer / x-api-key is checked in constant time; CORS is only sent when an origin is configured.
+#include "core/engine_interface.hpp"
 #include "core/json_lite.hpp"
 #include "core/metrics.hpp"
 #include "core/server.hpp"
+#include "core/server_engine_adapter.hpp"
 
 #include "tests/test_common.hpp"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -156,6 +159,26 @@ Resp one(int port, const std::string& raw) {
 
 Resp chat(int port, const std::string& body, const std::string& extra = {}) {
     return one(port, chat_head(static_cast<int>(body.size()), false, extra) + body);
+}
+
+bool wait_until(const std::function<bool()>& pred, int ms = 5000) {
+    const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+    while (std::chrono::steady_clock::now() < end) {
+        if (pred()) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return pred();
+}
+
+std::string read_text_file(const std::string& path) {
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    VJ_CHECK(f != nullptr);
+    std::string out;
+    char buf[4096];
+    size_t n;
+    while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) out.append(buf, n);
+    std::fclose(f);
+    return out;
 }
 
 // Sends on an already open connection (keep-alive), reusing its read buffer.
@@ -360,6 +383,71 @@ void test_m1_half_close() {
     VJ_CHECK(srv.stats().cancelled == 0);  // a half-close is not a cancellation
 }
 
+// ------------------------------------------------------------------------------------------------ S-M2
+// A client abort was logged as status 200 / cancelled:false and never reached vegajet_requests_cancelled_total.
+// SlowEngine emits one piece per 20 ms through the real adapter (core/server_engine_adapter), which is where a
+// client-gone sink result becomes FinishReason::Cancelled.
+struct SlowEngine : IEngine {
+    MockEngine inner;
+    ModelInfo model_info() const override { return inner.model_info(); }
+    const BpeTokenizer& tokenizer() const override { return inner.tokenizer(); }
+    std::string format_chat(const std::vector<ChatMessage>& m) const override { return inner.format_chat(m); }
+    void generate(const std::vector<int32_t>&, const GenerationParams& gp, const TokenCallback& on) override {
+        for (int i = 0; i < 8; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            TokenEvent ev;
+            ev.token_id = 3;
+            ev.text = "tok";
+            ev.completion_tokens = static_cast<uint32_t>(i + 1);
+            if (!on(ev)) return;
+        }
+        TokenEvent eos;
+        eos.is_eos = true;
+        eos.completion_tokens = 8;
+        if (gp.max_tokens > 8) on(eos);
+    }
+};
+
+void test_m2_cancelled_accounting() {
+    char dir[] = "/tmp/vj_rel_XXXXXX";
+    VJ_CHECK(::mkdtemp(dir) != nullptr);
+    const std::string path = std::string(dir) + "/requests.jsonl";
+
+    metrics::Registry reg;
+    metrics::JsonlLogger log;
+    std::string err;
+    VJ_CHECK(log.open(path, &err));
+
+    SlowEngine engine;
+    ServerOptions opt;
+    opt.port = 0;
+    opt.model_id = "m";
+    OpenAiServer srv(opt, metrics::instrument(make_engine_generate_fn(engine), reg, &log));
+    VJ_CHECK(srv.start(&err));
+
+    const std::string body = chat_body("m", "hi", ",\"stream\":true,\"max_tokens\":8");
+    const int fd = connect_local(srv.port());
+    VJ_CHECK(fd >= 0);
+    send_str(fd, chat_head(static_cast<int>(body.size()), true) + body);
+    // Read the SSE head, then walk away mid-stream with a RST so the next write fails.
+    char tmp[256];
+    VJ_CHECK(::recv(fd, tmp, sizeof(tmp), 0) > 0);
+    linger lg{1, 0};
+    setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+    ::close(fd);
+
+    VJ_CHECK(wait_until([&] { return log.lines() == 1; }, 5000));
+    srv.stop();
+    VJ_CHECK(srv.stats().cancelled == 1);
+    VJ_CHECK(srv.stats().completions == 0);
+
+    const std::string rec = read_text_file(path);
+    VJ_CHECK(rec.find("\"cancelled\":true") != std::string::npos);
+    VJ_CHECK(rec.find("\"status\":499") != std::string::npos);
+    const std::string expo = reg.exposition(nullptr);
+    VJ_CHECK(expo.find("vegajet_requests_cancelled_total 1") != std::string::npos);
+}
+
 }  // namespace
 
 int main() {
@@ -367,8 +455,9 @@ int main() {
     test_b1_server_survives();
     test_b2_connection_limit();
     test_m1_half_close();
+    test_m2_cancelled_accounting();
     std::printf("test_serve_reliability: S-B1 bounded JSON parse, S-B2 connection limit 503 + health reserve,\n"
-                "                        S-M1 half-closed client gets the full response\n");
+                "                        S-M1 half-closed client gets the full response, S-M2 cancellation is logged as 499\n");
     std::printf("PASS\n");
     return 0;
 }
