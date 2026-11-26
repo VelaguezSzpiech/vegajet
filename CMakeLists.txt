@@ -481,6 +481,13 @@ endif()
 # Captured at configure time: re-run cmake after a commit to refresh it.
 target_compile_definitions(vegajet PRIVATE VEGAJET_GIT_COMMIT="${VJ_GIT_COMMIT}")
 vj_test(test_bench_json)
+# M6: `vegajet bench --dump-tokens` writer + the token_compare.py gate that run.sh uses.
+vj_test(test_token_dump)
+if(Python3_FOUND)
+    add_test(NAME test_token_compare
+             COMMAND ${Python3_EXECUTABLE} -B -m unittest discover -s tests -p "test_token_compare*.py"
+             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+endif()
 if(Python3_FOUND)
     add_test(NAME test_bench_json_roundtrip
              COMMAND ${Python3_EXECUTABLE} -m unittest discover -s tests -p "test_bench_json_roundtrip*.py"

@@ -44,7 +44,7 @@ void usage(const char* cmd) {
                 "                    [--fr-spec 0|32768|65536] [--mtp-k 1..6] [--gu-grp-verify] [--spec-force-reject]\n"
                 "                    [--draft-model F] [--mask-embedding F] [--dflash-k 1..15] [--dflash-p-min P]\n"
                 "  Diagnostics:      [--profile-stages] [--pp-stages] [--ar-timeline] [--dot8-ab] [--ab-no-prepush]\n"
-                "                    [--dump-hidden FILE] [--dump-logits FILE] [--gdn-state-dump FILE] [--prefill-seq]\n"
+                "                    [--dump-hidden FILE] [--dump-logits FILE] [--dump-tokens FILE] [--gdn-state-dump FILE] [--prefill-seq]\n"
                 "                    [--interactive] [--interactive-fifo PATH] [--sweep \"VAR_A ; VAR_B\"]\n"
                 "                    [--dump-golden-layers DIR]\n"
                 "                    | --bench-ar [--hsaco-dir DIR] | --bench-gemv [--hsaco-dir DIR]\n"
@@ -59,7 +59,7 @@ void usage(const char* cmd) {
 } // namespace
 
 int run_bench(const std::string& cmd, const std::vector<std::string>& args) {
-    std::string model_path, draft, mask_embd, prompt, hsaco_dir, dump_hidden, dump_logits, json_out;
+    std::string model_path, draft, mask_embd, prompt, hsaco_dir, dump_hidden, dump_logits, json_out, dump_tokens;
     std::string interactive_fifo, sweep_spec, dump_golden_layers_dir;
     bool interactive = false;
     std::vector<std::string> hsaco;
@@ -133,6 +133,7 @@ int run_bench(const std::string& cmd, const std::vector<std::string>& args) {
         else if (a == "--suffix-max-draft") { const int v = std::atoi(next().c_str()); if (v < 1 || v > 15) { std::fprintf(stderr, "--suffix-max-draft takes 1..15\n"); return 2; } sfx_max = static_cast<uint32_t>(v); }
         else if (a == "--dump-hidden") dump_hidden = next();
         else if (a == "--dump-logits") dump_logits = next();
+        else if (a == "--dump-tokens") { dump_tokens = next(); if (dump_tokens.empty() || dump_tokens[0] == '-') { std::fprintf(stderr, "--dump-tokens needs a file\n"); return 2; } }
         else if (a == "--interactive") interactive = true;
         else if (a == "--interactive-fifo") { interactive = true; interactive_fifo = next(); }
         else if (a == "--sweep") sweep_spec = next();
@@ -156,6 +157,11 @@ int run_bench(const std::string& cmd, const std::vector<std::string>& args) {
     if (!json_out.empty() && (interactive || !sweep_spec.empty())) {
         std::fprintf(stderr, "--json-out records one configuration: not with --interactive / --interactive-fifo / --sweep "
                              "(run one bench --json-out per variant)\n");
+        return 2;
+    }
+    if (!dump_tokens.empty() && (interactive || !sweep_spec.empty())) {
+        std::fprintf(stderr, "--dump-tokens records one token sequence: not with --interactive / --interactive-fifo / --sweep "
+                             "(run one bench --dump-tokens per variant)\n");
         return 2;
     }
     if (bench_ar) {
@@ -316,6 +322,7 @@ int run_bench(const std::string& cmd, const std::vector<std::string>& args) {
         gopt.dot8_scope = dot8_scope;
         gopt.dot8_clip_alpha = dot8_clip;
         gopt.dump_logits_path = dump_logits;
+        gopt.dump_tokens_path = dump_tokens;
         gopt.down_grp_prefill = dgp;
         gopt.down_grp_verify = dgv;
         gopt.suffix_max_draft = sfx_max;

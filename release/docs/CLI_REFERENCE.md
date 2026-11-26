@@ -148,6 +148,7 @@ validation failure, 2 usage error.
 | `--ab-no-prepush` | A/B: disable the epilogue BAR0 prepush. |
 | `--dump-hidden FILE` | Dump hidden states. |
 | `--dump-logits FILE` | Dump logits. |
+| `--dump-tokens FILE` | Write the generated greedy token ids (one per line after a `#` header) for `tools/token_compare.py`; a write failure fails the run. Not with `--interactive`, `--interactive-fifo` or `--sweep` (exit 2). |
 | `--gdn-state-dump FILE` | Dump GatedDeltaNet state. |
 | `--prefill-seq` | Sequential (non-chunked) prefill reference. |
 | `--interactive` | Keep the model resident and read commands (run, parity, reload of a code object) from stdin (GPU builds). |

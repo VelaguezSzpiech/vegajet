@@ -6,6 +6,11 @@
 #   [RUNS=5] [N=128] [ONLY="VOCAB_ILP DENSE_PERSIST"] bench/v12/run.sh
 # Pin the same two MI50s for every run by PCI address (see `vegajet serve --gpu list`):
 #   GPUS=dddd:bb:dd.f,dddd:bb:dd.f MODEL=... bench/v12/run.sh
+# Token parity (REVIEW M6): every timed run writes `--dump-tokens "$OUT/<name>.<i>.tokens"`. Set
+#   REF_TOKENS=<dir>  to compare each run's ids against a reference dump from an all-off/main run
+#                     (uses "$REF_TOKENS/<name>.tokens", else "$REF_TOKENS/baseline_raw.tokens").
+#                     A mismatch (or a missing dump) is a runner failure, never a speed result.
+#   DUMP_TOKENS=0     turns the per-run token dump off (for a binary that predates --dump-tokens).
 set -euo pipefail
 
 BIN=${BIN:-./build-gpu/vegajet}
@@ -14,6 +19,21 @@ RUNS=${RUNS:-5}
 N=${N:-128}
 OUT=${OUT:-bench/v12/out/$(date +%Y%m%d-%H%M%S)-$(git rev-parse --short HEAD)}
 mkdir -p "$OUT"
+
+# Optional reference token dumps and the comparison gate (tools/token_compare.py, stdlib only).
+REF_TOKENS=${REF_TOKENS:-}
+DUMP_TOKENS=${DUMP_TOKENS:-1}
+PYTHON=${PYTHON:-python3}
+TOKEN_COMPARE=${TOKEN_COMPARE:-tools/token_compare.py}
+if [[ -n $REF_TOKENS && ! -d $REF_TOKENS ]]; then
+  echo "REF_TOKENS=$REF_TOKENS is not a directory of token dumps" >&2
+  exit 2
+fi
+if [[ -n $REF_TOKENS ]]; then
+  command -v "$PYTHON" >/dev/null 2>&1 || { echo "REF_TOKENS set but $PYTHON is not on PATH" >&2; exit 2; }
+  [[ -f $TOKEN_COMPARE ]] || { echo "REF_TOKENS set but $TOKEN_COMPARE is missing" >&2; exit 2; }
+fi
+ref_warned=0
 
 # Add a fixed prompt with EXTRA="--prompt '...'" to test normal text as well as the default prompt.
 EXTRA=${EXTRA:-}
@@ -25,6 +45,34 @@ else
 fi
 
 failed=0
+# Compare one run's token dump to the reference sequence (REVIEW M6). A mismatch, an unusable dump or a missing
+# dump is a runner failure: throughput from a diverged run must never be reported as a result.
+compare_tokens() { # name, run index, dump path
+  local name=$1 idx=$2 dump=$3 ref out rc
+  ref="$REF_TOKENS/$name.tokens"
+  [[ -f $ref ]] || ref="$REF_TOKENS/baseline_raw.tokens"
+  if [[ ! -f $ref ]]; then
+    if (( ref_warned == 0 )); then
+      echo "WARNING: no $REF_TOKENS/$name.tokens and no $REF_TOKENS/baseline_raw.tokens; token compare skipped" \
+        | tee -a "$OUT/summary.txt"
+      ref_warned=1
+    fi
+    return 0
+  fi
+  if [[ ! -f $dump ]]; then
+    echo "   run $idx: NO TOKEN DUMP ($dump missing, DUMP_TOKENS=$DUMP_TOKENS) -> FAIL" | tee -a "$OUT/summary.txt"
+    failed=1
+    return 0
+  fi
+  if out=$("$PYTHON" "$TOKEN_COMPARE" "$ref" "$dump" 2>&1); then
+    echo "   run $idx: $out" | tee -a "$OUT/summary.txt"
+  else
+    rc=$?
+    echo "   run $idx: TOKEN MISMATCH vs $ref (token_compare exit $rc): $out" | tee -a "$OUT/summary.txt"
+    failed=1
+  fi
+}
+
 run() { # name, env, args...
   local name=$1 envs=$2 key entry status; shift 2
   local -a clean_env=(env)
@@ -43,7 +91,12 @@ run() { # name, env, args...
     return
   fi
   for i in $(seq 1 "$RUNS"); do
-    if "${clean_env[@]}" $envs "$BIN" bench "$MODEL" "$@" $EXTRA --json-out "$OUT/${name}.$i.json" > "$OUT/${name}.$i.log" 2>&1; then :; else
+    local -a dump_args=()
+    [[ $DUMP_TOKENS == 0 ]] || dump_args=(--dump-tokens "$OUT/${name}.$i.tokens")
+    if "${clean_env[@]}" $envs "$BIN" bench "$MODEL" "$@" $EXTRA ${dump_args[@]+"${dump_args[@]}"} \
+        --json-out "$OUT/${name}.$i.json" > "$OUT/${name}.$i.log" 2>&1; then
+      [[ -z $REF_TOKENS ]] || compare_tokens "$name" "$i" "$OUT/${name}.$i.tokens"
+    else
       status=$?
       echo "   run $i: FAILED (exit $status) -> see $OUT/${name}.$i.log" | tee -a "$OUT/summary.txt"
       failed=1
@@ -83,5 +136,10 @@ done
 
 echo "Logs in $OUT. Compare tok/s medians and the [PARITY]/[BENCH-VALIDATE] lines per lever."
 echo "Any lever with a token mismatch vs baseline_raw is a FAIL, whatever its speed."
-echo "This runner is NOT evidence of main/all-off token parity; full token-ID comparison still needs a GPU harness."
+if [[ -z $REF_TOKENS ]]; then
+  echo "Token dumps are in $OUT/*.tokens; re-run with REF_TOKENS=<dir of reference dumps> to gate id parity per run"
+  echo "(tools/token_compare.py REF CAND; a mismatch is counted as a runner failure)."
+else
+  echo "Token ids compared against $REF_TOKENS for every run; mismatches are counted as failures."
+fi
 exit "$failed"

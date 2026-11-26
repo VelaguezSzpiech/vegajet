@@ -9,6 +9,7 @@
 #include "core/prefill_planner.hpp"
 #include "core/sharder.hpp"
 #include "core/tcc_stagger.hpp"
+#include "core/token_dump.hpp"
 #include "core/q4_dot8_repack.hpp"
 #include "core/spec_policy.hpp"
 #include "core/spec_cascade.hpp"
@@ -3645,6 +3646,21 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         return gen;
     };
 
+    // M6: `--dump-tokens` writes the generated ids of one greedy sequence so tools/token_compare.py can prove token
+    // parity across binaries/toggles. A write failure fails the run (res.error) instead of leaving a stale dump.
+    auto dump_tokens = [&](const std::vector<int32_t>& ids) -> bool {
+        if (opt.dump_tokens_path.empty()) return true;
+        std::string derr;
+        if (!bench_io::write_token_ids(opt.dump_tokens_path, ids, &derr)) {
+            res.ok = false;
+            res.error = derr;
+            std::fprintf(stderr, "[DUMP-TOKENS] %s\n", derr.c_str());
+            return false;
+        }
+        std::printf("[DUMP-TOKENS] %zu generated token ids -> %s\n", ids.size(), opt.dump_tokens_path.c_str());
+        return true;
+    };
+
     auto commit_spec_gdn = [&](uint32_t acc, uint32_t dk) {
         if (!opt.spec_gdn) return;
         if (acc == dk) {
@@ -4652,6 +4668,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             if (run_raw_part && !run_spec_part && !run_prefill_part) {
                 static std::vector<int32_t> trusted_raw128;
                 auto raw128 = run_greedy_raw(p_rep_code, 129, &res.tg128_raw_tps);
+                if (!dump_tokens(raw128)) return false;
                 res.dispatches_per_tok = last_dispatches;
                 if (trusted_raw128.empty()) trusted_raw128 = raw128;
                 uint32_t eq128 = 0; int fd128 = -1;
@@ -5151,6 +5168,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             return false;
         }
         auto raw128 = run_greedy_raw(p_rep_code, 129, &res.tg128_raw_tps);
+        if (!dump_tokens(raw128)) return false;
         res.dispatches_per_tok = last_dispatches;
         // Exact actual fetched HBM2 bytes/tok across ALL GPUs (excluding odd-256B TCC padding bytes never read,
         // and using exact per-format routed Gate+Up and routed Down byte counts).
@@ -6048,6 +6066,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             double tps = 0;
             auto gen = opt.use_suffix_spec ? run_greedy_suffix(ids, opt.decode_tokens, &tps)
                                            : run_greedy_raw(ids, opt.decode_tokens, &tps);
+            (void)dump_tokens(gen);
             res.tg128_raw_tps = tps;
             res.parity_simple_text = tok.decode(gen);
             std::printf("[GEN %.2f tok/s]: %s\n", tps, res.parity_simple_text.c_str());

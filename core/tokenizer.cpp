@@ -266,7 +266,8 @@ bool BpeTokenizer::load_from_gguf(const std::string& gguf_path, std::string* err
     GgufReader rd{
         reinterpret_cast<const uint8_t*>(base),
         reinterpret_cast<const uint8_t*>(base) + static_cast<size_t>(st.st_size),
-        true
+        true,
+        {}
     };
 
     char magic[4] = {};

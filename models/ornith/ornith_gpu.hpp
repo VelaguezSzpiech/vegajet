@@ -60,6 +60,7 @@ struct OrnithGpuOptions {
     uint32_t    dot8_scope      = 0;       // 0=all (dense+MoE GU), 1=dense-only, 2=MoE-GU-only
     float       dot8_clip_alpha = 1.0f;    // symmetric INT4 activation clip ratio (0.5..1.0)
     std::string dump_logits_path;          // bench: dump full-vocab FP32 logits on held-out prompts (for KLD gate) and exit
+    std::string dump_tokens_path;          // bench: write generated token ids (tools/token_compare.py diffs two dumps)
     std::string gdn_state_dump;            // bench: two-chunk prompt + continuation; dump the carried GDN state at both chunk boundaries
     bool        prefill_seq     = false;   // with gdn_state_dump: feed the prompt one token at a time (sequential reference)
     bool        pp_stages       = false;   // bench: per-stage, per-rank wall time of one uncached pp2048 request
