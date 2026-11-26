@@ -12,6 +12,16 @@ int main() {
     VJ_CHECK(vegajet::dispatch::mtp_batch_layout_supported(false, true));
     VJ_CHECK(vegajet::dispatch::mtp_batch_layout_supported(true, false));
     VJ_CHECK(!vegajet::dispatch::mtp_batch_layout_supported(true, true));
+    using vegajet::dispatch::fused_verify_resident;
+    VJ_CHECK(fused_verify_resident(true, 60u, 64u, 64u, 20000u, 4u));
+    VJ_CHECK(!fused_verify_resident(true, 60u, 128u, 64u, 20000u, 4u));
+    VJ_CHECK(!fused_verify_resident(true, 60u, 64u, 64u, 32768u, 4u));
+    VJ_CHECK(!fused_verify_resident(true, 60u, 64u, 64u, 20000u, 2u));
+    VJ_CHECK(!fused_verify_resident(false, 60u, 64u, 64u, 20000u, 4u));
+    VJ_CHECK(!fused_verify_resident(true, 0u, 64u, 64u, 20000u, 4u));
+    VJ_CHECK(!fused_verify_resident(true, 60u, 0u, 64u, 20000u, 4u));
+    VJ_CHECK(!fused_verify_resident(true, 60u, 64u, 0u, 20000u, 4u));
+    VJ_CHECK(!fused_verify_resident(true, 60u, 64u, 64u, 20000u, 0u));
     // Two logical collectives per batch: both ranks must share epoch and slot.
     for (uint32_t start : {1u, 2u, std::numeric_limits<uint32_t>::max()}) {
         uint32_t next = start;

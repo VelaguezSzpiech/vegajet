@@ -147,6 +147,7 @@ if(NOT VEGAJET_CPU_ONLY)
     set(VEGAJET_HSACO_COMMON_DEPS
         "${CMAKE_CURRENT_SOURCE_DIR}/core/ggml_iq_tables.hpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/ops/kernels/vj_moe_dot8.hiph"
+        "${CMAKE_CURRENT_SOURCE_DIR}/ops/kernels/vj_device_fault.hiph"
         "${CMAKE_CURRENT_SOURCE_DIR}/ops/kernels/vj_moe_down_grouped.hiph"
         "${CMAKE_CURRENT_SOURCE_DIR}/ops/kernels/vj_ornith_super_desc.hpp"
     )
