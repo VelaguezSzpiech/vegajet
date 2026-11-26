@@ -888,15 +888,16 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
     }
 
     kfd::Runtime rt;
-    if (!rt.init(30.5, 64, &res.error) && !rt.init(30.0, 64, &res.error)) return res;
-    if (rt.num_gpus() < 2) { res.error = "Ornith-122B GPU runner requires 2x MI50 GPUs"; return res; }
+    if (!rt.init(30.5, 64, &res.error, 2) && !rt.init(30.0, 64, &res.error, 2)) return res;
+    if (rt.num_gpus() != 2) { res.error = "Ornith-122B GPU runner requires exactly 2 selected MI50 GPUs"; return res; }
     // Resolve per-GPU calibrated HBM2 ceiling from hw_profile.json (matched by PCI BDF when available).
     double gpu_bw_ceiling_gbs[kfd::kMaxGpus] = {};
     double calibrated_hbm2_ceiling_gbs = 0.0;
     for (size_t g = 0; g < rt.num_gpus() && g < kfd::kMaxGpus; ++g) {
         const uint32_t loc = rt.devices()[g].location_id;
         char bdf_buf[32];
-        std::snprintf(bdf_buf, sizeof(bdf_buf), "0000:%02x:%02x.%u", (loc >> 8) & 0xFFu, (loc >> 3) & 0x1Fu, loc & 7u);
+        std::snprintf(bdf_buf, sizeof(bdf_buf), "%04x:%02x:%02x.%u", rt.devices()[g].pci_domain,
+                      (loc >> 8) & 0xFFu, (loc >> 3) & 0x1Fu, loc & 7u);
         double bw = (g < lopt.gpus.size()) ? lopt.gpus[g].bw_hbm_gbs : 800.0;
         if (have_hw_prof) {
             for (const auto& hg : hw_prof.gpus) {

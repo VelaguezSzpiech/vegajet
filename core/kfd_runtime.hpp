@@ -112,6 +112,7 @@ struct DeviceInfo {
     uint32_t n_cu = 0;
     uint32_t simd_count = 0;
     uint32_t location_id = 0;
+    uint32_t pci_domain = 0;
     uint32_t p2p_links_count = 0;
     uint32_t cwsr_size = 0;
     uint32_t ctl_stack_size = 0;
@@ -276,7 +277,7 @@ public:
 
     // Opens /dev/kfd with default arena sizing (30.5 GiB ceiling, 64 MiB pinned staging).
     bool open(std::string* err);
-    bool init(double vram_arena_gib, size_t host_pinned_mb, std::string* err = nullptr);
+    bool init(double vram_arena_gib, size_t host_pinned_mb, std::string* err = nullptr, size_t expected_devices = 0);
     void shutdown();
     // Irreversible fail-closed stop; keep allocations valid for caller cleanup.
     void abort_dispatches();

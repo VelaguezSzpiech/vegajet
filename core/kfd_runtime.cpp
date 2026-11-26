@@ -137,7 +137,7 @@ std::vector<DeviceInfo> Runtime::scan_gfx906_topology() {
     std::vector<DeviceInfo> out;
     namespace fs = std::filesystem;
     std::error_code ec;
-    const fs::path base("/sys/class/kfd/kfd/topology/nodes");
+    const fs::path base = fs::path(gpusel::sysfs_root()) / "sys/class/kfd/kfd/topology/nodes";
     if (!fs::exists(base, ec)) return out;
 
     std::vector<uint32_t> node_ids;
@@ -162,6 +162,7 @@ std::vector<DeviceInfo> Runtime::scan_gfx906_topology() {
             else if (key == "simd_count") info.simd_count = static_cast<uint32_t>(val);
             else if (key == "drm_render_minor") info.drm_render_minor = static_cast<uint32_t>(val);
             else if (key == "location_id") info.location_id = static_cast<uint32_t>(val);
+            else if (key == "domain") info.pci_domain = static_cast<uint32_t>(val);
             else if (key == "p2p_links_count") info.p2p_links_count = static_cast<uint32_t>(val);
             else if (key == "cwsr_size") info.cwsr_size = static_cast<uint32_t>(val);
             else if (key == "ctl_stack_size") info.ctl_stack_size = static_cast<uint32_t>(val);
@@ -185,7 +186,7 @@ std::vector<DeviceInfo> Runtime::scan_gfx906_topology() {
     }
 
     std::sort(out.begin(), out.end(), [](const DeviceInfo& a, const DeviceInfo& b) {
-        return a.location_id < b.location_id;
+        return a.pci_domain != b.pci_domain ? a.pci_domain < b.pci_domain : a.location_id < b.location_id;
     });
     return out;
 }
@@ -220,7 +221,7 @@ bool Runtime::open(std::string* err) {
     if (err) *err = "VegaJet was built with VEGAJET_CPU_ONLY=ON; the KFD runtime is disabled";
     return false;
 }
-bool Runtime::init(double, size_t, std::string* err) { return open(err); }
+bool Runtime::init(double, size_t, std::string* err, size_t) { return open(err); }
 void Runtime::shutdown() { open_ = false; }
 void Runtime::abort_dispatches() {}
 bool Runtime::load_code_object(const std::string&, std::string* err) {
@@ -287,13 +288,32 @@ bool Runtime::open(std::string* err) {
     return init(30.5, 64, err);
 }
 
-bool Runtime::init(double vram_arena_gib, size_t host_pinned_mb, std::string* err) {
+bool Runtime::init(double vram_arena_gib, size_t host_pinned_mb, std::string* err, size_t expected_devices) {
     if (const char* dl = std::getenv("VEGAJET_DISPATCH_LOG"); dl && dl[0] && dlog_fd_ < 0)
         dlog_fd_ = ::open(dl, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
-    if (open_) return true;
+    if (open_) {
+        if (!expected_devices || devices_.size() == expected_devices) return true;
+        if (err) *err = "Runtime already open with a different selected device count";
+        return false;
+    }
 
     devices_ = scan_gfx906_topology();
-    if (!gpusel::filter_from_env(devices_, err)) return false;  // per-process selection (--gpu / VJ_GPU_DEVICES)
+    const size_t discovered = devices_.size();
+    gpusel::Selection selection;
+    if (!gpusel::resolve(nullptr, std::getenv(gpusel::kEnvVar), selection, err) ||
+        !gpusel::filter(devices_, selection, err)) return false;
+    if ((expected_devices && devices_.size() != expected_devices) || devices_.size() > kMaxGpus) {
+        if (err) *err = "Runner requires exactly " + std::to_string(expected_devices ? expected_devices : kMaxGpus) +
+                        " selected GPUs; found " + std::to_string(devices_.size()) +
+                        ". Pin the intended cards with --gpu dddd:bb:dd.f,dddd:bb:dd.f (or VJ_GPU_DEVICES).";
+        return false;
+    }
+    if (!selection.all && selection.bdfs.empty() && discovered > devices_.size())
+        std::fprintf(stderr, "[vegajet::kfd] WARNING: ordinal GPU selection uses %zu of %zu cards; insertion can change identities. Use full PCI BDFs.\n",
+                     devices_.size(), discovered);
+    for (size_t rank = 0; rank < devices_.size(); ++rank)
+        std::printf("[vegajet::kfd] selected GPU %zu: PCI %s (gpu_id=%u)\n", rank,
+                    gpusel::bdf(devices_[rank].pci_domain, devices_[rank].location_id).c_str(), devices_[rank].gpu_id);
     if (devices_.empty()) {
         if (err) *err = "No gfx906 (90006) GPUs found in /sys/class/kfd/kfd/topology/nodes";
         return false;

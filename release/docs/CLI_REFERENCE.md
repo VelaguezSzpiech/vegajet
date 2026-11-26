@@ -38,10 +38,23 @@ complete.
 
 ### GPU selection (`--gpu`, `VJ_GPU_DEVICES`)
 
-`SPEC` is `all` (the default), a list of indices and ranges such as `0`, `1`, `0,1`, `0-1`, or `list`. Indices are
-positions in the gfx906 enumeration: KFD topology nodes with `gfx_target_version 90006`, ordered by PCI location,
-the same order the runtime uses. Duplicates, reversed ranges, indices above 63 and anything else are usage errors
-(exit 2), as is an index beyond the GPUs present (the message names the source and the valid range).
+`SPEC` is `all` (the default), ordinals/ranges such as `0`, `1`, `0,1`, `0-1`, a comma-separated list of full PCI
+identities such as `dddd:bb:dd.f,dddd:bb:dd.f`, or `list`. Both `--gpu SPEC` and `--gpu=SPEC` work.
+Full BDFs include the PCI domain (`dddd:bb:dd.f`); their list order defines TP ranks and survives insertion of a
+third card before, between or after them. Ordinals are positions in the gfx906 KFD topology sorted by PCI domain
+then bus/device/function, **not stable card identities**. When ordinals select fewer cards than exist, the runtime
+prints a warning. Mixing ordinals with BDFs, duplicates, malformed BDFs, reversed ranges and indices above 63 are
+usage errors (exit 2); missing or ambiguous BDFs fail closed rather than falling back to an ordinal.
+
+The Ornith TP=2 runner requires **exactly two selected devices**, checked before opening devices or allocating
+arenas. On a three-MI50 machine, select the intended pair explicitly; `all` is rejected. Only selected cards have
+arenas, queues and mappings created. Startup logs show the full BDF for each selected rank. Pin two cards with:
+
+```sh
+vegajet bench <model-file> --gpu dddd:bb:dd.f,dddd:bb:dd.f
+# Equivalent environment form (also inherited by the runtime and children):
+VJ_GPU_DEVICES=dddd:bb:dd.f,dddd:bb:dd.f vegajet bench <model-file>
+```
 
 * Precedence: `--gpu` beats `VJ_GPU_DEVICES`, which beats `all`. The CLI exports the resolved selection as
   `VJ_GPU_DEVICES` (canonical form) so the KFD runtime and child processes see the same set.

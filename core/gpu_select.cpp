@@ -28,6 +28,26 @@ bool parse_index(const std::string& t, uint32_t& v) {
 
 }  // namespace
 
+std::string bdf(uint32_t domain, uint32_t location) {
+    char text[32];
+    std::snprintf(text, sizeof(text), "%04x:%02x:%02x.%u", domain,
+                  (location >> 8) & 255u, (location >> 3) & 31u, location & 7u);
+    return text;
+}
+
+bool parse_bdf(const std::string& text, std::string& out) {
+    if (text.size() != 12 || text[4] != ':' || text[7] != ':' || text[10] != '.') return false;
+    for (size_t i : {0u,1u,2u,3u,5u,6u,8u,9u,11u})
+        if (std::string("0123456789abcdefABCDEF").find(text[i]) == std::string::npos) return false;
+    const auto domain = std::stoul(text.substr(0,4), nullptr, 16);
+    const auto bus = std::stoul(text.substr(5,2), nullptr, 16);
+    const auto dev = std::stoul(text.substr(8,2), nullptr, 16);
+    const auto fn = std::stoul(text.substr(11,1), nullptr, 16);
+    if (dev > 31 || fn > 7) return false;
+    out = bdf(static_cast<uint32_t>(domain), static_cast<uint32_t>((bus << 8) | (dev << 3) | fn));
+    return true;
+}
+
 bool parse(const std::string& spec_in, Selection& out, std::string* err) {
     auto fail = [&](const std::string& m) { if (err) *err = m; return false; };
     Selection s;
@@ -39,6 +59,17 @@ bool parse(const std::string& spec_in, Selection& out, std::string* err) {
         const size_t comma = spec.find(',', pos);
         const std::string tok = trim(spec.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos));
         if (tok.empty()) return fail("empty entry in GPU list '" + spec + "'");
+        if (tok.find(':') != std::string::npos || tok.find('.') != std::string::npos) {
+            std::string identity;
+            if (!parse_bdf(tok, identity)) return fail("invalid full PCI BDF '" + tok + "' (expected dddd:bb:dd.f)");
+            if (!seen.empty()) return fail("cannot mix GPU ordinals and PCI BDFs");
+            if (std::find(s.bdfs.begin(), s.bdfs.end(), identity) != s.bdfs.end()) return fail("duplicate PCI BDF '" + identity + "'");
+            s.bdfs.push_back(identity);
+            if (comma == std::string::npos) break;
+            pos = comma + 1;
+            continue;
+        }
+        if (!s.bdfs.empty()) return fail("cannot mix GPU ordinals and PCI BDFs");
         const size_t dash = tok.find('-');
         uint32_t a = 0, b = 0;
         if (dash == std::string::npos) {
@@ -79,12 +110,17 @@ bool resolve(const std::string* flag, const char* env_value, Selection& out, std
 std::string canonical(const Selection& s) {
     if (s.all) return "all";
     std::string o;
+    if (!s.bdfs.empty()) {
+        for (const auto& id : s.bdfs) { if (!o.empty()) o += ","; o += id; }
+        return o;
+    }
     for (size_t i = 0; i < s.indices.size(); ++i) o += (i ? "," : "") + std::to_string(s.indices[i]);
     return o;
 }
 
 bool pick(const Selection& s, size_t n, std::vector<size_t>& out, std::string* err) {
     out.clear();
+    if (!s.bdfs.empty()) { if (err) *err = "PCI BDF selection requires device identities, not a count"; return false; }
     if (s.all) {
         for (size_t i = 0; i < n; ++i) out.push_back(i);
         return true;
@@ -98,6 +134,23 @@ bool pick(const Selection& s, size_t n, std::vector<size_t>& out, std::string* e
         }
         out.push_back(i);
     }
+    return true;
+}
+
+bool pick_bdfs(const Selection& s, const std::vector<std::string>& ids, std::vector<size_t>& out, std::string* err) {
+    out.clear();
+    std::vector<size_t> picked;
+    for (const auto& id : s.bdfs) {
+        size_t match = ids.size(), count = 0;
+        for (size_t i = 0; i < ids.size(); ++i) if (ids[i] == id) { match = i; ++count; }
+        if (count != 1) {
+            if (err) *err = "PCI BDF " + id + " selected (" + s.source + ") " +
+                            (count ? "is ambiguous in KFD topology" : "was not found in gfx906 topology");
+            return false;
+        }
+        picked.push_back(match);
+    }
+    out = std::move(picked);
     return true;
 }
 
@@ -128,6 +181,7 @@ std::vector<Device> scan_topology(const std::string& root) {
             else if (key == "simd_count") d.simd_count = static_cast<uint32_t>(val);
             else if (key == "drm_render_minor") d.drm_render_minor = static_cast<uint32_t>(val);
             else if (key == "location_id") d.location_id = static_cast<uint32_t>(val);
+            else if (key == "domain") d.pci_domain = static_cast<uint32_t>(val);
         }
         if (gfx != 90006u) continue;
         std::ifstream gf(nd / "gpu_id");
@@ -138,7 +192,7 @@ std::vector<Device> scan_topology(const std::string& root) {
             if (key == "size_in_bytes") { d.vram_bytes = val; break; }
         out.push_back(d);
     }
-    std::stable_sort(out.begin(), out.end(), [](const Device& a, const Device& b) { return a.location_id < b.location_id; });
+    std::stable_sort(out.begin(), out.end(), [](const Device& a, const Device& b) { return a.pci_domain != b.pci_domain ? a.pci_domain < b.pci_domain : a.location_id < b.location_id; });
     for (size_t i = 0; i < out.size(); ++i) out[i].index = static_cast<uint32_t>(i);
     return out;
 }
@@ -154,11 +208,15 @@ std::string format_list(const std::vector<Device>& devs, const Selection& s) {
     if (devs.empty()) return "no gfx906 GPUs found in the KFD topology\n";
     std::snprintf(line, sizeof(line), "  %-3s %-5s %-6s %-8s %-7s %-4s %-9s\n", "idx", "sel", "node", "gpu_id", "render", "CUs", "VRAM GiB");
     o += line;
+    std::vector<size_t> picked;
+    std::string why;
+    if (!pick_devices(s, devs, picked, &why)) return why + "\n";
     for (const auto& d : devs) {
-        const bool sel = s.all || std::binary_search(s.indices.begin(), s.indices.end(), d.index);
+        const bool sel = std::find(picked.begin(), picked.end(), d.index) != picked.end();
         std::snprintf(line, sizeof(line), "  %-3u %-5s %-6u %-8u %-7u %-4u %-9.1f\n", d.index, sel ? "*" : "", d.node_id, d.gpu_id,
                       d.drm_render_minor, d.simd_count / 4u, d.vram_bytes / double(1ull << 30));
         o += line;
+        o += "    PCI " + bdf(d.pci_domain, d.location_id) + "\n";
     }
     o += "selection: " + canonical(s) + " (" + s.source + ")\n";
     return o;
