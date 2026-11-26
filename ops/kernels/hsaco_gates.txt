@@ -7,6 +7,9 @@
 # vgpr_count rises above the ceiling, and also fail once the kernel fits its class (then delete the waiver).
 # An unlisted kernel fails the gate, so new kernels must be classified here.
 
+vj_moe_m1_back_asym_s224_kernel tiled
+vj_moe_down_asym_kernel tiled
+vj_moe_down_asym_q4a8_kernel tiled
 vegajet_megakernel_vm tiled
 kfd_memcpy_u32 tiled
 kfd_memset_u32 tiled

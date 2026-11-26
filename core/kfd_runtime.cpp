@@ -1013,6 +1013,10 @@ bool Runtime::load_hsaco_dir(const std::string& hsaco_dir, std::string* err) {
             if (!load_code_object(p.string(), err)) return false;
         }
     }
+    const char* asym = std::getenv("VEGAJET_V12_ASYM_EXPERTS");
+    if (asym && std::strcmp(asym, "1") == 0) {
+        if (!load_code_object((fs::path(dir) / "vj_moe_asym.hsaco").string(), err)) return false;
+    }
     return true;
 }
 

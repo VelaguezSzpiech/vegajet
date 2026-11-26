@@ -44,6 +44,15 @@ std::vector<Range> split_rows(uint64_t rows, const std::vector<double>& bw, uint
     return to_ranges(apportion(units, bw), u, rows);
 }
 
+std::vector<Range> split_expert_intermediate(uint32_t rows, const std::vector<double>& bw, bool enabled) {
+    if (rows < 64u || rows % 64u != 0u || bw.size() != 2u) return {};
+    if (!enabled) return {{0u, rows / 2u}, {rows / 2u, rows}};
+    for (double w : bw) if (!std::isfinite(w) || w <= 0.0) return {};
+    const auto ranges = split_rows(rows, bw, 32u);
+    const uint64_t cut = std::clamp<uint64_t>(ranges[0].end, 32u, rows - 32u);
+    return {{0u, cut}, {cut, rows}};
+}
+
 std::vector<Range> split_experts(uint64_t n_experts, const std::vector<double>& bw) {
     return to_ranges(apportion(n_experts, bw), 1, n_experts);
 }

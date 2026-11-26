@@ -124,6 +124,43 @@ Dot8RowLayout dot8_iq3_layout(uint64_t rows, uint32_t cols) {
     return finish_layout(rows, cols, cols / 2u, nsb * 8u);
 }
 
+Dot8RowLayout dot8_iq3_asym_layout(uint64_t rows, uint32_t cols) {
+    return finish_layout(rows, cols, cols / 2u, (cols / 32u) * 8u);
+}
+
+bool dot8_repack_iq3xxs_asym_rows(const uint8_t* src, uint64_t src_stride, uint32_t col_begin,
+                                const Dot8RowLayout& lay, uint64_t row_begin, uint64_t row_end,
+                                uint8_t* w, uint8_t* s, std::string* err) {
+    if (!src || !w || (!lay.scale_embedded && !s) || !lay.cols || lay.cols % 32u || col_begin % 32u ||
+        row_begin > row_end || row_end > lay.rows ||
+        (static_cast<uint64_t>(col_begin) + lay.cols + 255u) / 256u > src_stride / kIq3xxsBlockBytes ||
+        lay.w_raw_row_bytes != lay.cols / 2u || lay.s_raw_row_bytes != (lay.cols / 32u) * 8u ||
+        lay.w_row_stride_bytes < lay.w_raw_row_bytes ||
+        (lay.scale_embedded && (lay.s_offset_bytes < lay.w_raw_row_bytes ||
+          static_cast<uint64_t>(lay.s_offset_bytes) + lay.s_raw_row_bytes > lay.w_row_stride_bytes)) ||
+        (!lay.scale_embedded && lay.s_row_stride_bytes < lay.s_raw_row_bytes)) {
+        set_err(err, "dot8 asym: invalid buffers, range or 32-column layout"); return false;
+    }
+    for (uint64_t r = row_begin; r < row_end; ++r) {
+        auto* wr = w + r * lay.w_row_stride_bytes;
+        auto* sr = scale_row_ptr(lay, w, s, r);
+        std::memset(wr, 0, lay.w_row_stride_bytes);
+        for (uint32_t b = 0; b < lay.cols / 32u; ++b) {
+            const uint32_t source_b = col_begin / 32u + b;
+            const auto* block = src + r * src_stride + (source_b / 8u) * kIq3xxsBlockBytes;
+            uint8_t codes[32], scale;
+            if (!dot8_encode_iq3xxs_sub(block, source_b % 8u, codes, &scale)) {
+                set_err(err, "dot8 asym: invalid IQ3_XXS code"); return false;
+            }
+            dot8_pack_codes(codes, wr + b * 16u);
+            wr32(sr + b * 8u, scale);
+            const float d = half_to_f32(rd16(block));
+            std::memcpy(sr + b * 8u + 4u, &d, 4u);
+        }
+    }
+    return true;
+}
+
 Dot8RowLayout dot8_gu_iq2s_layout(uint64_t rows, uint32_t cols) {
     const uint32_t nblk = cols / kDot8BlockElems;
     const uint32_t nsb = cols / kDot8SuperElems;
