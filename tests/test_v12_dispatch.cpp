@@ -1,4 +1,5 @@
 #include "core/v12_dispatch.hpp"
+#include "core/v12_modules.hpp"
 #include "ops/kernels/vj_ornith_super_args.hpp"
 #include "core/vj_check.hpp"
 #include "core/vj_device_guard.hpp"
@@ -24,6 +25,13 @@ int main() {
         }
         VJ_CHECK(next == start + 8u);
     }
+    const auto off = vegajet::select_super_variant(false, false);
+    VJ_CHECK(off.valid && off.object == nullptr && std::string(off.suffix).empty());
+    const auto vol = vegajet::select_super_variant(true, false);
+    const auto iq2s = vegajet::select_super_variant(false, true);
+    VJ_CHECK(std::string(vol.object) == "vj_ornith_super_vol.hsaco");
+    VJ_CHECK(std::string(iq2s.object) == "vj_ornith_super_iq2sreg.hsaco");
+    VJ_CHECK(!vegajet::select_super_variant(true, true).valid);
     using vegajet::dispatch::kv_span_fits;
     using vegajet::dispatch::split_scratch_fits;
     VJ_CHECK(kv_span_fits(16368u, 16u, 16384u));

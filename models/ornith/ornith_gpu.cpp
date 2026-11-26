@@ -13,6 +13,7 @@
 #include "core/spec_cascade.hpp"
 #include "core/suffix_trie.hpp"
 #include "core/v12_dispatch.hpp"
+#include "core/v12_modules.hpp"
 #include "core/evict_controller.hpp"
 #include "core/host_preflight.hpp"
 #include "core/moe_lru_cache.hpp"
@@ -883,27 +884,17 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         gpu_bw_ceiling_gbs[g] = bw;
         calibrated_hbm2_ceiling_gbs += bw;
     }
+    // Resolve the requested variant before loading any experimental artifact.
+    const char* vol = std::getenv("VEGAJET_V12_BARRIER_VOL");
+    const char* iq2s = std::getenv("VEGAJET_V12_IQ2S_REG");
+    const auto variant = select_super_variant(vol && vol[0] == '1', iq2s && iq2s[0] == '1');
+    if (!variant.valid) {
+        res.error = "VEGAJET_V12_BARRIER_VOL and VEGAJET_V12_IQ2S_REG are mutually exclusive";
+        return res;
+    }
+    const std::string super_sfx = variant.suffix;
     const std::string hdir = kfd::resolve_hsaco_dir(opt.hsaco_dir);
     if (!rt.load_hsaco_dir(hdir, &res.error)) return res;
-
-    // v1.2 opt-in super-kernel variants (default off). Each variant is the same source built into
-    // its own .hsaco with a symbol suffix; the baseline object is untouched when the env var is unset.
-    std::string super_sfx;
-    {
-        const char* v = std::getenv("VEGAJET_V12_BARRIER_VOL");
-        if (v != nullptr && v[0] == '1') super_sfx = "_vol";
-        const char* r = std::getenv("VEGAJET_V12_IQ2S_REG");
-        if (r != nullptr && r[0] == '1') {
-            // Both levers rebuild the same four kernels; there is no _vol+_iq2sreg object, and
-            // silently picking one would misreport which variant was measured.
-            if (!super_sfx.empty()) {
-                res.error = "VEGAJET_V12_BARRIER_VOL and VEGAJET_V12_IQ2S_REG are mutually exclusive "
-                            "(no combined super-kernel variant is built)";
-                return res;
-            }
-            super_sfx = "_iq2sreg";
-        }
-    }
 
     KernelTable K[2];
     auto resolve_kernels = [&](std::string* kerr) -> bool {
