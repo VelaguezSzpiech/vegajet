@@ -2,6 +2,7 @@
 #include "core/gguf_reader.hpp"
 
 #include <algorithm>
+#include <new>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
@@ -234,7 +235,16 @@ bool GgufFile::open(const std::string& path) {
         return fail("general.alignment must be a power of two");
     alignment_ = align;
 
-    tensors_.reserve(n_tensors);
+    // Minimum 32 bytes per tensor info: name length + n_dims + one axis + type + offset.
+    const uint64_t info_room = file_size_ - std::min(r.pos(), file_size_);
+    if (n_tensors > info_room / 32)
+        return fail("implausible tensor count " + std::to_string(n_tensors) + " for " +
+                    std::to_string(info_room) + " bytes of tensor info");
+    try {
+        tensors_.reserve(n_tensors);
+    } catch (const std::bad_alloc&) {
+        return fail("tensor table of " + std::to_string(n_tensors) + " entries is too large");
+    }
     for (uint64_t t = 0; t < n_tensors; ++t) {
         GgufTensorInfo ti;
         if (!r.str(ti.name, 1 << 16) || !r.pod(ti.n_dims) || ti.n_dims > 4)
