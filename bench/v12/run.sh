@@ -4,8 +4,8 @@
 # Usage:
 #   MODEL=/path/ornith-122b.gguf [DRAFT=/path/dflash2.gguf] [MTP=/path/blk48-mtp.gguf] \
 #   [RUNS=5] [N=128] [ONLY="VOCAB_ILP DENSE_PERSIST"] bench/v12/run.sh
-# Pin the same two MI50s for every run (third card must not be used for v1.2 numbers):
-#   export the device-selection your rig uses (e.g. ROCR_VISIBLE_DEVICES / the hw_profile) BEFORE running.
+# Pin the same two MI50s for every run by PCI address (see `vegajet serve --gpu list`):
+#   GPUS=0000:03:00.0,0000:43:00.0 MODEL=... bench/v12/run.sh
 set -euo pipefail
 
 BIN=${BIN:-./build-gpu/vegajet}
@@ -17,6 +17,8 @@ mkdir -p "$OUT"
 
 # Add a fixed prompt with EXTRA="--prompt '...'" to test normal text as well as the default prompt.
 EXTRA=${EXTRA:-}
+GPUS=${GPUS:?set GPUS=<bdf0>,<bdf1> (two MI50s, from vegajet serve --gpu list)}
+EXTRA="$EXTRA --gpu $GPUS"
 
 failed=0
 run() { # name, env, args...
@@ -56,9 +58,12 @@ LEVERS=(
   "BARRIER_VOL|VEGAJET_V12_BARRIER_VOL=1|$RAW"
   "SPEC_GOV|VEGAJET_V12_SPEC_GOV=1|$MTPA"
   "BATCH_CATCHUP|VEGAJET_V12_BATCH_CATCHUP=1|$MTPA"
+  "NARROW_VERIFY|VEGAJET_V12_NARROW_VERIFY=1|$MTPA"
+  "VERIFY_FUSED_NQ|VEGAJET_V12_VERIFY_FUSED_NQ=1|$MTPA"
+  "GDN_SPLITV|VEGAJET_ENABLE_SUPER=0 VEGAJET_V12_GDN_SPLITV=1|$RAW"
+  "ASYM_EXPERTS|VEGAJET_V12_ASYM_EXPERTS=1|$RAW"
 )
-# Group-2 levers are appended here by later commits (GDN_SPLITV, VERIFY_FUSED_NQ, NARROW_VERIFY, TREE_VERIFY, ASYM_EXPERTS).
-[ -f bench/v12/levers_extra.sh ] && source bench/v12/levers_extra.sh
+# TREE_VERIFY is host-side only in v1.2 and fails closed when enabled; it is not benchmarked.
 
 run baseline_raw "" $RAW
 [ -n "${DRAFT:-}" ] && run baseline_spec "" $SPEC
@@ -68,7 +73,7 @@ for e in "${LEVERS[@]}"; do
   IFS='|' read -r name envs args <<< "$e"
   [ -n "${ONLY:-}" ] && [[ " $ONLY " != *" $name "* ]] && continue
   if [[ "$args" == *"--draft  "* || "$args" == *"--draft --"* ]]; then echo "skip $name (no draft model set)"; continue; fi
-  if [[ $name == DENSE_PERSIST ]]; then run baseline_dense_standalone "VEGAJET_ENABLE_SUPER=0" $RAW; fi
+  if [[ $name == DENSE_PERSIST || $name == GDN_SPLITV ]] && [[ ! -e "$OUT/baseline_nosuper.env" ]]; then run baseline_nosuper "VEGAJET_ENABLE_SUPER=0" $RAW; fi
   run "$name" "$envs" $args
 done
 
