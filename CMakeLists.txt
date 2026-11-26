@@ -61,6 +61,7 @@ add_library(vegajet_core STATIC
     core/host_preflight.cpp
     core/hsaco_gate.cpp
     core/hsaco_bundle.cpp
+    core/hsaco_loader.cpp
     core/gguf_arch_detect.cpp
     core/fr_spec.cpp
     core/spec_policy.cpp
@@ -313,6 +314,7 @@ vj_test(test_spec_policy)
 vj_test(test_spec_governor)
 vj_test(test_spec_flash_ref)
 vj_test(test_hsaco_bundle)
+vj_test(test_hsaco_loader)
 vj_test(test_dflash_host)
 vj_test(test_spec_gdn_ref)
 vj_test(test_gdn_recur_colthread_ref)
