@@ -24,6 +24,23 @@ int main() {
         }
         VJ_CHECK(next == start + 8u);
     }
+    using vegajet::dispatch::kv_span_fits;
+    using vegajet::dispatch::split_scratch_fits;
+    VJ_CHECK(kv_span_fits(16368u, 16u, 16384u));
+    VJ_CHECK(!kv_span_fits(16369u, 16u, 16384u));
+    VJ_CHECK(!kv_span_fits(0u, 0u, 16384u));
+    VJ_CHECK(!kv_span_fits(UINT32_MAX - 3u, 16u, UINT32_MAX));
+    VJ_CHECK(kv_span_fits(UINT32_MAX - 16u, 16u, UINT32_MAX));
+    VJ_CHECK(split_scratch_fits(16u, 16u, 60u, 960u, 16u));
+    VJ_CHECK(!split_scratch_fits(16u, 16u, 61u, 960u, 16u));
+    VJ_CHECK(!split_scratch_fits(16u, 16u, 64u, 960u, 16u));
+    VJ_CHECK(split_scratch_fits(15u, 16u, 64u, 960u, 16u));
+    VJ_CHECK(split_scratch_fits(1u, 16u, 960u, 960u, 16u));
+    VJ_CHECK(!split_scratch_fits(1u, 16u, 961u, 960u, 16u));
+    VJ_CHECK(!split_scratch_fits(UINT32_MAX, 16u, UINT32_MAX, 960u, 16u));
+    VJ_CHECK(!split_scratch_fits(1u, 17u, 60u, 960u, 16u));
+    VJ_CHECK(!split_scratch_fits(0u, 16u, 60u, 960u, 16u));
+    VJ_CHECK(!split_scratch_fits(1u, 16u, 0u, 960u, 16u));
     // Simulated driver work after verifier failure must be unreachable in every mode.
     for (const char* mode : {"raw", "suffix", "MTP", "DFlash", "serve", "dump", "warm"}) {
         for (const char* cause : {"mailbox timeout", "bad input token", "bad argmax"}) {

@@ -6,6 +6,15 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class FixContracts(unittest.TestCase):
+    def test_split_attention_checked_before_launch(self):
+        src = (ROOT / 'models/ornith/ornith_gpu.cpp').read_text()
+        for dims in ('M, n_q_local', '1u, 16u', 'M, 16u'):
+            self.assertIn('require_split_scratch(' + dims + ', n_chunks);', src)
+        self.assertIn('require_kv_span(pos0, n);', src)
+        self.assertIn('require_kv_span(pos, 1u);', src)
+        self.assertIn('require_kv_span(pos0, M);', src)
+        self.assertNotIn('(span + chunk_len - 1u)', src)
+
     def test_failures_unwind_all_drivers(self):
         src = (ROOT / 'models/ornith/ornith_gpu.cpp').read_text()
         self.assertNotIn('return std::vector<int32_t>(M, -1)', src)
