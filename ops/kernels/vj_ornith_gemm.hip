@@ -135,6 +135,169 @@ void ornith_gemv_q4a8_m1_w32_kernel(
     }
 }
 
+// ============================================================================
+// v1.2 D13: persistent work-stealing grid for the same dense M=1 GEMV
+// (VEGAJET_V12_DENSE_PERSIST, default off).
+//     (rows+7)/8 WGs of 256 threads overshoot the 300 resident slots (rows=3072 -> 384 WGs =
+//     1.28 waves), so the tail runs with a third of the CUs issuing. This variant launches a
+//     fixed resident grid (224-240 WGs) and lets each WG pull 8-row tiles from an atomic
+//     counter, exactly like the M=1 MoE back path. Per-tile math, per-row accumulation order
+//     and the peer_tx layout (8 halves starting at row 8*tile) are identical to the
+//     blockIdx.x variant, so tokens do not change.
+//     q[0] = tile counter, q[1] = WG arrivals. The last WG out zeroes both, so the host never
+//     has to memset per dispatch; the buffer only has to be zeroed once at setup.
+// ============================================================================
+extern "C" __global__ __launch_bounds__(256, 5)
+void ornith_gemv_q4a8_m1_w32_persist_kernel(
+    const uint8_t*  __restrict__ w_qs,
+    const uint32_t* __restrict__ w_dm,
+    const int8_t*   __restrict__ x_q8,
+    const float2*   __restrict__ x_ds,
+    float*          __restrict__ y_out,
+    uint32_t rows,
+    uint32_t cols,
+    uint32_t row_stride_bytes,
+    uint32_t dm_stride_u32,
+    uint16_t*       __restrict__ peer_tx,
+    uint32_t*       __restrict__ q,
+    uint32_t n_tiles) {
+    const uint32_t grp  = threadIdx.x >> 5;  // 0..7 (8 rows/WG)
+    const uint32_t lane = threadIdx.x & 31u;
+
+    const uint32_t  nb    = cols >> 5;
+    const uint32_t  dm_st = dm_stride_u32 ? dm_stride_u32 : nb;
+    const uint4*    x4    = reinterpret_cast<const uint4*>(x_q8);
+    const uint32_t  b_last = nb - 1u;
+
+    __shared__ uint32_t sm_tile;
+    __shared__ float    sm_out[8];
+
+    for (;;) {
+        if (threadIdx.x == 0u) sm_tile = atomicAdd(&q[0], 1u);
+        __syncthreads();
+        const uint32_t t = sm_tile;
+        __syncthreads();                     // sm_tile is free again for the next pull
+        if (t >= n_tiles) break;             // uniform across the WG
+        const uint32_t row = t * 8u + grp;
+
+        float acc = 0.0f;
+        if (row < rows) {
+            const uint4*    w4 = reinterpret_cast<const uint4*>(w_qs + static_cast<uint64_t>(row) * row_stride_bytes);
+            const uint32_t* dm = w_dm + static_cast<uint64_t>(row) * dm_st;
+            // Same two paths, same accumulation order as ornith_gemv_q4a8_m1_w32_kernel.
+            if (nb == 128u) {
+                #pragma unroll
+                for (uint32_t r = 0u; r < 2u; ++r) {
+                    const uint32_t b0 = lane + r * 64u;
+                    const uint32_t b1 = b0 + 32u;
+                    const uint4    wv0 = vegajet::ornith_dev::ldg_u32x4_stream(w4 + b0);
+                    const uint32_t dm0 = vegajet::ornith_dev::ldg_u32_stream(dm + b0);
+                    const uint4    wv1 = vegajet::ornith_dev::ldg_u32x4_stream(w4 + b1);
+                    const uint32_t dm1 = vegajet::ornith_dev::ldg_u32_stream(dm + b1);
+                    {
+                        const uint4  xa = x4[b0 * 2u], xb = x4[b0 * 2u + 1u];
+                        const float2 xds = x_ds[b0];
+                        int32_t dp = vegajet::ornith_dev::sdot4(wv0.x & 0x0F0F0F0Fu, xa.x, 0);
+                        dp         = vegajet::ornith_dev::sdot4(wv0.y & 0x0F0F0F0Fu, xa.y, dp);
+                        dp         = vegajet::ornith_dev::sdot4(wv0.z & 0x0F0F0F0Fu, xa.z, dp);
+                        dp         = vegajet::ornith_dev::sdot4(wv0.w & 0x0F0F0F0Fu, xa.w, dp);
+                        dp         = vegajet::ornith_dev::sdot4((wv0.x >> 4) & 0x0F0F0F0Fu, xb.x, dp);
+                        dp         = vegajet::ornith_dev::sdot4((wv0.y >> 4) & 0x0F0F0F0Fu, xb.y, dp);
+                        dp         = vegajet::ornith_dev::sdot4((wv0.z >> 4) & 0x0F0F0F0Fu, xb.z, dp);
+                        dp         = vegajet::ornith_dev::sdot4((wv0.w >> 4) & 0x0F0F0F0Fu, xb.w, dp);
+                        const float wd = vegajet::ornith_dev::fp16_to_f32(static_cast<uint16_t>(dm0 & 0xFFFFu));
+                        const float wm = vegajet::ornith_dev::fp16_to_f32(static_cast<uint16_t>(dm0 >> 16));
+                        acc = fmaf(wd * xds.x, static_cast<float>(dp), fmaf(wm, xds.y, acc));
+                    }
+                    {
+                        const uint4  xa = x4[b1 * 2u], xb = x4[b1 * 2u + 1u];
+                        const float2 xds = x_ds[b1];
+                        int32_t dp = vegajet::ornith_dev::sdot4(wv1.x & 0x0F0F0F0Fu, xa.x, 0);
+                        dp         = vegajet::ornith_dev::sdot4(wv1.y & 0x0F0F0F0Fu, xa.y, dp);
+                        dp         = vegajet::ornith_dev::sdot4(wv1.z & 0x0F0F0F0Fu, xa.z, dp);
+                        dp         = vegajet::ornith_dev::sdot4(wv1.w & 0x0F0F0F0Fu, xa.w, dp);
+                        dp         = vegajet::ornith_dev::sdot4((wv1.x >> 4) & 0x0F0F0F0Fu, xb.x, dp);
+                        dp         = vegajet::ornith_dev::sdot4((wv1.y >> 4) & 0x0F0F0F0Fu, xb.y, dp);
+                        dp         = vegajet::ornith_dev::sdot4((wv1.z >> 4) & 0x0F0F0F0Fu, xb.z, dp);
+                        dp         = vegajet::ornith_dev::sdot4((wv1.w >> 4) & 0x0F0F0F0Fu, xb.w, dp);
+                        const float wd = vegajet::ornith_dev::fp16_to_f32(static_cast<uint16_t>(dm1 & 0xFFFFu));
+                        const float wm = vegajet::ornith_dev::fp16_to_f32(static_cast<uint16_t>(dm1 >> 16));
+                        acc = fmaf(wd * xds.x, static_cast<float>(dp), fmaf(wm, xds.y, acc));
+                    }
+                }
+            } else {
+                #pragma nounroll
+                for (uint32_t b0 = lane; b0 < nb; b0 += 96u) {
+                    uint4    wvs[3];
+                    uint32_t dms[3];
+                    #pragma unroll
+                    for (uint32_t k = 0u; k < 3u; ++k) {
+                        const uint32_t bc = min(b0 + k * 32u, b_last); // out-of-row blocks re-read the last one and are skipped below
+                        wvs[k] = vegajet::ornith_dev::ldg_u32x4_stream(w4 + bc);
+                        dms[k] = vegajet::ornith_dev::ldg_u32_stream(dm + bc);
+                    }
+                    #pragma unroll
+                    for (uint32_t k = 0u; k < 3u; ++k) {
+                        const uint32_t b = b0 + k * 32u;
+                        if (b < nb) {
+                            const uint4    wv  = wvs[k];
+                            const uint32_t dmv = dms[k];
+                            const uint4    xa  = x4[b * 2u];
+                            const uint4    xb  = x4[b * 2u + 1u];
+                            const float2   xds = x_ds[b];
+
+                            int32_t dp = vegajet::ornith_dev::sdot4(wv.x & 0x0F0F0F0Fu, xa.x, 0);
+                            dp         = vegajet::ornith_dev::sdot4(wv.y & 0x0F0F0F0Fu, xa.y, dp);
+                            dp         = vegajet::ornith_dev::sdot4(wv.z & 0x0F0F0F0Fu, xa.z, dp);
+                            dp         = vegajet::ornith_dev::sdot4(wv.w & 0x0F0F0F0Fu, xa.w, dp);
+                            dp         = vegajet::ornith_dev::sdot4((wv.x >> 4) & 0x0F0F0F0Fu, xb.x, dp);
+                            dp         = vegajet::ornith_dev::sdot4((wv.y >> 4) & 0x0F0F0F0Fu, xb.y, dp);
+                            dp         = vegajet::ornith_dev::sdot4((wv.z >> 4) & 0x0F0F0F0Fu, xb.z, dp);
+                            dp         = vegajet::ornith_dev::sdot4((wv.w >> 4) & 0x0F0F0F0Fu, xb.w, dp);
+
+                            const float wd = vegajet::ornith_dev::fp16_to_f32(static_cast<uint16_t>(dmv & 0xFFFFu));
+                            const float wm = vegajet::ornith_dev::fp16_to_f32(static_cast<uint16_t>(dmv >> 16));
+                            acc = fmaf(wd * xds.x, static_cast<float>(dp), fmaf(wm, xds.y, acc));
+                        }
+                    }
+                }
+            }
+            acc = vegajet::ornith_dev::block32_sum(acc);
+            if (lane == 0u) y_out[row] = acc;
+        }
+
+        // peer_tx layout is per tile (rows 8*t .. 8*t+7), so tiles may be claimed in any order.
+        if (peer_tx != nullptr && (rows & 7u) == 0u) {
+            if (lane == 0u) sm_out[grp] = acc;
+            __syncthreads();
+            if (threadIdx.x == 0u) {
+                const __half2 h0 = __float22half2_rn(make_float2(sm_out[0], sm_out[1]));
+                const __half2 h1 = __float22half2_rn(make_float2(sm_out[2], sm_out[3]));
+                const __half2 h2 = __float22half2_rn(make_float2(sm_out[4], sm_out[5]));
+                const __half2 h3 = __float22half2_rn(make_float2(sm_out[6], sm_out[7]));
+                typedef uint32_t u32x4_t __attribute__((ext_vector_type(4)));
+                u32x4_t pv = {
+                    *reinterpret_cast<const uint32_t*>(&h0),
+                    *reinterpret_cast<const uint32_t*>(&h1),
+                    *reinterpret_cast<const uint32_t*>(&h2),
+                    *reinterpret_cast<const uint32_t*>(&h3)
+                };
+                __builtin_nontemporal_store(pv, reinterpret_cast<u32x4_t*>(peer_tx + t * 8u));
+            }
+            __syncthreads();                 // sm_out is reused by the next tile
+        }
+    }
+
+    // Last WG out resets both counters: the next dispatch starts from an empty queue with no host memset.
+    if (threadIdx.x == 0u) {
+        const uint32_t arr = atomicAdd(&q[1], 1u) + 1u;
+        if (arr == gridDim.x) {
+            __atomic_store_n(&q[0], 0u, __ATOMIC_RELEASE);
+            __atomic_store_n(&q[1], 0u, __ATOMIC_RELEASE);
+        }
+    }
+}
+
 extern "C" __global__ __launch_bounds__(256, 6)
 void ornith_gemv_q4a8_m1_w16_kernel(
     const uint8_t*  __restrict__ w_qs,

@@ -19,6 +19,7 @@ ornith_p2p_ar_res_rms_quant_kernel tiled
 ornith_p2p_ar_res_rms_quant_prepush_kernel tiled
 ornith_gemv_q4a8_m1_w32_kernel stream
 ornith_gemv_q4a8_m1_w16_kernel stream
+ornith_gemv_q4a8_m1_w32_persist_kernel stream
 ornith_gemm_q4a8_tcc_kernel tiled 73
 ornith_gemm_q4a8_m8_kernel tiled
 ornith_gemm_q4a8_m12_kernel tiled

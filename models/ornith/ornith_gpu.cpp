@@ -71,6 +71,18 @@ bool v12_vocab_ilp() {
     static const bool on = [] { const char* e = std::getenv("VEGAJET_V12_VOCAB_ILP"); return e != nullptr && e[0] == '1'; }();
     return on;
 }
+bool v12_dense_persist() {
+    static const bool on = [] { const char* e = std::getenv("VEGAJET_V12_DENSE_PERSIST"); return e != nullptr && e[0] == '1'; }();
+    return on;
+}
+uint32_t v12_dense_wgs() {
+    static const uint32_t wgs = [] {
+        const char* e = std::getenv("VEGAJET_V12_DENSE_WGS");
+        const long v = (e != nullptr) ? std::atol(e) : 224L;
+        return static_cast<uint32_t>((v >= 96L && v <= 240L) ? v : 224L);
+    }();
+    return wgs;
+}
 
 struct Q8WeightDev {
     uint64_t qs_va = 0;
@@ -185,6 +197,7 @@ struct GpuStateDev {
     uint64_t moe_bar_va    = 0;
     uint64_t gdn_bar_va    = 0;
     uint64_t moe_bq_va     = 0;
+    uint64_t dense_q_va    = 0;   // v1.2 D13: dense GEMV tile counter / WG arrival pair
     uint64_t gdn_sq_va     = 0;
 
     uint64_t gdn_qkv_gab_va = 0;
@@ -260,6 +273,7 @@ struct KernelTable {
     const kfd::LoadedKernel* moe_mid_f32_to_q8 = nullptr;
     const kfd::LoadedKernel* moe_down_d8_sh = nullptr;
     const kfd::LoadedKernel* gemv_q4_w32 = nullptr;
+    const kfd::LoadedKernel* gemv_q4_w32p = nullptr; // v1.2 D13: persistent work-stealing grid variant
     const kfd::LoadedKernel* gemv_q4_w64 = nullptr;
     const kfd::LoadedKernel* gemv_q4_splitk_p1 = nullptr;
     const kfd::LoadedKernel* splitk_red_pp = nullptr;
@@ -855,6 +869,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             K[g].p2p_ar_prepush = need_k("ornith_p2p_ar_res_rms_quant_prepush_kernel");
             K[g].p2p_ar_i8      = need_k("ornith_p2p_ar_i8_res_rms_quant_kernel");
             K[g].gemv_q4_w32  = need_k("ornith_gemv_q4a8_m1_w32_kernel");
+            K[g].gemv_q4_w32p = v12_dense_persist() ? rt.get_kernel(g, "ornith_gemv_q4a8_m1_w32_persist_kernel") : nullptr;
             K[g].gemv_q4_w64  = need_k("vj_gemv_q4a8_w64_kernel");
             K[g].gemv_q4_splitk_p1 = need_k("vj_gemv_q4a8_splitk_p1_kernel");
             K[g].splitk_red_pp = need_k("vj_splitk_reduce_prepush_f32_kernel");
@@ -1736,6 +1751,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         S[g].moe_bar_va     = alloc(256u);
         S[g].gdn_bar_va     = alloc(8192u, 256);
         S[g].moe_bq_va      = alloc(256u);
+        S[g].dense_q_va     = alloc(256u);
         S[g].super_bar_va      = alloc(2048u, 256);
         S[g].gdn_super_desc_va = alloc(36ULL * sizeof(ornith_super::GdnSuperDesc), 256);
         S[g].gqa_super_desc_va = alloc(12ULL * sizeof(ornith_super::GqaSuperDesc), 256);
@@ -1943,6 +1959,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             if (S[g].pf_gdn_bar_va)  zero_buf(S[g].pf_gdn_bar_va, 256u);
             if (S[g].pf_gu_queue_va) zero_buf(S[g].pf_gu_queue_va, 256u);
             zero_buf(S[g].moe_bq_va, 256u);
+            zero_buf(S[g].dense_q_va, 256u);
             if (has_mtp) zero_buf(S[g].mtp_h_zero_va, D * 4u);
             for (uint32_t i = 0; i < 36u; ++i) {
                 zero_buf(S[g].gdn_conv_ring_va[i], kGdnRingSlots * 3ULL * 6144ULL * 4ULL);
@@ -2248,8 +2265,22 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                     } else {
                         struct M1W32KA { uint64_t wq, wdm, xq, xds, y; uint32_t rows, cols, stride, dm_st; uint64_t ptx; };
                         M1W32KA ka{w.qs_va, w.dm_va, xq, xds, y, w.rows, w.cols, w.row_stride_bytes, 0u, peer_tx};
-                        const uint32_t gx = ((w.rows + 7u) / 8u) * 256u;
-                        VJ_CHECK(rt.enqueue_kernel(g, *K[g].gemv_q4_w32, gx, 1, 1, 256, 1, 1, &ka, sizeof(ka), barrier));
+                        const uint32_t n_tiles = (w.rows + 7u) / 8u;
+                        const uint32_t pwgs    = v12_dense_wgs();
+                        // The tile counter is shared by consecutive dispatches, so the variant is only
+                        // taken when the launch is a full AQL barrier (barrier=0 lets packets overlap).
+                        if (K[g].gemv_q4_w32p != nullptr && n_tiles >= pwgs && barrier) {
+                            // v1.2 D13: resident grid pulls 8-row tiles from an atomic counter instead of
+                            // launching one WG per tile (rows=3072 -> 384 WGs on 250-300 slots).
+                            struct M1W32PKA { uint64_t wq, wdm, xq, xds, y; uint32_t rows, cols, stride, dm_st;
+                                              uint64_t ptx, q; uint32_t n_tiles; };
+                            M1W32PKA kap{w.qs_va, w.dm_va, xq, xds, y, w.rows, w.cols, w.row_stride_bytes, 0u,
+                                         peer_tx, S[g].dense_q_va, n_tiles};
+                            VJ_CHECK(rt.enqueue_kernel(g, *K[g].gemv_q4_w32p, pwgs * 256u, 1, 1, 256, 1, 1, &kap, sizeof(kap), barrier));
+                        } else {
+                            const uint32_t gx = ((w.rows + 7u) / 8u) * 256u;
+                            VJ_CHECK(rt.enqueue_kernel(g, *K[g].gemv_q4_w32, gx, 1, 1, 256, 1, 1, &ka, sizeof(ka), barrier));
+                        }
                     }
                 }
             } else {
