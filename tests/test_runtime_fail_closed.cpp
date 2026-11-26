@@ -68,6 +68,38 @@ struct RuntimeTestAccess {
         rt.kfd_fd_ = -1;
         io_ok = false;
     }
+    static void completion_lifecycle() {
+        Runtime rt;
+        rt.open_ = true;
+        rt.queues_.resize(1);
+        auto& q = rt.queues_[0];
+        AqlDispatchPacket ring[16]{};
+        uint64_t rptr = 0, wptr = 0, doorbell = 0;
+        AmdSignal signal{};
+        q.ring_buf.host_ptr = ring;
+        q.ring_packets = 16;
+        q.read_ptr = &rptr; q.write_ptr = &wptr; q.doorbell = &doorbell;
+        q.completion_sig = &signal;
+        q.next_write_idx = 1;
+        VJ_CHECK(rt.submit_batch(0));
+        const auto wp = q.next_write_idx;
+        VJ_CHECK(!rt.submit_batch(0));
+        VJ_CHECK(q.next_write_idx == wp && signal.value == 1);
+        LoadedKernel kernel{};
+        VJ_CHECK(!rt.enqueue_kernel(0, kernel, 1, 1, 1, 1, 1, 1, nullptr, 0));
+        signal.value = 0;
+        VJ_CHECK(rt.wait_idle(0, 0));
+        VJ_CHECK(!q.submission_in_flight && q.completed_write_idx == wp);
+        // A stale zero cannot hide pending, already-rung work: wait adds a fresh fence and times out.
+        ++q.next_write_idx;
+        rt.ring_doorbell(0);
+        VJ_CHECK(!rt.wait_idle(0, 0));
+        VJ_CHECK(signal.value == 1 && !rt.open_);
+        rt.open_ = true;
+        signal.value = -1;
+        VJ_CHECK(!rt.wait_idle(0, 0) && !rt.open_);
+        q = KfdAqlQueue{};
+    }
     static void reload_failure() {
         Runtime rt;
         rt.open_ = true;
@@ -90,5 +122,6 @@ struct RuntimeTestAccess {
 int main() {
     vegajet::kfd::RuntimeTestAccess::reload_failure();
     vegajet::kfd::RuntimeTestAccess::mapping_ownership();
+    vegajet::kfd::RuntimeTestAccess::completion_lifecycle();
     std::puts("runtime fail-closed tests PASS");
 }

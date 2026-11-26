@@ -225,7 +225,9 @@ struct KfdAqlQueue {
     uint64_t  kernarg_va = 0;
     void*     kernarg_host = nullptr;
     size_t    kernarg_capacity = 0;
-    uint32_t  kernarg_slot = 0;
+    uint32_t kernarg_slot = 0;
+    uint64_t completed_write_idx = 0;
+    bool submission_in_flight = false;
     uint64_t  forced_flushes = 0;  // ring-full publishes done by aql_wait_space (see below)
 };
 

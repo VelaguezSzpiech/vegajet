@@ -1494,7 +1494,12 @@ bool Runtime::enqueue_kernel(size_t gpu_idx, const LoadedKernel& kernel,
         dprintf(dlog_fd_, "E rank=%zu seq=%llu kernel=%s grid=%ux%ux%u block=%ux%ux%u kernarg=%zu barrier=%d\n", gpu_idx,
                 static_cast<unsigned long long>(++dlog_seq_), kernel.name.c_str(), grid_x, grid_y, grid_z, block_x, block_y, block_z,
                 kernarg_bytes, barrier ? 1 : 0);
+    if (!open_ || gpu_idx >= queues_.size()) return false;
     auto& q = queues_[gpu_idx];
+    if (q.submission_in_flight) {
+        std::fprintf(stderr, "[vegajet::kfd] enqueue GPU %zu rejected: wait for outstanding batch first\n", gpu_idx);
+        return false;
+    }
     const size_t hidden_off = align_up(kernarg_bytes, 8ULL);
     const size_t total_ka   = std::max<size_t>(hidden_off + 256, kernel.kernarg_size);
     if (total_ka > 512) return false;
@@ -1554,7 +1559,13 @@ bool Runtime::enqueue_kernel(size_t gpu_idx, const LoadedKernel& kernel,
 }
 
 bool Runtime::submit_batch(size_t gpu_idx) {
+    if (!open_ || gpu_idx >= queues_.size()) return false;
     auto& q = queues_[gpu_idx];
+    if (q.submission_in_flight) {
+        std::fprintf(stderr, "[vegajet::kfd] submit GPU %zu rejected: completion signal still owned by outstanding batch\n", gpu_idx);
+        return false;
+    }
+    if (q.next_write_idx == q.completed_write_idx) return true;
     if (dlog_fd_ >= 0) dprintf(dlog_fd_, "S rank=%zu upto_seq=%llu\n", gpu_idx, static_cast<unsigned long long>(dlog_seq_));
     if (!aql_wait_space(q, 1u, 5000000ULL)) return false;
     __atomic_store_n(&q.completion_sig->value, 1LL, __ATOMIC_RELEASE);
@@ -1571,12 +1582,14 @@ bool Runtime::submit_batch(size_t gpu_idx) {
     const uint16_t hdr = make_aql_header(kPacketTypeBarrierAnd, true, kFenceScopeSystem, kFenceScopeSystem);
     __atomic_store_n(&raw16[0], hdr, __ATOMIC_RELEASE);
 
+    q.submission_in_flight = true;
     __atomic_store_n(q.write_ptr, q.next_write_idx, __ATOMIC_RELEASE);
     __atomic_store_n(q.doorbell, idx, __ATOMIC_RELEASE);
     return true;
 }
 
 void Runtime::ring_doorbell(size_t gpu_idx) {
+    if (!open_ || gpu_idx >= queues_.size()) return;
     auto& q = queues_[gpu_idx];
     if (q.next_write_idx == 0) return;
     __atomic_store_n(q.write_ptr, q.next_write_idx, __ATOMIC_RELEASE);
@@ -1594,10 +1607,20 @@ bool Runtime::dispatch_async(size_t gpu_idx, const LoadedKernel& kernel,
 }
 
 bool Runtime::wait_idle(size_t gpu_idx, uint64_t timeout_us) {
+    if (!open_ || gpu_idx >= queues_.size()) return false;
     auto& q = queues_[gpu_idx];
+    // Pending/rung packets without a completion barrier must be fenced before zero means idle.
+    if (!q.submission_in_flight && q.next_write_idx != q.completed_write_idx && !submit_batch(gpu_idx)) return false;
     auto t0 = std::chrono::steady_clock::now();
     uint32_t spins = 0;
-    while (__atomic_load_n(&q.completion_sig->value, __ATOMIC_ACQUIRE) > 0) {
+    int64_t value;
+    while ((value = __atomic_load_n(&q.completion_sig->value, __ATOMIC_ACQUIRE)) != 0) {
+        if (value < 0) {
+            std::fprintf(stderr, "[vegajet::kfd] completion underflow GPU %zu (sig=%lld); runtime stopped\n",
+                         gpu_idx, static_cast<long long>(value));
+            open_ = false;
+            return false;
+        }
         if ((++spins & 1023u) == 0u) {
             const auto el = std::chrono::duration_cast<std::chrono::microseconds>(
                                 std::chrono::steady_clock::now() - t0).count();
@@ -1606,6 +1629,7 @@ bool Runtime::wait_idle(size_t gpu_idx, uint64_t timeout_us) {
                              gpu_idx, static_cast<long long>(q.completion_sig->value),
                              static_cast<unsigned long long>(*q.read_ptr),
                              static_cast<unsigned long long>(*q.write_ptr));
+                open_ = false;
                 return false;
             }
         }
@@ -1615,6 +1639,8 @@ bool Runtime::wait_idle(size_t gpu_idx, uint64_t timeout_us) {
         std::this_thread::yield();
 #endif
     }
+    q.submission_in_flight = false;
+    q.completed_write_idx = q.next_write_idx;
     if (dlog_fd_ >= 0) dprintf(dlog_fd_, "C rank=%zu upto_seq=%llu\n", gpu_idx, static_cast<unsigned long long>(dlog_seq_));
     return true;
 }
