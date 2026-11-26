@@ -52,6 +52,7 @@ uint16_t rd16(const uint8_t* p) { uint16_t v; std::memcpy(&v, p, 2); return v; }
 uint32_t rd32(const uint8_t* p) { uint32_t v; std::memcpy(&v, p, 4); return v; }
 void wr16(uint8_t* p, uint16_t v) { std::memcpy(p, &v, 2); }
 void wr32(uint8_t* p, uint32_t v) { std::memcpy(p, &v, 4); }
+void or32(uint8_t* p, uint32_t v) { wr32(p, rd32(p) | v); }
 
 // Exact fp16 -> f32 (every fp16 value, incl. subnormals, is representable in f32).
 float half_to_f32(uint16_t h) {
@@ -327,6 +328,203 @@ void dot8_decode_row_iq2_int(const uint8_t* w_codes_row, uint32_t cols, uint32_t
             }
         }
     }
+}
+
+// =================================================================================================
+// Universal single-tensor repacker (IQ3_XXS / IQ2_S) + TCC XOR tile swizzle
+// =================================================================================================
+Dot8UniversalLayout dot8_universal_layout(uint64_t rows, uint32_t cols, GgmlType src, Dot8RowMode mode) {
+    Dot8UniversalLayout l;
+    l.rows = rows;
+    l.cols = cols;
+    l.mode = mode;
+    if (rows == 0 || cols == 0 || (cols % kDot8SuperElems) != 0u) return l;
+    const uint32_t nblk = cols / kDot8BlockElems;
+    const uint32_t nsb = cols / kDot8SuperElems;
+    l.w_raw_row_bytes = cols / 2u;
+    l.s_raw_row_bytes = (src == GgmlType::IQ3_XXS) ? nsb * 8u : nblk * 1u + nsb * 4u;
+    if (mode == Dot8RowMode::Xor16) {
+        // Whole 16-tile groups: the permutation stays inside the row for every (row & 15).
+        const uint32_t tiles = (l.w_raw_row_bytes + kDot8TileBytes - 1u) / kDot8TileBytes;
+        const uint32_t groups = (tiles + 15u) / 16u;
+        l.w_tiles = groups * 16u;
+        l.w_row_stride_bytes = l.w_tiles * kDot8TileBytes;
+        l.scale_embedded = false;
+        l.s_offset_bytes = 0u;
+        l.s_row_stride_bytes = l.s_raw_row_bytes;
+        return l;
+    }
+    l.mode = Dot8RowMode::Odd256;
+    l.w_row_stride_bytes = dot8_odd256_stride(l.w_raw_row_bytes);
+    l.w_tiles = l.w_row_stride_bytes / kDot8TileBytes;
+    if (dot8_odd256_stride(l.w_raw_row_bytes + l.s_raw_row_bytes) == l.w_row_stride_bytes) {
+        l.scale_embedded = true;
+        l.s_offset_bytes = l.w_raw_row_bytes;
+        l.s_row_stride_bytes = l.w_row_stride_bytes;
+    } else {
+        l.scale_embedded = false;
+        l.s_offset_bytes = 0u;
+        l.s_row_stride_bytes = l.s_raw_row_bytes;
+    }
+    return l;
+}
+
+uint32_t dot8_swizzle_tile(uint32_t k_blk, uint64_t row, const Dot8UniversalLayout& lay) {
+    if (lay.mode != Dot8RowMode::Xor16) return k_blk;
+    return k_blk ^ static_cast<uint32_t>(row & 15u);
+}
+
+uint32_t dot8_block_offset(uint32_t blk, uint64_t row, const Dot8UniversalLayout& lay) {
+    const uint32_t tile = blk / (kDot8TileBytes / kDot8BlockBytes);
+    const uint32_t in_tile = blk % (kDot8TileBytes / kDot8BlockBytes);
+    return dot8_swizzle_tile(tile, row, lay) * kDot8TileBytes + in_tile * kDot8BlockBytes;
+}
+
+std::vector<uint8_t> dot8_swizzle_plane(const uint8_t* w_plane, const Dot8UniversalLayout& lay) {
+    std::vector<uint8_t> out(static_cast<size_t>(lay.w_plane_bytes()), 0);
+    if (!w_plane || !lay.ok()) return out;
+    for (uint64_t r = 0; r < lay.rows; ++r) {
+        const uint8_t* s = w_plane + r * lay.w_row_stride_bytes;
+        uint8_t* d = out.data() + r * lay.w_row_stride_bytes;
+        for (uint32_t t = 0; t < lay.w_tiles; ++t)
+            std::memcpy(d + dot8_swizzle_tile(t, r, lay) * kDot8TileBytes, s + static_cast<size_t>(t) * kDot8TileBytes,
+                        kDot8TileBytes);
+    }
+    return out;
+}
+
+std::vector<uint8_t> dot8_unswizzle_plane(const uint8_t* w_plane, const Dot8UniversalLayout& lay) {
+    std::vector<uint8_t> out(static_cast<size_t>(lay.w_plane_bytes()), 0);
+    if (!w_plane || !lay.ok()) return out;
+    for (uint64_t r = 0; r < lay.rows; ++r) {
+        const uint8_t* s = w_plane + r * lay.w_row_stride_bytes;
+        uint8_t* d = out.data() + r * lay.w_row_stride_bytes;
+        for (uint32_t t = 0; t < lay.w_tiles; ++t)  // the xor is its own inverse
+            std::memcpy(d + static_cast<size_t>(t) * kDot8TileBytes, s + dot8_swizzle_tile(t, r, lay) * kDot8TileBytes,
+                        kDot8TileBytes);
+    }
+    return out;
+}
+
+bool dot8_repack_universal_rows(const uint8_t* src, uint64_t src_row_stride_bytes, uint32_t sb_begin,
+                                const Dot8UniversalLayout& lay, uint64_t row_begin, uint64_t row_end,
+                                uint8_t* w_plane, uint8_t* s_plane, std::string* err) {
+    if (!lay.ok() || (lay.cols % kDot8SuperElems) != 0u) {
+        set_err(err, "dot8 universal: cols must be a positive multiple of 256");
+        return false;
+    }
+    if (row_begin > row_end || row_end > lay.rows) { set_err(err, "dot8 universal: bad row range"); return false; }
+    if (!src || !w_plane || (!lay.scale_embedded && !s_plane)) { set_err(err, "dot8 universal: null buffer"); return false; }
+    const uint32_t nsb = lay.cols / kDot8SuperElems;
+    const uint32_t nblk = lay.cols / kDot8BlockElems;
+    const bool iq3 = lay.w_raw_row_bytes == lay.cols / 2u && lay.s_raw_row_bytes == nsb * 8u;
+    const bool iq2 = lay.s_raw_row_bytes == nblk + nsb * 4u;
+    if (!iq3 && !iq2) { set_err(err, "dot8 universal: scale plane does not match the row"); return false; }
+    const uint32_t sb_bytes = iq3 ? kIq3xxsBlockBytes : kIq2sBlockBytes;
+    if ((static_cast<uint64_t>(sb_begin) + nsb) * sb_bytes > src_row_stride_bytes) {
+        set_err(err, "dot8 universal: sb_begin outside the source row");
+        return false;
+    }
+    uint8_t codes[32];
+    for (uint64_t r = row_begin; r < row_end; ++r) {
+        const uint8_t* srow = src + r * src_row_stride_bytes + static_cast<uint64_t>(sb_begin) * sb_bytes;
+        uint8_t* wrow = w_plane + r * lay.w_row_stride_bytes;
+        uint8_t* sc = lay.scale_embedded ? wrow + lay.s_offset_bytes : s_plane + r * lay.s_row_stride_bytes;
+        std::memset(wrow, 0, lay.w_row_stride_bytes);  // padding stays zero
+        if (!lay.scale_embedded) std::memset(sc, 0, lay.s_row_stride_bytes);
+        for (uint32_t b = 0; b < nblk; ++b) {
+            const uint8_t* blk = srow + static_cast<uint64_t>(b / 8u) * sb_bytes;
+            if (iq3) {
+                uint8_t s4 = 0;
+                if (!dot8_encode_iq3xxs_sub(blk, b % 8u, codes, &s4)) {
+                    set_err(err, "dot8 universal: IQ3_XXS grid byte outside the level set");
+                    return false;
+                }
+                dot8_pack_codes(codes, wrow + dot8_block_offset(b, r, lay));
+                const uint32_t sb = b / 8u;
+                if (b % 8u == 0u) {
+                    const float d = half_to_f32(rd16(blk));
+                    uint32_t dbits;
+                    std::memcpy(&dbits, &d, 4);
+                    wr32(sc + sb * 8u + 4u, dbits);
+                }
+                or32(sc + sb * 8u, static_cast<uint32_t>(s4) << (4u * (b % 8u)));
+            } else {
+                uint8_t s8 = 0;
+                if (!dot8_encode_iq2s_sub(blk, b % 8u, codes, &s8)) {
+                    set_err(err, "dot8 universal: IQ2_S grid byte outside the level set");
+                    return false;
+                }
+                dot8_pack_codes(codes, wrow + dot8_block_offset(b, r, lay));
+                const uint32_t sb = b / 8u;
+                if (b % 8u == 0u) {
+                    const float d = half_to_f32(rd16(blk));
+                    uint32_t dbits;
+                    std::memcpy(&dbits, &d, 4);
+                    wr32(sc + nblk + sb * 4u, dbits);
+                }
+                sc[b] = s8;  // low nibble: weights 0..15, high: 16..31
+            }
+        }
+    }
+    return true;
+}
+
+// =================================================================================================
+// CPU reference: repacked row -> FP32 (ggml IQ scale formulas) and FP32 row dot
+// =================================================================================================
+bool dot8_dequant_row_f32(const uint8_t* w_plane, const uint8_t* s_plane, const Dot8UniversalLayout& lay,
+                          uint64_t row, GgmlType src, float* out) {
+    if (!w_plane || !out || !lay.ok() || row >= lay.rows) return false;
+    const uint8_t* w_row = w_plane + row * lay.w_row_stride_bytes;
+    const uint8_t* s_row = lay.scale_embedded ? w_row + lay.s_offset_bytes
+                                              : (s_plane ? s_plane + row * lay.s_row_stride_bytes : nullptr);
+    if (!s_row) return false;
+    const uint32_t nblk = lay.cols / kDot8BlockElems;
+    const bool iq3 = src == GgmlType::IQ3_XXS;
+    float levels[32];
+    for (uint32_t b = 0; b < nblk; ++b) {
+        const uint8_t* blk = w_row + dot8_block_offset(b, row, lay);
+        for (uint32_t j = 0; j < 4u; ++j) {
+            const uint32_t w = rd32(blk + 4u * j);
+            const uint32_t lo = iq3 ? dot8_decode4_iq3(w & 0x0F0F0F0Fu) : dot8_decode4_iq2(w & 0x07070707u);
+            const uint32_t hi = iq3 ? dot8_decode4_iq3((w >> 4) & 0x0F0F0F0Fu) : dot8_decode4_iq2((w >> 4) & 0x07070707u);
+            for (uint32_t i = 0; i < 4u; ++i) {
+                levels[4u * j + i] = static_cast<float>(static_cast<int8_t>((lo >> (8u * i)) & 0xFFu));
+                levels[16u + 4u * j + i] = static_cast<float>(static_cast<int8_t>((hi >> (8u * i)) & 0xFFu));
+            }
+        }
+        float* y = out + static_cast<size_t>(b) * kDot8BlockElems;
+        if (iq3) {
+            const uint32_t sb = b / 8u;
+            const uint32_t s4 = (rd32(s_row + sb * 8u) >> (4u * (b % 8u))) & 0xFu;
+            float d;
+            const uint32_t dbits = rd32(s_row + sb * 8u + 4u);
+            std::memcpy(&d, &dbits, 4);
+            const float db = d * (0.5f + static_cast<float>(s4)) * 0.5f;
+            for (uint32_t i = 0; i < 32u; ++i) y[i] = db * levels[i];
+        } else {
+            const uint8_t s8 = s_row[b];
+            float d;
+            const uint32_t dbits = rd32(s_row + nblk + (b / 8u) * 4u);
+            std::memcpy(&d, &dbits, 4);
+            const float dlo = d * (0.5f + static_cast<float>(s8 & 0xFu)) * 0.25f;
+            const float dhi = d * (0.5f + static_cast<float>(s8 >> 4)) * 0.25f;
+            for (uint32_t i = 0; i < 16u; ++i) y[i] = dlo * levels[i];
+            for (uint32_t i = 16u; i < 32u; ++i) y[i] = dhi * levels[i];
+        }
+    }
+    return true;
+}
+
+double dot8_dot_row_f32(const uint8_t* w_plane, const uint8_t* s_plane, const Dot8UniversalLayout& lay,
+                        uint64_t row, GgmlType src, const float* x) {
+    if (!x || !lay.ok()) return 0.0;
+    std::vector<float> w(lay.cols);
+    if (!dot8_dequant_row_f32(w_plane, s_plane, lay, row, src, w.data())) return 0.0;
+    double acc = 0.0;
+    for (uint32_t i = 0; i < lay.cols; ++i) acc += static_cast<double>(w[i]) * static_cast<double>(x[i]);
+    return acc;
 }
 
 // =================================================================================================

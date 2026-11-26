@@ -204,6 +204,60 @@ void dot8_decode_row_iq2_int(const uint8_t* w_codes_row /* one tensor's blocks, 
                              uint32_t block_stride_bytes, int8_t* out);
 
 // ---------------------------------------------------------------------------------------------------
+// Universal single-tensor repacker (IQ3_XXS or IQ2_S) with TCC anti-camping rows
+// ---------------------------------------------------------------------------------------------------
+// One entry point for either source type, one tensor per call (no merged Gate+Up). Code blocks are
+// 16 B of IQ-ordered signed nibbles; the scale plane stays dense and linear. Row layout:
+//  * Odd256 (default): stride padded to an odd number of 256 B tiles, gcd(16, tiles) == 1, so 16
+//    consecutive rows start on 16 distinct channels with no swizzle and no extra cost when the row
+//    already is an odd tile count.
+//  * Xor16 (opt-in): stride padded to whole 16-tile groups and the 256 B code tiles permuted per row,
+//    phys_k_blk = k_blk ^ (row & 15)  (exact inverse: applying it twice returns k_blk). Whole groups
+//    keep the permutation inside the row, so the padding cost is the only price.
+// The scale plane is never embedded in an Xor16 row (the permutation would move it).
+enum class Dot8RowMode : uint32_t { Odd256 = 0, Xor16 = 1 };
+
+struct Dot8UniversalLayout {
+    Dot8RowMode mode = Dot8RowMode::Odd256;
+    uint64_t rows = 0;
+    uint32_t cols = 0;
+    uint32_t w_raw_row_bytes = 0;    // cols / 2 code bytes
+    uint32_t s_raw_row_bytes = 0;    // IQ3_XXS: 8 B / superblock; IQ2_S: 1 B / 32 + 4 B / 256
+    uint32_t w_row_stride_bytes = 0;
+    uint32_t s_row_stride_bytes = 0;
+    uint32_t w_tiles = 0;            // 256 B tiles per padded code row
+    bool scale_embedded = false;
+    uint32_t s_offset_bytes = 0;
+    uint64_t w_plane_bytes() const { return rows * w_row_stride_bytes; }
+    uint64_t s_plane_bytes() const { return scale_embedded ? 0ull : rows * s_row_stride_bytes; }
+    bool ok() const { return rows > 0 && cols > 0 && w_row_stride_bytes > 0; }
+};
+
+// Physical 256 B tile of logical tile k_blk for row `row`: k_blk ^ (row & 15) in Xor16 mode, identity
+// otherwise. Only k_blk < w_tiles is a valid input.
+uint32_t dot8_swizzle_tile(uint32_t k_blk, uint64_t row, const Dot8UniversalLayout& lay);
+// Byte offset of code block `blk` (cols / 32 of them) inside row `row` of the code plane.
+uint32_t dot8_block_offset(uint32_t blk, uint64_t row, const Dot8UniversalLayout& lay);
+
+Dot8UniversalLayout dot8_universal_layout(uint64_t rows, uint32_t cols, GgmlType src,
+                                          Dot8RowMode mode = Dot8RowMode::Odd256);
+// Row-wise swizzle / unswizzle of a whole code plane (rows x w_row_stride_bytes); exact inverses.
+std::vector<uint8_t> dot8_swizzle_plane(const uint8_t* w_plane, const Dot8UniversalLayout& lay);
+std::vector<uint8_t> dot8_unswizzle_plane(const uint8_t* w_plane, const Dot8UniversalLayout& lay);
+
+// Repack rows [row_begin, row_end) from IQ3_XXS (98 B / 256) or IQ2_S (82 B / 256) disk blocks.
+bool dot8_repack_universal_rows(const uint8_t* src, uint64_t src_row_stride_bytes, uint32_t sb_begin,
+                                const Dot8UniversalLayout& lay, uint64_t row_begin, uint64_t row_end,
+                                uint8_t* w_plane, uint8_t* s_plane, std::string* err = nullptr);
+
+// CPU reference of the plane layout: row `row` -> FP32 weights (ggml IQ scale formulas), and the FP32
+// row dot product. s_plane may be null when the scales are embedded in the code row.
+bool dot8_dequant_row_f32(const uint8_t* w_plane, const uint8_t* s_plane, const Dot8UniversalLayout& lay,
+                          uint64_t row, GgmlType src, float* out);
+double dot8_dot_row_f32(const uint8_t* w_plane, const uint8_t* s_plane, const Dot8UniversalLayout& lay,
+                        uint64_t row, GgmlType src, const float* x);
+
+// ---------------------------------------------------------------------------------------------------
 // Promotion planner
 // ---------------------------------------------------------------------------------------------------
 enum class Dot8Role : uint32_t { MoeDown = 0, MoeGateUp = 1, Other = 2 };

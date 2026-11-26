@@ -340,6 +340,8 @@ vj_test(test_gemv_q4a8_mn_ref)
 vj_test(test_q4_dot8)
 # v1.3 dot8 promotion: measured-bandwidth crossover rule (owner-supplied JSON table, N-rank pool).
 vj_test(test_v13_dot8_promo)
+# v1.3 universal IQ3_XXS / IQ2_S DOT8 repacker: odd-256B rows + XOR tile swizzle, CPU reference dot.
+vj_test(test_v13_dot8_universal)
 # ---- Radix prefix cache (KV blocks + recurrent-state snapshots) and B=1..8 continuous batching (serving_prefix_batching) ----
 target_sources(vegajet_core PRIVATE core/prefix_cache.cpp core/cont_batch.cpp)
 vj_test(test_prefix_batching)
