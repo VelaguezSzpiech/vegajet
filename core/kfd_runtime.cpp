@@ -194,6 +194,7 @@ Runtime::~Runtime() {
 }
 
 bool aql_wait_space(KfdAqlQueue& q, uint32_t keep_free, uint64_t timeout_us) {
+    if (q.ring_packets <= keep_free || !q.read_ptr || !q.write_ptr || !q.doorbell) return false;
     const uint64_t limit = static_cast<uint64_t>(q.ring_packets - keep_free);
     auto has_space = [&] { return q.next_write_idx - __atomic_load_n(q.read_ptr, __ATOMIC_ACQUIRE) < limit; };
     if (has_space()) return true;
@@ -769,7 +770,7 @@ bool Runtime::create_aql_queue(size_t gpu_idx) {
     if (!alloc_iso_userptr(2048ULL * 512ULL, 0u, q.kernarg_buf)) return false;
     q.kernarg_host     = q.kernarg_buf.host_ptr;
     q.kernarg_va       = q.kernarg_buf.va;
-    q.kernarg_capacity = 512;
+    q.kernarg_capacity = q.kernarg_buf.size;
     q.kernarg_slot     = 0;
 
     // 5. Create AQL Compute Queue
@@ -1500,11 +1501,23 @@ bool Runtime::enqueue_kernel(size_t gpu_idx, const LoadedKernel& kernel,
         std::fprintf(stderr, "[vegajet::kfd] enqueue GPU %zu rejected: wait for outstanding batch first\n", gpu_idx);
         return false;
     }
+    if (kernarg_bytes > 256 || (kernarg_bytes && !kernargs)) {
+        std::fprintf(stderr, "[vegajet::kfd] invalid kernargs GPU %zu (bytes=%zu)\n", gpu_idx, kernarg_bytes);
+        return false;
+    }
     const size_t hidden_off = align_up(kernarg_bytes, 8ULL);
     const size_t total_ka   = std::max<size_t>(hidden_off + 256, kernel.kernarg_size);
-    if (total_ka > 512) return false;
-
-    const uint32_t kslot = (q.kernarg_slot++) & 2047u;
+    if (total_ka > 512 || !q.kernarg_host || q.kernarg_slot >= q.kernarg_capacity / 512) {
+        std::fprintf(stderr, "[vegajet::kfd] kernarg capacity exhausted GPU %zu; submit and wait before reuse\n", gpu_idx);
+        return false;
+    }
+    // Reserve AQL space before touching either live kernargs or the allocation cursor.
+    if (!aql_wait_space(q, 2u, 5000000ULL)) {
+        std::fprintf(stderr, "[vegajet::kfd] AQL space timeout GPU %zu; runtime stopped\n", gpu_idx);
+        open_ = false;
+        return false;
+    }
+    const uint32_t kslot = q.kernarg_slot++;
     uint8_t* ka_dst_host = reinterpret_cast<uint8_t*>(q.kernarg_host) + static_cast<size_t>(kslot) * 512ULL;
     const uint64_t ka_dst_va = q.kernarg_va + static_cast<uint64_t>(kslot) * 512ULL;
 
@@ -1530,8 +1543,6 @@ bool Runtime::enqueue_kernel(size_t gpu_idx, const LoadedKernel& kernel,
     imp.remainder_z   = (block_z > 0) ? static_cast<uint16_t>(grid_z % block_z) : 0u;
     imp.grid_dims     = 3u;
     std::memcpy(ka_dst_host + hidden_off, &imp, sizeof(imp));
-
-    if (!aql_wait_space(q, 2u, 5000000ULL)) return false;
 
     const uint64_t idx  = q.next_write_idx++;
     const uint32_t slot = static_cast<uint32_t>(idx % q.ring_packets);
@@ -1567,7 +1578,11 @@ bool Runtime::submit_batch(size_t gpu_idx) {
     }
     if (q.next_write_idx == q.completed_write_idx) return true;
     if (dlog_fd_ >= 0) dprintf(dlog_fd_, "S rank=%zu upto_seq=%llu\n", gpu_idx, static_cast<unsigned long long>(dlog_seq_));
-    if (!aql_wait_space(q, 1u, 5000000ULL)) return false;
+    if (!aql_wait_space(q, 1u, 5000000ULL)) {
+        std::fprintf(stderr, "[vegajet::kfd] AQL fence space timeout GPU %zu; runtime stopped\n", gpu_idx);
+        open_ = false;
+        return false;
+    }
     __atomic_store_n(&q.completion_sig->value, 1LL, __ATOMIC_RELEASE);
 
     const uint64_t idx  = q.next_write_idx++;
@@ -1641,6 +1656,7 @@ bool Runtime::wait_idle(size_t gpu_idx, uint64_t timeout_us) {
     }
     q.submission_in_flight = false;
     q.completed_write_idx = q.next_write_idx;
+    q.kernarg_slot = 0;  // only a completed system fence retires kernarg ownership
     if (dlog_fd_ >= 0) dprintf(dlog_fd_, "C rank=%zu upto_seq=%llu\n", gpu_idx, static_cast<unsigned long long>(dlog_seq_));
     return true;
 }

@@ -100,6 +100,37 @@ struct RuntimeTestAccess {
         VJ_CHECK(!rt.wait_idle(0, 0) && !rt.open_);
         q = KfdAqlQueue{};
     }
+    static void kernarg_ownership() {
+        Runtime rt;
+        rt.open_ = true; rt.queues_.resize(1);
+        auto& q = rt.queues_[0];
+        std::vector<AqlDispatchPacket> ring(4096);
+        std::vector<uint8_t> args(2048 * 512, 0xa5);
+        uint64_t rptr = 0, wptr = 0, doorbell = 0;
+        AmdSignal signal{};
+        q.ring_buf.host_ptr = ring.data(); q.ring_packets = 4096;
+        q.read_ptr = &rptr; q.write_ptr = &wptr; q.doorbell = &doorbell;
+        q.completion_sig = &signal;
+        q.kernarg_host = args.data(); q.kernarg_capacity = args.size();
+        LoadedKernel kernel{};
+        uint64_t arg = 0x1234;
+        for (unsigned i = 0; i < 2048; ++i)
+            VJ_CHECK(rt.enqueue_kernel(0, kernel, 1, 1, 1, 1, 1, 1, &arg, sizeof(arg)));
+        const auto before = args;
+        arg = 0x5678;
+        VJ_CHECK(!rt.enqueue_kernel(0, kernel, 1, 1, 1, 1, 1, 1, &arg, sizeof(arg)));
+        VJ_CHECK(q.kernarg_slot == 2048 && q.next_write_idx == 2048 && args == before);
+        VJ_CHECK(rt.submit_batch(0));
+        signal.value = 0; rptr = q.next_write_idx;
+        VJ_CHECK(rt.wait_idle(0, 0) && q.kernarg_slot == 0);
+        VJ_CHECK(rt.enqueue_kernel(0, kernel, 1, 1, 1, 1, 1, 1, &arg, sizeof(arg)));
+        // AQL reservation failure must not mutate even the first byte or increment a cursor.
+        q.ring_packets = 1; q.kernarg_slot = 0;
+        const auto before_fail = args;
+        VJ_CHECK(!rt.enqueue_kernel(0, kernel, 1, 1, 1, 1, 1, 1, &arg, sizeof(arg)));
+        VJ_CHECK(q.kernarg_slot == 0 && args == before_fail && !rt.open_);
+        q = KfdAqlQueue{};
+    }
     static void reload_failure() {
         Runtime rt;
         rt.open_ = true;
@@ -123,5 +154,6 @@ int main() {
     vegajet::kfd::RuntimeTestAccess::reload_failure();
     vegajet::kfd::RuntimeTestAccess::mapping_ownership();
     vegajet::kfd::RuntimeTestAccess::completion_lifecycle();
+    vegajet::kfd::RuntimeTestAccess::kernarg_ownership();
     std::puts("runtime fail-closed tests PASS");
 }
