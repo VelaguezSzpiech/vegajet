@@ -8,16 +8,27 @@
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
+#include <thread>
+#include <chrono>
 #include <cerrno>
 #include <cstdarg>
 #include <cstdio>
 
 namespace {
-bool io_ok = false;
+bool io_ok = false, fake_devices = false;
+std::vector<uint32_t> allocation_owners, mapping_targets;
 uint32_t map_done = 0, unmap_done = 0;
 bool fail_unmap = false, fail_free = false;
 unsigned free_calls = 0;
 std::vector<uint32_t> unmapped;
+}
+extern "C" int __real_open(const char*, int, ...);
+extern "C" int __wrap_open(const char* path, int flags, ...) {
+    mode_t mode=0;
+    if (flags & O_CREAT) { va_list ap; va_start(ap,flags); mode=va_arg(ap,mode_t); va_end(ap); }
+    if (fake_devices && (std::string(path)=="/dev/kfd" || std::string(path).find("/dev/dri/renderD")==0))
+        return __real_open("/dev/zero",flags,mode);
+    return __real_open(path,flags,mode);
 }
 extern "C" int __wrap_ioctl(int, unsigned long op, ...) {
     va_list ap;
@@ -29,8 +40,11 @@ extern "C" int __wrap_ioctl(int, unsigned long op, ...) {
         static uint64_t handle = 1000;
         auto* a = static_cast<kfd_ioctl_alloc_memory_of_gpu_args*>(arg);
         a->handle = ++handle;
+        allocation_owners.push_back(a->gpu_id);
     } else if (op == AMDKFD_IOC_MAP_MEMORY_TO_GPU) {
         auto* a = static_cast<kfd_ioctl_map_memory_to_gpu_args*>(arg);
+        const auto* ids = reinterpret_cast<const uint32_t*>(a->device_ids_array_ptr);
+        mapping_targets.insert(mapping_targets.end(), ids, ids + a->n_devices);
         a->n_success = std::min(map_done, a->n_devices);
         if (a->n_success != a->n_devices) { errno = EIO; return -1; }
     } else if (op == AMDKFD_IOC_UNMAP_MEMORY_FROM_GPU) {
@@ -139,6 +153,52 @@ struct RuntimeTestAccess {
         VJ_CHECK(q.kernarg_slot == 0 && args == before_fail && !rt.open_);
         q = KfdAqlQueue{};
     }
+    static void mailbox_reset() {
+        Runtime rt;
+        rt.open_ = true; rt.devices_.resize(2); rt.queues_.resize(2);
+        AmdSignal signals[2]{};
+        for (size_t g=0;g<2;++g) rt.queues_[g].completion_sig = &signals[g];
+        rt.transport_ = AllReduceTransport::PeerBarP2P;
+        rt.p2p_payload_slices_.resize(2); rt.p2p_flag_slices_.resize(2);
+        std::vector<uint8_t> payload(2*kArGpuBytes,0xa5), flags(8192,0xa5);
+        for (size_t g=0;g<2;++g) {
+            rt.p2p_payload_slices_[g].size=kArGpuBytes;
+            rt.p2p_payload_slices_[g].host_ptr=payload.data()+g*kArGpuBytes;
+            rt.p2p_flag_slices_[g].size=4096;
+            rt.p2p_flag_slices_[g].host_ptr=flags.data()+g*4096;
+        }
+        rt.p2p_payload_slices_[1].host_ptr=nullptr;
+        std::string err;
+        VJ_CHECK(!rt.reset_allreduce_mailboxes(&err));
+        VJ_CHECK(rt.failed_ && !rt.open_ && flags[0]==0xa5 && payload[0]==0xa5);
+        rt.p2p_payload_slices_[1].host_ptr=payload.data()+kArGpuBytes;
+        rt.failed_=false; rt.open_=true;
+        signals[1].value=-1;
+        VJ_CHECK(!rt.reset_allreduce_mailboxes(&err) && flags[0]==0xa5 && payload[0]==0xa5);
+        rt.failed_=false; rt.open_=true;
+        signals[1].value=0; signals[0].value=1;
+        rt.queues_[0].submission_in_flight=true;
+        std::thread gpu([&] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            __atomic_store_n(&signals[0].value,0LL,__ATOMIC_RELEASE);
+        });
+        VJ_CHECK(rt.reset_allreduce_mailboxes(&err));
+        gpu.join();
+        VJ_CHECK(std::all_of(payload.begin(),payload.end(),[](auto v){return v==0;}));
+        VJ_CHECK(std::all_of(flags.begin(),flags.end(),[](auto v){return v==0;}));
+        rt.p2p_payload_slices_.clear(); rt.p2p_flag_slices_.clear();
+        rt.open_=false;
+        for (auto& q : rt.queues_) q=KfdAqlQueue{}; // normal init resets mailboxes before queue creation
+        // A missing CPU mmap must not leave peer mode enabled; the fully mapped host fallback is explicit.
+        rt.devices_[0].p2p_links_count=1;
+        rt.all_gpu_ids_={1,2};
+        rt.kfd_fd_=::open("/dev/zero",O_RDWR);
+        rt.va_cursor_=0x10000000000ULL; rt.va_limit_=0x20000000000ULL;
+        io_ok=true; map_done=unmap_done=32;
+        VJ_CHECK(rt.setup_allreduce_mailbox());
+        VJ_CHECK(rt.transport_==AllReduceTransport::HostPinnedUserptr && rt.mailbox_flag_buf_.host_ptr);
+        rt.shutdown(); io_ok=false; free_calls=0;
+    }
     static void exact_tp_selection() {
         namespace fs = std::filesystem;
         const auto root = fs::path(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : ".") /
@@ -148,6 +208,8 @@ struct RuntimeTestAccess {
             fs::create_directories(dir);
             std::ofstream(dir / "properties") << "gfx_target_version 90006\ndomain 0\nlocation_id " << ((3+64*i)<<8) << "\n";
             std::ofstream(dir / "gpu_id") << i+1;
+            fs::create_directories(dir / "mem_banks/0");
+            std::ofstream(dir / "mem_banks/0/properties") << "size_in_bytes " << (uint64_t{32} << 30) << "\n";
         }
         setenv("VJ_SYSFS_ROOT",root.c_str(),1);
         unsetenv("VJ_GPU_DEVICES");
@@ -159,6 +221,19 @@ struct RuntimeTestAccess {
         setenv("VJ_GPU_DEVICES","0000" ":03:00.0",1);
         VJ_CHECK(!rt.init(0,0,&err,2) && err.find("found 1") != std::string::npos);
         VJ_CHECK(rt.kfd_fd_ == -1 && rt.devices_.size() == 1 && rt.devices_[0].gpu_id == 1);
+        // Exercise the complete healthy init order with fake device fds and ioctls, not just helper logic.
+        setenv("VJ_GPU_DEVICES","0000" ":03:00.0,0000" ":43:00.0",1);
+        io_ok=true; fake_devices=true; map_done=unmap_done=32;
+        allocation_owners.clear(); mapping_targets.clear();
+        if (!rt.init(0,0,&err,2)) { std::fprintf(stderr,"healthy init: %s\n",err.c_str()); std::exit(1); }
+        VJ_CHECK(rt.open_ && rt.devices_.size()==2 && rt.all_gpu_ids_==std::vector<uint32_t>({1,2}));
+        VJ_CHECK(!allocation_owners.empty() && !mapping_targets.empty());
+        for (auto id : allocation_owners) VJ_CHECK(id==1 || id==2);
+        for (auto id : mapping_targets) VJ_CHECK(id==1 || id==2);
+        for (const auto& q : rt.queues_) VJ_CHECK(q.queue_active && q.kernarg_capacity==2048*512);
+        rt.shutdown();
+        VJ_CHECK(rt.queues_.empty() && rt.retained_buffers_.empty() && rt.kfd_fd_==-1);
+        io_ok=false; fake_devices=false; free_calls=0;
         unsetenv("VJ_SYSFS_ROOT"); unsetenv("VJ_GPU_DEVICES");
         fs::remove_all(root);
     }
@@ -208,5 +283,6 @@ int main() {
     vegajet::kfd::RuntimeTestAccess::completion_lifecycle();
     vegajet::kfd::RuntimeTestAccess::kernarg_ownership();
     vegajet::kfd::RuntimeTestAccess::exact_tp_selection();
+    vegajet::kfd::RuntimeTestAccess::mailbox_reset();
     std::puts("runtime fail-closed tests PASS");
 }

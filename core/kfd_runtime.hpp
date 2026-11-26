@@ -313,7 +313,7 @@ public:
     // GPU VA and size of the peer-mapped payload slice owned by `gpu_idx` (0 when the transport is not PEER_BAR_P2P).
     uint64_t p2p_payload_slice_va(size_t gpu_idx) const { return gpu_idx < p2p_payload_slices_.size() ? p2p_payload_slices_[gpu_idx].va : 0; }
     uint64_t p2p_payload_slice_bytes(size_t gpu_idx) const { return gpu_idx < p2p_payload_slices_.size() ? p2p_payload_slices_[gpu_idx].size : 0; }
-    void     reset_allreduce_mailboxes();
+    bool reset_allreduce_mailboxes(std::string* err = nullptr);
 
     const KfdBuffer& host_pinned_arena() const { return host_pinned_arena_; }
     bool alloc_userptr_pinned(uint64_t size, KfdBuffer& out, bool map_all_gpus = true);
@@ -391,6 +391,7 @@ private:
     uint64_t va_cursor_ = 0;
     uint64_t va_limit_  = 0;
     bool open_ = false;
+    bool failed_ = false;
 };
 
 } // namespace vegajet::kfd
