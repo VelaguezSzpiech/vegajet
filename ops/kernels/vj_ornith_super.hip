@@ -120,10 +120,43 @@ __device__ __forceinline__ uint32_t load_u32_glc(GPtr<const uint32_t> ptr) {
     return v;
 }
 
-__device__ __forceinline__ void grid_barrier_glc_only(GPtr<uint32_t> bar, uint32_t n_wgs, uint32_t sense) {
+// ---------------------------------------------------------------------------------------------
+// Fail-closed waits (v1.2 C1): a WG that exhausts its spin budget records a device fault in
+// host-visible memory (rank / barrier id / stage / epoch) and the caller returns from the kernel
+// immediately, so a stalled barrier or mailbox can never keep producing tokens. The healthy path is
+// untouched: two stores happen only on the timeout branch, and the spin budgets are unchanged.
+// Slot layout (3 x u32, one slot per rank, host-cleared before every step):
+//   [0] identity word: (0x56 << 24) | (kind << 16) | (bar_id << 8) | stage,  0 = clean
+//   [1] epoch: the sense/epoch value the WG was waiting for
+//   [2] rank: written once by the host at init
+// Mirrored by vegajet::guard in core/vj_device_guard.hpp.
+// ---------------------------------------------------------------------------------------------
+constexpr uint32_t kVjFaultTag     = 0x56u;
+constexpr uint32_t kVjFaultBarrier = 1u;
+constexpr uint32_t kVjFaultMailbox = 2u;
+
+struct FaultCtx {
+    uint64_t rec_va;   // 0 disables recording (one-shot self-tests)
+    uint32_t epoch;    // super_sense of this launch, profiling bit masked off
+};
+
+__device__ __forceinline__ void fault_record(FaultCtx fc, uint32_t kind, uint32_t bar_id,
+                                             uint32_t stage, uint32_t want) {
+    // Thread 0 only: every call site sits inside `if (threadIdx.x == 0u)`.
+    if (fc.rec_va == 0ULL) return;
+    const GPtr<volatile uint32_t> rec = as_gptr<volatile uint32_t>(fc.rec_va);
+    rec[1] = want;                                                              // epoch that was awaited
+    rec[0] = (kVjFaultTag << 24) | (kind << 16) | (bar_id << 8) | stage;         // identity, written last
+}
+
+// Returns false when the expected sense never arrived within the (unchanged) 5M spin budget.
+__device__ __forceinline__ bool grid_barrier_glc_only(GPtr<uint32_t> bar, uint32_t n_wgs, uint32_t sense,
+                                                     FaultCtx fc, uint32_t bar_id, uint32_t stage) {
+    __shared__ uint32_t sm_ok;
     asm volatile("s_waitcnt vmcnt(0)\n" ::: "memory");
     __syncthreads();
     if (threadIdx.x == 0u) {
+        bool ok = true;
         const uint32_t arr = __atomic_fetch_add(&bar[0], 1u, __ATOMIC_RELAXED) + 1u;
         if (arr == n_wgs) {
             __atomic_store_n(&bar[0], 0u, __ATOMIC_RELAXED);
@@ -135,15 +168,22 @@ __device__ __forceinline__ void grid_barrier_glc_only(GPtr<uint32_t> bar, uint32
                 if (load_u32_glc(&bar[16]) == sense) break;
                 __builtin_amdgcn_s_sleep(1);
             }
+            ok = (load_u32_glc(&bar[16]) == sense);
+            if (!ok) fault_record(fc, kVjFaultBarrier, bar_id, stage, sense);
         }
+        sm_ok = ok ? 1u : 0u;
     }
     __syncthreads();
+    return sm_ok != 0u;
 }
 
-__device__ __forceinline__ void grid_barrier_wbinvl1(GPtr<uint32_t> bar, uint32_t n_wgs, uint32_t sense) {
+__device__ __forceinline__ bool grid_barrier_wbinvl1(GPtr<uint32_t> bar, uint32_t n_wgs, uint32_t sense,
+                                                    FaultCtx fc, uint32_t bar_id, uint32_t stage) {
+    __shared__ uint32_t sm_ok;
     asm volatile("s_waitcnt vmcnt(0)\n" ::: "memory");
     __syncthreads();
     if (threadIdx.x == 0u) {
+        bool ok = true;
         const uint32_t arr = __atomic_fetch_add(&bar[0], 1u, __ATOMIC_RELAXED) + 1u;
         if (arr == n_wgs) {
             __atomic_store_n(&bar[0], 0u, __ATOMIC_RELAXED);
@@ -155,11 +195,29 @@ __device__ __forceinline__ void grid_barrier_wbinvl1(GPtr<uint32_t> bar, uint32_
                 if (load_u32_glc(&bar[16]) == sense) break;
                 __builtin_amdgcn_s_sleep(2);
             }
+            ok = (load_u32_glc(&bar[16]) == sense);
+            if (!ok) fault_record(fc, kVjFaultBarrier, bar_id, stage, sense);
         }
         asm volatile("buffer_wbinvl1\n" ::: "memory");
+        sm_ok = ok ? 1u : 0u;
     }
     __syncthreads();
+    return sm_ok != 0u;
 }
+
+// Fail-closed call sites: the kernel returns (stops emitting output) instead of continuing on stale data.
+#define VJ_SUPER_BAR(bar_expr, sense_expr, bar_id, stage_id)                                          \
+    do {                                                                                              \
+        if (!grid_barrier_wbinvl1((bar_expr), gridDim.x, (sense_expr), fctx, (bar_id), (stage_id))) { \
+            return;                                                                                   \
+        }                                                                                             \
+    } while (0)
+#define VJ_SUPER_BAR_N(bar_expr, n_wgs, sense_expr, bar_id, stage_id)                                 \
+    do {                                                                                              \
+        if (!grid_barrier_glc_only((bar_expr), (n_wgs), (sense_expr), fctx, (bar_id), (stage_id))) {   \
+            return;                                                                                   \
+        }                                                                                             \
+    } while (0)
 
 template<int Off>
 __device__ __forceinline__ uint32_t xor_shfl32_fast(uint32_t v) {
@@ -241,7 +299,7 @@ __device__ __forceinline__ void fast_softmax_top8_wave64(
 }
 
 // Bit-identical pre-pushed FP16 P2P AllReduce + Residual + RMSNorm + Q8 Quant (WG 0 only, M == 1).
-__device__ __forceinline__ void p2p_ar_prepush_m1(
+__device__ __forceinline__ bool p2p_ar_prepush_m1(
     GPtr<const float>    __restrict__ x_partial,
     GPtr<const uint16_t> __restrict__ local_rx,
     GPtr<uint32_t>       __restrict__ peer_flag,
@@ -254,24 +312,32 @@ __device__ __forceinline__ void p2p_ar_prepush_m1(
     float*               sm_red4,
     uint32_t D,
     uint32_t epoch,
-    float    eps) {
+    float    eps,
+    FaultCtx fc,
+    uint32_t stage) {
     const uint32_t tid  = threadIdx.x;
     const uint32_t wave = tid >> 6;
     const uint32_t lane = tid & 63u;
     const uint32_t n8   = D >> 3;
 
+    __shared__ uint32_t sm_wait_ok;
     if (tid == 0u) {
         if (peer_flag != nullptr) {
             __threadfence_system();
             __atomic_store_n(peer_flag, epoch, __ATOMIC_RELEASE);
         }
+        bool ok = false;
         #pragma nounroll
         for (uint32_t spin = 0u; spin < 5000000u; ++spin) {
-            if (load_u32_glc(local_flag) == epoch) break;
+            if (load_u32_glc(local_flag) == epoch) { ok = true; break; }
             __builtin_amdgcn_s_sleep(1);
         }
+        // Peer epoch never arrived: record it and let the caller drop out instead of reading stale rx.
+        if (!ok) fault_record(fc, kVjFaultMailbox, 0u, stage, epoch);
+        sm_wait_ok = ok ? 1u : 0u;
     }
     __syncthreads();
+    if (sm_wait_ok == 0u) return false;
 
     GPtr<const float4> xp4 = reinterpret_cast<GPtr<const float4>>(x_partial);
     GPtr<const uint4>  lr4 = reinterpret_cast<GPtr<const uint4>>(local_rx);
@@ -365,6 +431,7 @@ __device__ __forceinline__ void p2p_ar_prepush_m1(
             if ((tid & 3u) == 0u) x_ds_out[i >> 2] = make_float2(d, bsum);
         }
     }
+    return true;
 }
 
 // Persistent grid-strided VJ_Q4_A8 GEMV helper (exact bit-identical to ornith_gemv_q4a8_m1_w32_kernel!).
@@ -618,8 +685,10 @@ void ornith_m1_gdn_super_kernel(
     uint32_t ssm_ring_head,
     uint32_t use_ring,
     uint32_t super_sense,
-    uint32_t gdn_sense) {
+    uint32_t gdn_sense,
+    uint64_t fault_va) {
     using namespace vegajet::super_dev;
+    const FaultCtx fctx{fault_va, super_sense & 0x7FFFFFFFu};
     __shared__ uint4  sm_xq[256];
     __shared__ float2 sm_xds[128];
     __shared__ float  sm_q[128];
@@ -646,7 +715,7 @@ void ornith_m1_gdn_super_kernel(
     if (prev_ar_epoch != 0u) {
         if (wg == 0u) {
             const uint64_t rx_va = desc->ar_local_rx_base + static_cast<uint64_t>(prev_ar_epoch & 1u) * VJ_SUPER_AR_SLOT_BYTES;
-            p2p_ar_prepush_m1(
+            if (!p2p_ar_prepush_m1(
                 as_gptr<const float>(desc->x_partial),
                 as_gptr<const uint16_t>(rx_va),
                 nullptr,
@@ -657,9 +726,9 @@ void ornith_m1_gdn_super_kernel(
                 as_gptr<int8_t>(desc->x_q8),
                 as_gptr<float2>(desc->x_ds),
                 sm_fo,
-                desc->D, prev_ar_epoch, desc->eps);
+                desc->D, prev_ar_epoch, desc->eps, fctx, 0u)) return;
         }
-        grid_barrier_wbinvl1(sbar, gridDim.x, super_sense);
+        VJ_SUPER_BAR(sbar, super_sense, 0u, 1u);
         p_acc(0u);
     }
 
@@ -673,7 +742,7 @@ void ornith_m1_gdn_super_kernel(
             as_gptr<float>(desc->gdn_qkv_gab),
             nullptr, sm_xq, sm_xds, sm_fo,
             desc->qkv_rows, desc->qkv_cols, desc->qkv_qs_stride, desc->qkv_dm_stride);
-        grid_barrier_wbinvl1(sbar + 32u, gridDim.x, super_sense);
+        VJ_SUPER_BAR(sbar + 32u, super_sense, 1u, 2u);
         p_acc(1u);
     }
 
@@ -833,7 +902,7 @@ void ornith_m1_gdn_super_kernel(
         const float fo0 = sm_fo[l16 * 2u];
         const float fo1 = sm_fo[l16 * 2u + 1u];
         if (tid < 16u) stg_f32_stream(sq + part * 16u + tid, fo0 * fo0 + fo1 * fo1);
-        grid_barrier_glc_only(as_gptr<uint32_t>(desc->gdn_bar) + static_cast<uint64_t>(hv) * 32u, 4u, gdn_sense);
+        VJ_SUPER_BAR_N(as_gptr<uint32_t>(desc->gdn_bar) + static_cast<uint64_t>(hv) * 32u, 4u, gdn_sense, 8u, 3u);
 
         if (tid < 64u) {
             const float total_sq = wave64_sum(ldg_f32_stream(sq + tid));
@@ -867,7 +936,7 @@ void ornith_m1_gdn_super_kernel(
             }
         }
     }
-    grid_barrier_wbinvl1(sbar + 64u, gridDim.x, super_sense);
+    VJ_SUPER_BAR(sbar + 64u, super_sense, 2u, 4u);
     p_acc(2u);
 
     // ---- Stage 3: w_ssm_out GEMV [3072, 4096] + FP16 BAR0 prepush ----
@@ -900,8 +969,10 @@ void ornith_m1_gqa_super_kernel(
     uint32_t prev_ar_epoch,
     uint32_t out_ar_epoch,
     uint32_t pos0,
-    uint32_t super_sense) {
+    uint32_t super_sense,
+    uint64_t fault_va) {
     using namespace vegajet::super_dev;
+    const FaultCtx fctx{fault_va, super_sense & 0x7FFFFFFFu};
     __shared__ uint4  sm_xq[256];
     __shared__ float2 sm_xds[128];
     __shared__ float  sm_v[256];
@@ -929,7 +1000,7 @@ void ornith_m1_gqa_super_kernel(
     if (prev_ar_epoch != 0u) {
         if (wg == 0u) {
             const uint64_t rx_va = desc->ar_local_rx_base + static_cast<uint64_t>(prev_ar_epoch & 1u) * VJ_SUPER_AR_SLOT_BYTES;
-            p2p_ar_prepush_m1(
+            if (!p2p_ar_prepush_m1(
                 as_gptr<const float>(desc->x_partial),
                 as_gptr<const uint16_t>(rx_va),
                 nullptr,
@@ -940,9 +1011,9 @@ void ornith_m1_gqa_super_kernel(
                 as_gptr<int8_t>(desc->x_q8),
                 as_gptr<float2>(desc->x_ds),
                 sm_red,
-                desc->D, prev_ar_epoch, desc->eps);
+                desc->D, prev_ar_epoch, desc->eps, fctx, 0u)) return;
         }
-        grid_barrier_wbinvl1(sbar, gridDim.x, super_sense);
+        VJ_SUPER_BAR(sbar, super_sense, 0u, 1u);
         p_acc(4u);
     }
 
@@ -956,7 +1027,7 @@ void ornith_m1_gqa_super_kernel(
             as_gptr<float>(desc->attn_qkv),
             nullptr, sm_xq, sm_xds, sm_red,
             desc->qkv_rows, desc->qkv_cols, desc->qkv_qs_stride, desc->qkv_dm_stride);
-        grid_barrier_wbinvl1(sbar + 32u, gridDim.x, super_sense);
+        VJ_SUPER_BAR(sbar + 32u, super_sense, 1u, 2u);
         p_acc(5u);
     }
 
@@ -1031,7 +1102,7 @@ void ornith_m1_gqa_super_kernel(
                 if (sub == 0u) reinterpret_cast<GPtr<uint16_t>>(vc)[blk] = __half_as_ushort(__float2half(sc));
             }
         }
-        grid_barrier_wbinvl1(sbar + 64u, gridDim.x, super_sense);
+        VJ_SUPER_BAR(sbar + 64u, super_sense, 2u, 3u);
         p_acc(6u);
     }
 
@@ -1112,7 +1183,7 @@ void ornith_m1_gqa_super_kernel(
                 }
             }
         }
-        grid_barrier_wbinvl1(sbar + 96u, gridDim.x, super_sense);
+        VJ_SUPER_BAR(sbar + 96u, super_sense, 3u, 4u);
         p_acc(7u);
     }
 
@@ -1148,7 +1219,7 @@ void ornith_m1_gqa_super_kernel(
                 static_cast<int8_t>(max(-127, min(127, __float2int_rn(y_d * inv_d))));
             if (sub == 0u) as_gptr<float2>(desc->mid_ds)[static_cast<uint64_t>(wg) * 8u + blk] = make_float2(sc, bsum);
         }
-        grid_barrier_wbinvl1(sbar + 128u, gridDim.x, super_sense);
+        VJ_SUPER_BAR(sbar + 128u, super_sense, 4u, 5u);
         p_acc(8u);
     }
 
@@ -1182,8 +1253,10 @@ void ornith_m1_moe_super_kernel(
     const vegajet::ornith_super::MoeSuperDesc* __restrict__ desc,
     uint32_t ar_epoch,
     uint32_t out_ar_epoch,
-    uint32_t super_sense) {
+    uint32_t super_sense,
+    uint64_t fault_va) {
     using namespace vegajet::super_dev;
+    const FaultCtx fctx{fault_va, super_sense & 0x7FFFFFFFu};
     __shared__ uint32_t sm_grid32[1024]; // 4,096 B (half of sm_grid!)
     __shared__ uint4    sm_x[256];       // 4,096 B
     __shared__ float    sm_xd[128];      //   512 B
@@ -1203,7 +1276,7 @@ void ornith_m1_moe_super_kernel(
     // ---- Stage 0: Optional Post-Mixer Prepush FP16 AR (WG 0) overlapped with 4-KiB sm_grid32 LDS preload! ----
     if (ar_epoch != 0u && wg == 0u) {
         const uint64_t rx_va = desc->ar_local_rx_base + static_cast<uint64_t>(ar_epoch & 1u) * VJ_SUPER_AR_SLOT_BYTES;
-        p2p_ar_prepush_m1(
+        if (!p2p_ar_prepush_m1(
             as_gptr<const float>(desc->x_partial),
             as_gptr<const uint16_t>(rx_va),
             nullptr,
@@ -1214,14 +1287,14 @@ void ornith_m1_moe_super_kernel(
             as_gptr<int8_t>(desc->x_q8),
             as_gptr<float2>(desc->x_ds),
             sm_y,
-            desc->D, ar_epoch, desc->eps);
+            desc->D, ar_epoch, desc->eps, fctx, 0u)) return;
     }
     // Preload 4-KiB sm_grid32 into LDS ONLY on non-DOT8 (IQ2_S) layers!
     if (desc->w_gu_d8_w == 0ULL) {
         reinterpret_cast<uint4*>(sm_grid32)[tid] = reinterpret_cast<const uint4*>(vegajet::ggml_tables::iq2s_grid32)[tid];
     }
     if (ar_epoch != 0u) {
-        grid_barrier_wbinvl1(sbar, gridDim.x, super_sense);
+        VJ_SUPER_BAR(sbar, super_sense, 0u, 1u);
     } else {
         __syncthreads();
     }
@@ -1364,7 +1437,7 @@ void ornith_m1_moe_super_kernel(
                 }
             }
         }
-        grid_barrier_wbinvl1(sbar + 32u, gridDim.x, super_sense);
+        VJ_SUPER_BAR(sbar + 32u, super_sense, 1u, 2u);
         prof_acc(prof, 11u, t_p, prof_on);
     }
 
@@ -1489,7 +1562,7 @@ void ornith_m1_moe_super_kernel(
                 if (lane16 == 0u) as_gptr<float>(desc->sh_down_out)[row] = acc;
             }
         }
-        grid_barrier_wbinvl1(sbar + 96u, gridDim.x, super_sense);
+        VJ_SUPER_BAR(sbar + 96u, super_sense, 3u, 3u);
         prof_acc(prof, (desc->w_gu_d8_w != 0ULL) ? 15u : 13u, t_p, prof_on);
     }
 
@@ -1542,8 +1615,10 @@ void ornith_m1_moe_super_q3_kernel(
     const vegajet::ornith_super::MoeSuperDesc* __restrict__ desc,
     uint32_t ar_epoch,
     uint32_t out_ar_epoch,
-    uint32_t super_sense) {
+    uint32_t super_sense,
+    uint64_t fault_va) {
     using namespace vegajet::super_dev;
+    const FaultCtx fctx{fault_va, super_sense & 0x7FFFFFFFu};
     __shared__ uint4   sm_x[256];   // 4,096 B
     __shared__ float   sm_xd[128];  //   512 B
     __shared__ float   sm_y[32];    //   128 B
@@ -1568,7 +1643,7 @@ void ornith_m1_moe_super_q3_kernel(
     if (ar_epoch != 0u) {
         if (wg == 0u) {
             const uint64_t rx_va = desc->ar_local_rx_base + static_cast<uint64_t>(ar_epoch & 1u) * VJ_SUPER_AR_SLOT_BYTES;
-            p2p_ar_prepush_m1(
+            if (!p2p_ar_prepush_m1(
                 as_gptr<const float>(desc->x_partial),
                 as_gptr<const uint16_t>(rx_va),
                 nullptr,
@@ -1579,9 +1654,9 @@ void ornith_m1_moe_super_q3_kernel(
                 as_gptr<int8_t>(desc->x_q8),
                 as_gptr<float2>(desc->x_ds),
                 sm_y,
-                desc->D, ar_epoch, desc->eps);
+                desc->D, ar_epoch, desc->eps, fctx, 0u)) return;
         }
-        grid_barrier_wbinvl1(sbar, gridDim.x, super_sense);
+        VJ_SUPER_BAR(sbar, super_sense, 0u, 1u);
         p_acc(10u);
     }
 
@@ -1687,7 +1762,7 @@ void ornith_m1_moe_super_q3_kernel(
                 __syncthreads();
             }
         }
-        grid_barrier_wbinvl1(sbar + 32u, gridDim.x, super_sense);
+        VJ_SUPER_BAR(sbar + 32u, super_sense, 1u, 2u);
         p_acc(11u);
     }
 
@@ -1793,7 +1868,7 @@ void ornith_m1_moe_super_q3_kernel(
                 if (lane16 == 0u) as_gptr<float>(desc->sh_down_out)[row] = acc;
             }
         }
-        grid_barrier_wbinvl1(sbar + 96u, gridDim.x, super_sense);
+        VJ_SUPER_BAR(sbar + 96u, super_sense, 3u, 3u);
         p_acc(15u);
     }
 

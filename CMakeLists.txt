@@ -269,6 +269,8 @@ vj_test(test_sharder)
 vj_test(test_topology_planner)
 vj_test(test_grid_planner)
 vj_test(test_hsaco_gate)
+# v1.2 C1/C3: device fault-record decoding + token-id bounds guard (host side).
+vj_test(test_device_guard)
 # ---- Pre-tokenizer families + SPM, Jinja-subset chat templates, full sampler stack (core_tokenizer_samplers) ----
 target_sources(vegajet_core PRIVATE core/pretok_families.cpp core/chat_template.cpp core/sampler_stack.cpp)
 vj_test(test_tokenizer_samplers)

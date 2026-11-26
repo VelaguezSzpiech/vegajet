@@ -32,6 +32,7 @@
 #include <atomic>
 #include <algorithm>
 #include "core/vj_check.hpp"
+#include "core/vj_device_guard.hpp"
 #include "ops/kernels/vj_ornith_super_desc.hpp"
 #include <chrono>
 #include <cmath>
@@ -1671,6 +1672,15 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
     const uint64_t df_io_val_va1 = df_io_val_va0 + kDfTopkStride;          // +512 KiB
     const uint64_t df_io_id_va0  = df_io_val_va1 + kDfTopkStride;          // +768 KiB
     const uint64_t df_io_id_va1  = df_io_id_va0  + kDfTopkStride;          // +1024 KiB (ends at 2.25 MiB < 4 MiB)
+    // v1.2 C1: one 16 B device-fault slot per rank at 3.5 MiB (above the DFlash2 slices and lru_top at
+    // 3 MiB+48 KiB, below the 4 MiB end). Host-visible, zeroed by the allocator, rank stamped once.
+    constexpr uint64_t kFaultIoBase = 3670016ULL;
+    auto* io_fault_host = reinterpret_cast<uint32_t*>(io_host_u8 + kFaultIoBase);
+    const uint64_t io_fault_va[2] = {io_buf.va + kFaultIoBase,
+                                     io_buf.va + kFaultIoBase + guard::kFaultSlotBytes};
+    for (size_t g = 0; g < 2; ++g) {
+        io_fault_host[g * guard::kFaultWords + guard::kFaultWRank] = static_cast<uint32_t>(g);
+    }
     auto* df_io_gate_host = reinterpret_cast<float*>(io_host_u8 + kDfIoBase + 98304ULL);
     auto* df_io_val_host0 = reinterpret_cast<float*>(io_host_u8 + kDfIoBase + 262144ULL);
     auto* df_io_val_host1 = reinterpret_cast<float*>(io_host_u8 + kDfIoBase + 262144ULL + kDfTopkStride);
@@ -2120,10 +2130,35 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         st_last = now;
     };
 
+    // v1.2 C1: fail-closed barrier / peer-mailbox faults. The super-kernels stop as soon as a spin budget runs
+    // out and leave a record in io_fault_host. Every step re-arms both slots and, once the queues have drained,
+    // any record becomes a sticky host error so no token can ever be produced from a wedged grid.
+    bool device_faulted = false;
+    auto device_fault_check = [&](const char* where) -> bool {
+        for (size_t g = 0; g < 2; ++g) {
+            const uint32_t* slot = io_fault_host + g * guard::kFaultWords;
+            if (!guard::fault_seen(slot)) continue;
+            device_faulted = true;
+            if (res.error.empty()) {
+                res.error = std::string("device fault during ") + where + ": " + guard::fault_describe(slot);
+                std::fprintf(stderr, "[ornith::gpu] DEVICE FAULT: %s\n", res.error.c_str());
+            }
+            return true;
+        }
+        return false;
+    };
+
     auto step_batch = [&](const std::vector<int32_t>& toks, uint32_t pos0,
                           bool use_wy, bool use_ring, bool compute_logits,
                           bool capture_dflash_taps = false) -> std::vector<int32_t> {
         const uint32_t M = static_cast<uint32_t>(toks.size());
+        // v1.2 C1: a funneled fault stops the run instead of re-dispatching onto a poisoned barrier arena.
+        // Callers still index preds[0]/preds.back(), so hand back inert -1 ids: no GPU work runs and
+        // res.error is already set, which keeps the run on the error path.
+        if (device_faulted) return std::vector<int32_t>(M, -1);
+        // A fault raised by a dispatch queued outside step_batch (stage-profiler path) is caught here.
+        if (device_fault_check("previous dispatch")) return std::vector<int32_t>(M, -1);
+        for (size_t g = 0; g < 2; ++g) guard::fault_clear(io_fault_host + g * guard::kFaultWords);
         if (st_on) st_last = std::chrono::steady_clock::now();
         std::memcpy(io_toks_host, toks.data(), M * sizeof(int32_t));
         __atomic_thread_fence(__ATOMIC_RELEASE);
@@ -2305,43 +2340,49 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                     const uint32_t gi = gdn_idx++;
                     ++super_sense;
                     ++gdn_sense;
-                    struct GdnSupKA {
+                    struct GdnSupKA {  // field order == ornith_m1_gdn_super_kernel parameter order
                         uint64_t desc, sring_ov;
                         uint32_t prev_ep, out_ep, cin, cout, shead, uring, ssense, gsense;
+                        uint64_t fault;
                     };
+                    static_assert(sizeof(GdnSupKA) == 56u, "kernarg ABI drift");
                     for (size_t g = 0; g < 2; ++g) {
                         const uint64_t s_ov = opt.spec_gdn
                             ? (S[g].spec_gdn_s_slot_va[spec_gdn_active] + static_cast<uint64_t>(gi) * s_layer_bytes) : 0ULL;
                         const GdnSupKA ka{
                             S[g].gdn_super_desc_va + static_cast<uint64_t>(gi) * sizeof(ornith_super::GdnSuperDesc),
-                            s_ov, prev_ep, attn_ep, c_in_slot, c_out_slot, s_rhead, s_uring, super_sense, gdn_sense
+                            s_ov, prev_ep, attn_ep, c_in_slot, c_out_slot, s_rhead, s_uring, super_sense, gdn_sense, io_fault_va[g]
                         };
                         VJ_CHECK(rt.enqueue_kernel(g, *K[g].m1_gdn_super, super_wgs * 256u, 1, 1, 256, 1, 1, &ka, sizeof(ka), true));
                     }
                 } else {
                     const uint32_t ai = attn_idx++;
                     ++super_sense;
-                    struct GqaSupKA {
+                    struct GqaSupKA {  // field order == ornith_m1_gqa_super_kernel parameter order
                         uint64_t desc;
                         uint32_t prev_ep, out_ep, pos0, ssense;
+                        uint64_t fault;
                     };
+                    static_assert(sizeof(GqaSupKA) == 32u, "kernarg ABI drift");
                     for (size_t g = 0; g < 2; ++g) {
                         const GqaSupKA ka{
                             S[g].gqa_super_desc_va + static_cast<uint64_t>(ai) * sizeof(ornith_super::GqaSuperDesc),
-                            prev_ep, attn_ep, pos0, super_sense
+                            prev_ep, attn_ep, pos0, super_sense, io_fault_va[g]
                         };
                         VJ_CHECK(rt.enqueue_kernel(g, *K[g].m1_gqa_super, super_wgs * 256u, 1, 1, 256, 1, 1, &ka, sizeof(ka), true));
                     }
                 }
                 ++super_sense;
-                struct MoeSupKA {
+                struct MoeSupKA {  // field order == ornith_m1_moe_super[_q3]_kernel parameter order
                     uint64_t desc;
                     uint32_t ar_ep, out_ep, ssense;
+                    uint64_t fault;
                 };
+                static_assert(sizeof(MoeSupKA) == 32u, "kernarg ABI drift");
                 for (size_t g = 0; g < 2; ++g) {
                     const MoeSupKA ka{
                         S[g].moe_super_desc_va + static_cast<uint64_t>(il) * sizeof(ornith_super::MoeSuperDesc),
-                        attn_ep, moe_ep, super_sense
+                        attn_ep, moe_ep, super_sense, io_fault_va[g]
                     };
                     const bool use_q3_k = allow_q3_fast && (super_wgs == 240u) && K[g].m1_moe_super_q3 &&
                                           (layers[g][il].w_gu_d8_w_va != 0ULL) &&
@@ -3029,6 +3070,8 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
 
         VJ_CHECK(rt.submit_batch(0) && rt.submit_batch(1));
         VJ_CHECK(rt.wait_idle(0)    && rt.wait_idle(1));
+        // v1.2 C1: both queues drained -> a recorded barrier/mailbox fault invalidates this step's logits.
+        if (device_fault_check("decode step")) return std::vector<int32_t>(M, -1);
 
         // Update Dynamic LRU MoE Gate+Up cache on M >= 4 verify passes (~10.8 us/expert on-GPU repack!).
         const bool lru_active_now = (lru_cache && std::getenv("VEGAJET_MOE_LRU") != nullptr && std::atoi(std::getenv("VEGAJET_MOE_LRU")) > 0);
@@ -4074,28 +4117,31 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                             const uint32_t pep = pend_ep, aep = ar_epoch++, mep = ar_epoch++;
                             if (layers[0][il].is_gdn) {
                                 const uint32_t cgi = gi++; ++super_sense; ++gdn_sense;
-                                struct GdnSupKA { uint64_t desc, ov; uint32_t pep, oep, cin, cout, sh, ur, ss, gs; };
+                                struct GdnSupKA { uint64_t desc, ov; uint32_t pep, oep, cin, cout, sh, ur, ss, gs; uint64_t fault; };
+                                static_assert(sizeof(GdnSupKA) == 56u, "kernarg ABI drift");
                                 const uint64_t s_layer_bytes = 32ULL * 128ULL * 128ULL * 4ULL;
                                 const uint32_t s_rhead = opt.spec_gdn ? 0u : ring_head;
                                 for (size_t g = 0; g < 2; ++g) {
                                     const uint64_t s_ov = opt.spec_gdn
                                         ? (S[g].spec_gdn_s_slot_va[spec_gdn_active] + static_cast<uint64_t>(cgi) * s_layer_bytes) : 0ULL;
-                                    const GdnSupKA ka{S[g].gdn_super_desc_va + cgi * sizeof(ornith_super::GdnSuperDesc), s_ov, pep, aep, cin, cout, s_rhead, 0u, super_sense | 0x80000000u, gdn_sense};
+                                    const GdnSupKA ka{S[g].gdn_super_desc_va + cgi * sizeof(ornith_super::GdnSuperDesc), s_ov, pep, aep, cin, cout, s_rhead, 0u, super_sense | 0x80000000u, gdn_sense, io_fault_va[g]};
                                     VJ_CHECK(rt.enqueue_kernel(g, *K[g].m1_gdn_super, swgs * 256u, 1, 1, 256, 1, 1, &ka, sizeof(ka), true));
                                 }
                             } else {
                                 const uint32_t cai = ai++; ++super_sense;
-                                struct GqaSupKA { uint64_t desc; uint32_t pep, oep, pos0, ss; };
+                                struct GqaSupKA { uint64_t desc; uint32_t pep, oep, pos0, ss; uint64_t fault; };
+                                static_assert(sizeof(GqaSupKA) == 32u, "kernarg ABI drift");
                                 for (size_t g = 0; g < 2; ++g) {
-                                    const GqaSupKA ka{S[g].gqa_super_desc_va + cai * sizeof(ornith_super::GqaSuperDesc), pep, aep, 1u, super_sense | 0x80000000u};
+                                    const GqaSupKA ka{S[g].gqa_super_desc_va + cai * sizeof(ornith_super::GqaSuperDesc), pep, aep, 1u, super_sense | 0x80000000u, io_fault_va[g]};
                                     VJ_CHECK(rt.enqueue_kernel(g, *K[g].m1_gqa_super, swgs * 256u, 1, 1, 256, 1, 1, &ka, sizeof(ka), true));
                                 }
                             }
                             stamp(0, tidx); stamp(1, tidx); ++tidx;
                             ++super_sense;
-                            struct MoeSupKA { uint64_t desc; uint32_t aep, oep, ss; };
+                            struct MoeSupKA { uint64_t desc; uint32_t aep, oep, ss; uint64_t fault; };
+                            static_assert(sizeof(MoeSupKA) == 32u, "kernarg ABI drift");
                             for (size_t g = 0; g < 2; ++g) {
-                                const MoeSupKA ka{S[g].moe_super_desc_va + il * sizeof(ornith_super::MoeSuperDesc), aep, mep, super_sense | 0x80000000u};
+                                const MoeSupKA ka{S[g].moe_super_desc_va + il * sizeof(ornith_super::MoeSuperDesc), aep, mep, super_sense | 0x80000000u, io_fault_va[g]};
                                 const bool use_q3_k = allow_q3_fast && (swgs == 240u) && K[g].m1_moe_super_q3 &&
                                                       (layers[g][il].w_gu_d8_w_va != 0ULL) &&
                                                       (layers[g][il].gu_d8_w_stride == 2304u);
@@ -5090,6 +5136,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                         hdr ? (100.0 * hacc / hdr) : 0.0);
             if (df_hyb_tps > best_spec_tps) { best_spec_tps = df_hyb_tps; spec_eq = eqh; spec_tot = static_cast<uint32_t>(raw128.size()); spec_fd = fdh; }
             if (eqp != raw_prose.size() || eqc != raw128.size() || eqh != raw128.size()) all_lossless = false;
+
             read_hwmon_max(pass_pwr, pass_tmem);
             max_pwr = std::max(max_pwr, pass_pwr); max_tmem = std::max(max_tmem, pass_tmem);
         }
@@ -5385,6 +5432,9 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         return res;
     }
     if (!telem_ok) { res.error = "power/thermal telemetry gate failed (see [TELEM])"; return res; }
+    device_fault_check("run end");   // catches a fault from a dispatch queued outside step_batch
+    // v1.2 C1: a fail-closed device fault is never reported as a clean run, even if the caller kept going.
+    if (device_faulted) return res;
     res.ok = true;
     return res;
 }
@@ -6121,10 +6171,11 @@ int run_ornith_gemv_ab_bench(const std::string& hsaco_dir) {
             }
             VJ_CHECK(rt.upload_to_vram(0, mdesc_va, mds.data(), mds.size() * sizeof(ornith_super::MoeSuperDesc)));
             uint32_t s_sense = 1u;
-            struct MoeSupKA { uint64_t desc; uint32_t ar_ep, out_ep, ssense; };
+            struct MoeSupKA { uint64_t desc; uint32_t ar_ep, out_ep, ssense; uint64_t fault; };
+            static_assert(sizeof(MoeSupKA) == 32u, "kernarg ABI drift");
             // 1-layer check first!
             {
-                const MoeSupKA ka{mdesc_va, 0u, 0u, s_sense++};
+                const MoeSupKA ka{mdesc_va, 0u, 0u, s_sense++, 0ULL};
                 VJ_CHECK(rt.enqueue_kernel(0, *k_moe_sup, 192u * 256u, 1, 1, 256, 1, 1, &ka, sizeof(ka), true));
                 VJ_CHECK(rt.submit_batch(0) && rt.wait_idle(0));
                 VJ_CHECK(rt.download_from_vram(0, cur_out.data(), out_va, kD * 4u));
@@ -6136,7 +6187,7 @@ int run_ornith_gemv_ab_bench(const std::string& hsaco_dir) {
                 std::printf("  [SUPER-B 192-WG vs F0+B0] bit_exact=%u/%u max_abs_diff=%.3e\n", exact, kD, mdiff);
             }
             time48("(SUPER-B) 192-WG fused Front+Back (g32, 0 AR)", front_mb + back_mb, [&](uint32_t b) {
-                const MoeSupKA ka{mdesc_va + static_cast<uint64_t>(b) * sizeof(ornith_super::MoeSuperDesc), 0u, 0u, s_sense++};
+                const MoeSupKA ka{mdesc_va + static_cast<uint64_t>(b) * sizeof(ornith_super::MoeSuperDesc), 0u, 0u, s_sense++, 0ULL};
                 VJ_CHECK(rt.enqueue_kernel(0, *k_moe_sup, 192u * 256u, 1, 1, 256, 1, 1, &ka, sizeof(ka), true));
             });
 
@@ -6208,8 +6259,9 @@ int run_ornith_gemv_ab_bench(const std::string& hsaco_dir) {
                 gd.super_bar = sbar_va; gd.D = kD; gd.nk = 8u; gd.nv = 32u;
                 gd.conv_dim = 6144u; gd.z_off = 6144u; gd.alpha_off = 10240u; gd.beta_off = 10272u; gd.eps = 1e-6f;
                 VJ_CHECK(rt.upload_to_vram(0, gd_va, &gd, sizeof(gd)));
-                struct GdnSupKA { uint64_t desc, sring_ov; uint32_t prev_ep, out_ep, cin, cout, shead, uring, ssense, gsense; };
-                const GdnSupKA gska{gd_va, 0ULL, 0u, 0u, 0u, 1u, 0u, 0u, s_sense++, g_sense++};
+                struct GdnSupKA { uint64_t desc, sring_ov; uint32_t prev_ep, out_ep, cin, cout, shead, uring, ssense, gsense; uint64_t fault; };
+                static_assert(sizeof(GdnSupKA) == 56u, "kernarg ABI drift");
+                const GdnSupKA gska{gd_va, 0ULL, 0u, 0u, 0u, 1u, 0u, 0u, s_sense++, g_sense++, 0ULL};
                 VJ_CHECK(rt.enqueue_kernel(0, *k_gdn_sup, 192u * 256u, 1, 1, 256, 1, 1, &gska, sizeof(gska), true));
                 VJ_CHECK(rt.submit_batch(0) && rt.wait_idle(0));
                 VJ_CHECK(rt.download_from_vram(0, cur_out.data(), out_va, kD * 4u));
@@ -6258,8 +6310,9 @@ int run_ornith_gemv_ab_bench(const std::string& hsaco_dir) {
                 qa.w_o_qs = w_out_q; qa.w_o_dm = w_out_d; qa.o_rows = kD; qa.o_cols = mid_c; qa.o_qs_stride = out_st;
                 qa.super_bar = sbar_va; qa.D = kD; qa.eps = 1e-6f;
                 VJ_CHECK(rt.upload_to_vram(0, qa_va, &qa, sizeof(qa)));
-                struct GqaSupKA { uint64_t desc; uint32_t prev_ep, out_ep, pos0, ssense; };
-                const GqaSupKA qska{qa_va, 0u, 0u, pos0, s_sense++};
+                struct GqaSupKA { uint64_t desc; uint32_t prev_ep, out_ep, pos0, ssense; uint64_t fault; };
+                static_assert(sizeof(GqaSupKA) == 32u, "kernarg ABI drift");
+                const GqaSupKA qska{qa_va, 0u, 0u, pos0, s_sense++, 0ULL};
                 VJ_CHECK(rt.enqueue_kernel(0, *k_gqa_sup, 192u * 256u, 1, 1, 256, 1, 1, &qska, sizeof(qska), true));
                 VJ_CHECK(rt.submit_batch(0) && rt.wait_idle(0));
                 VJ_CHECK(rt.download_from_vram(0, cur_out.data(), out_va, kD * 4u));
