@@ -915,3 +915,109 @@ void ornith_gemm_q4a8_m16_l2_kernel(
     }
 }
 
+
+// ============================================================================
+// 4g. NARROW multi-column verify GEMV: M = 2..16 draft rows (VEGAJET_V12_NARROW_VERIFY=1, default off).
+//     One warp per output row, lane = block index modulo 32, weight block dequantised ONCE and dotted with
+//     all M draft rows (M + 1 FMAs per block instead of M complete passes), no LDS staging and no
+//     __syncthreads in the K loop: x_q8/x_ds rows are re-read from the (L1/L2 resident) x buffer instead.
+//
+//     Per-row accumulation order is exactly the M=1 decode order, so verify rows stay bit-identical to a
+//     raw M=1 pass:
+//       * lane l owns blocks l, l+32, l+64, ... in ascending order (cols/32 = 96 or 128 -> 3 or 4 blocks);
+//       * one `acc = fmaf(wd*xds.x, (float)dp, fmaf(wm, xds.y, acc))` per block, dp = the 8-step sdot4
+//         chain low-nibbles-then-high over the block's 16 weight bytes and 32 x bytes;
+//       * final reduction = ornith_dev::block32_sum over the 32 lanes.
+//     That is the order of ornith_gemv_q4a8_m1_w32_kernel (M=1 dense decode) and of the super-kernel's
+//     gemv_q4a8_persistent helper (M=1 ENABLE_SUPER=1 path), which are already documented as bit-identical
+//     to each other. cols == 512 is excluded by the host: M=1 uses the 16-lane w16 tree there.
+// ============================================================================
+extern "C" __global__ __launch_bounds__(256, 4)
+void ornith_gemv_q4a8_mn_kernel(
+    const uint8_t*  __restrict__ w_qs,
+    const uint32_t* __restrict__ w_dm,
+    const int8_t*   __restrict__ x_q8,
+    const float2*   __restrict__ x_ds,
+    float*          __restrict__ y_out,
+    uint32_t rows,
+    uint32_t cols,
+    uint32_t M,
+    uint32_t row_stride_bytes,
+    uint16_t*       __restrict__ peer_tx) {
+    if (M < 2u || M > 16u || (cols & 31u) != 0u) return;
+    const uint32_t grp  = threadIdx.x >> 5;  // 0..7 (8 rows/WG, as in the M=1 GEMV)
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t row  = blockIdx.x * 8u + grp;
+    if (row >= rows) return;
+
+    const uint32_t nb = cols >> 5;                       // 96 for 3072, 128 for 4096
+    const uint4*    w4 = reinterpret_cast<const uint4*>(w_qs + static_cast<uint64_t>(row) * row_stride_bytes);
+    const uint32_t* dm = w_dm + static_cast<uint64_t>(row) * nb;
+    const uint4*    x4 = reinterpret_cast<const uint4*>(x_q8);   // per token row: cols bytes = cols/16 uint4
+    const uint32_t  xrow4 = cols >> 4;
+
+    float acc[16];
+    #pragma unroll
+    for (uint32_t k = 0u; k < 16u; ++k) acc[k] = 0.0f;
+
+    #pragma nounroll
+    for (uint32_t b = lane; b < nb; b += 32u) {
+        const uint4    wv  = vegajet::ornith_dev::ldg_u32x4_stream(w4 + b);
+        const uint32_t dmv = vegajet::ornith_dev::ldg_u32_stream(dm + b);
+        const uint32_t wl0 = wv.x & 0x0F0F0F0Fu, wh0 = (wv.x >> 4) & 0x0F0F0F0Fu;
+        const uint32_t wl1 = wv.y & 0x0F0F0F0Fu, wh1 = (wv.y >> 4) & 0x0F0F0F0Fu;
+        const uint32_t wl2 = wv.z & 0x0F0F0F0Fu, wh2 = (wv.z >> 4) & 0x0F0F0F0Fu;
+        const uint32_t wl3 = wv.w & 0x0F0F0F0Fu, wh3 = (wv.w >> 4) & 0x0F0F0F0Fu;
+        const float    wd  = vegajet::ornith_dev::fp16_to_f32(static_cast<uint16_t>(dmv & 0xFFFFu));
+        const float    wm  = vegajet::ornith_dev::fp16_to_f32(static_cast<uint16_t>(dmv >> 16));
+        #pragma unroll
+        for (uint32_t t = 0u; t < 16u; ++t) {
+            if (t < M) {
+                const uint4  xa  = x4[static_cast<uint64_t>(t) * xrow4 + b * 2u];
+                const uint4  xb  = x4[static_cast<uint64_t>(t) * xrow4 + b * 2u + 1u];
+                const float2 xds = x_ds[static_cast<uint64_t>(t) * nb + b];
+                int32_t dp = vegajet::ornith_dev::sdot4(wl0, xa.x, 0);
+                dp         = vegajet::ornith_dev::sdot4(wl1, xa.y, dp);
+                dp         = vegajet::ornith_dev::sdot4(wl2, xa.z, dp);
+                dp         = vegajet::ornith_dev::sdot4(wl3, xa.w, dp);
+                dp         = vegajet::ornith_dev::sdot4(wh0, xb.x, dp);
+                dp         = vegajet::ornith_dev::sdot4(wh1, xb.y, dp);
+                dp         = vegajet::ornith_dev::sdot4(wh2, xb.z, dp);
+                dp         = vegajet::ornith_dev::sdot4(wh3, xb.w, dp);
+                acc[t] = fmaf(wd * xds.x, static_cast<float>(dp), fmaf(wm, xds.y, acc[t]));
+            }
+        }
+    }
+
+    __shared__ float sm_pp[16 * 8];
+    const bool do_pp = (peer_tx != nullptr && (rows & 7u) == 0u);
+    #pragma unroll
+    for (uint32_t t = 0u; t < 16u; ++t) {
+        if (t < M) {
+            const float v = vegajet::ornith_dev::block32_sum(acc[t]);
+            if (lane == 0u) {
+                y_out[static_cast<uint64_t>(t) * rows + row] = v;
+                if (do_pp) sm_pp[t * 8u + grp] = v;
+            }
+        }
+    }
+    if (do_pp) {
+        // BAR0 prepush: one 16 B half2 vector per token, as the m8/m12/m16 kernels emit it.
+        __syncthreads();
+        if (threadIdx.x < M) {
+            const float* so = sm_pp + threadIdx.x * 8u;
+            const __half2 h0 = __float22half2_rn(make_float2(so[0], so[1]));
+            const __half2 h1 = __float22half2_rn(make_float2(so[2], so[3]));
+            const __half2 h2 = __float22half2_rn(make_float2(so[4], so[5]));
+            const __half2 h3 = __float22half2_rn(make_float2(so[6], so[7]));
+            typedef uint32_t u32x4_t __attribute__((ext_vector_type(4)));
+            u32x4_t pv = {
+                *reinterpret_cast<const uint32_t*>(&h0),
+                *reinterpret_cast<const uint32_t*>(&h1),
+                *reinterpret_cast<const uint32_t*>(&h2),
+                *reinterpret_cast<const uint32_t*>(&h3)
+            };
+            __builtin_nontemporal_store(pv, reinterpret_cast<u32x4_t*>(peer_tx + static_cast<uint64_t>(threadIdx.x) * rows + blockIdx.x * 8u));
+        }
+    }
+}

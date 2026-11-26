@@ -292,6 +292,7 @@ vj_test(test_hsaco_bundle)
 vj_test(test_dflash_host)
 vj_test(test_spec_gdn_ref)
 vj_test(test_gdn_recur_colthread_ref)
+vj_test(test_gemv_q4a8_mn_ref)
 vj_test(test_q4_dot8)
 # ---- Radix prefix cache (KV blocks + recurrent-state snapshots) and B=1..8 continuous batching (serving_prefix_batching) ----
 target_sources(vegajet_core PRIVATE core/prefix_cache.cpp core/cont_batch.cpp)
