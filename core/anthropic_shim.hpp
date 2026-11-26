@@ -29,6 +29,7 @@ struct Limits {
     std::string default_model = "vegajet";
     int32_t default_max_tokens = 256;  // "max_tokens" is required by the API; this is used when it is missing
     int32_t max_tokens_cap = 0;        // 0: no cap
+    size_t max_model_len = 128;        // longer "model" names answer 400 (S-M3)
 };
 
 bool parse_request(const json::Value& root, const Limits& lim, serve::GenerateRequest& g, std::string& err);

@@ -83,6 +83,9 @@ struct ServerOptions {
     std::string host = "127.0.0.1";
     uint16_t port = 8080;               // 0: ephemeral (read it back with port())
     std::string model_id = "vegajet";
+    // A request's "model" must name this server (S-M3): longer names answer 400, others 404 model_not_found, and an
+    // absent field means model_id. The name is also no longer repeated in every SSE chunk.
+    size_t max_model_name_len = 128;
     uint32_t context_length = 0;        // reported in /v1/models when non-zero
     int32_t default_max_tokens = 256;
     int32_t max_tokens_cap = 0;         // 0: no cap

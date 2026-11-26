@@ -157,11 +157,11 @@ json::Value parse_json(const std::string& s) {
 }
 
 std::string chat_body(const std::string& extra) {
-    return "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]" + extra + "}";
+    return "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]" + extra + "}";
 }
 
 std::string anthropic_body(const std::string& extra) {
-    return "{\"model\":\"m\",\"max_tokens\":16,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]" + extra + "}";
+    return "{\"max_tokens\":16,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]" + extra + "}";
 }
 
 int count_of(const std::string& hay, const std::string& needle) {
