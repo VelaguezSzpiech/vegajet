@@ -20,6 +20,7 @@
 #include "models/ornith/ornith_gpu.hpp"
 
 #include "core/spec_engine.hpp"
+#include "core/spec_tree.hpp"
 
 #include <condition_variable>
 #include <deque>
@@ -44,11 +45,20 @@
 
 namespace vegajet::ornith {
 
+// Host planning is ready; never silently run the chain as a tree verifier.
+static constexpr const char* kTreeVerifyUnavailable =
+    "VEGAJET_V12_TREE_VERIFY=1 unavailable: S3 host planning only; "
+    "GPU tree attention, GDN branching and KV commit are not integrated";
+
 #ifdef VEGAJET_CPU_ONLY
 
 OrnithBenchMetrics run_ornith_gpu(const std::string&, const std::string&, const OrnithGpuOptions&) {
     OrnithBenchMetrics m;
     m.ok = false;
+    if (spec::tree_verify_requested(std::getenv("VEGAJET_V12_TREE_VERIFY"))) {
+        m.error = kTreeVerifyUnavailable;
+        return m;
+    }
     m.error = "Ornith GPU execution requires VEGAJET_CPU_ONLY=OFF";
     return m;
 }
@@ -814,6 +824,10 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
     OrnithGpuOptions opt = opt_in;
     const OrnithGpuOptions base_opt = opt_in;
     OrnithBenchMetrics res{};
+    if (spec::tree_verify_requested(std::getenv("VEGAJET_V12_TREE_VERIFY"))) {
+        res.error = kTreeVerifyUnavailable;
+        return res;
+    }
     auto t_load0 = std::chrono::steady_clock::now();
     {   // Alpha portability: 2 x 32 GB gfx906 only. Say so before planning, tokenizing or reserving any arena.
         const auto budget = preflight::check_arena(preflight::gfx906_vram_bytes("/"), preflight::kOrnithArenaGiB,
