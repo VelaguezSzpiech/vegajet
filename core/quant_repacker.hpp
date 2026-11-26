@@ -180,6 +180,67 @@ struct TensorPlanDecision {
     bool rejected_negative_roi = false;
 };
 
+// -------------------------------------------------------------------------------------------------
+// Measured-bandwidth promotion (crossover) rule [VEGAJET_V13_DOT8_PROMOTE]
+// -------------------------------------------------------------------------------------------------
+// A promotion old -> new multiplies the bytes that must be streamed by bpw_new / bpw_old, so it only
+// pays off when the measured (or owner-profiled) bandwidth ratio beats that ratio: strict
+//   bw_new / bw_old > bpw_new / bpw_old.
+// No bandwidth number is compiled in. The table is data the owner writes or overrides as JSON
+// (path: $VEGAJET_FORMAT_BW_JSON, else $HOME/.config/vegajet/format_bw.json):
+//   {"formats": [{"format": "IQ3_XXS", "m_max": 1, "bw_gbs": 0.0},
+//                {"format": "VJ_Q4_DOT8", "m_max": 1, "bw_gbs": 0.0}]}
+// An entry covers batch sizes 1..m_max; the narrowest m_max that covers the query wins. A format with
+// no covering entry counts as unmeasured and its promotions are refused (fail closed).
+struct FormatBwEntry {
+    std::string format;    // table key: "IQ3_XXS", "IQ2_S", "VJ_Q4_DOT8", "VJ_Q4_A8", ...
+    uint32_t m_max = 1;    // applies at batch sizes 1..m_max
+    double bw_gbs = 0.0;   // measured / profiled bytes per second, same shape and M
+};
+
+class FormatBwTable {
+public:
+    static std::string default_path();
+    static bool load_json(const std::string& path, FormatBwTable& out);  // no file / no entry -> false
+    void set(const std::string& format, double bw_gbs, uint32_t m_max = 1);
+    double gbs(const std::string& format, uint32_t m) const;             // 0.0 = not measured
+    bool empty() const { return entries_.empty(); }
+    size_t size() const { return entries_.size(); }
+
+private:
+    std::vector<FormatBwEntry> entries_;
+};
+
+// One tensor class: tensors that share a role and a disk format, bytes summed over all N ranks.
+struct PromoClassSpec {
+    std::string name;       // e.g. "routed.ffn_down.IQ3_XXS"
+    std::string from_format;
+    std::string to_format;
+    TensorRole role = TensorRole::RoutedMoE;
+    GgmlType disk = GgmlType::IQ3_XXS;  // IQ2_S -> VJ_Q4_A8 is banned at M=1
+    uint64_t old_bytes = 0;             // VRAM over all ranks, current format
+    uint64_t new_bytes = 0;             // VRAM over all ranks, promoted format
+    bool frees_old = true;              // old copy dropped: only the difference is charged
+};
+
+struct PromoVerdict {
+    std::string name, from_format, to_format;
+    bool promoted = false;
+    double bw_old_gbs = 0.0, bw_new_gbs = 0.0;
+    double bw_ratio = 0.0, bpw_ratio = 0.0;
+    int64_t delta_bytes = 0;
+    std::string reason;                 // set for every class, promoted or refused
+};
+
+struct PromoPlan {
+    uint64_t usable_bytes = 0;          // total usable VRAM summed over the N ranks
+    uint64_t used_bytes = 0;            // sum of the promoted deltas (clamped at 0)
+    std::vector<PromoVerdict> verdicts; // input order
+    uint32_t promoted_classes = 0;
+    // One "PROMOTE|KEEP <class>: <from> -> <to>: <reason>" line per class plus a total line.
+    std::string summary() const;
+};
+
 class VramBudgetPlanner {
 public:
     static uint64_t estimate_bytes(NativeFormat fmt, DiskQuantType disk, uint64_t rows, uint64_t cols,
@@ -198,6 +259,13 @@ public:
                                                                   uint64_t reserve_bytes,
                                                                   const HardwareRooflineProfile& hw,
                                                                   double batch_reuse_factor = 1.0);
+    // Crossover rule per tensor class against the total usable VRAM of N ranks: a class is promoted
+    // only when the table measures both formats at M=m and bw_new/bw_old > bpw_new/bpw_old (strict),
+    // and the accepted deltas fit in usable_bytes. Routed IQ3_XXS classes go first, then routed
+    // IQ2_S, then the rest; a class that does not fit blocks lower priorities (strict order).
+    // Every class gets a verdict with its reason; PromoPlan::summary() prints them all.
+    static PromoPlan plan_crossover(const std::vector<PromoClassSpec>& classes, uint64_t usable_bytes,
+                                    const FormatBwTable& bw, uint32_t m = 1);
 };
 
 // =================================================================================================

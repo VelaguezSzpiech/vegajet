@@ -4,7 +4,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <sstream>
 
 namespace vegajet::ornith {
 
@@ -345,6 +347,76 @@ LoadReport OrnithModel::load(GgufFile& f, const LoadOptions& opt) {
         p.bytes_total = dec[j].estimated_vram_bytes;
         upgraded += dec[j].expected_ms_saved > 0;
         rejected += dec[j].rejected_negative_roi;
+    }
+
+    // ---- v1.3: measured-bandwidth crossover promotion [VEGAJET_V13_DOT8_PROMOTE, default off] -----
+    // Promotes sub-4-bit tensors still uploaded as VJ_IQ_PACKED to VJ_Q4_DOT8, class by class, only
+    // when the owner's per-format bandwidth table measures bw_new/bw_old > bpw_new/bpw_old. Usable
+    // VRAM is the total over the N ranks. No bandwidth is compiled in: without a table, nothing moves.
+    if (const char* env13 = std::getenv("VEGAJET_V13_DOT8_PROMOTE"); env13 && env13[0] == '1') {
+        struct Group {
+            std::string key;
+            TensorRole role = TensorRole::Other;
+            DiskQuantType disk = DiskQuantType::IQ3_XXS;
+            std::vector<size_t> idx;
+        };
+        std::vector<Group> groups;
+        for (size_t k = 0; k < plan_.size(); ++k) {
+            const auto& p = plan_[k];
+            if (p.keep_float || p.format != NativeFormat::VJ_IQ_PACKED) continue;
+            if (p.disk != DiskQuantType::IQ3_XXS && p.disk != DiskQuantType::IQ2_S) continue;
+            std::string fam = "other";
+            if (ends_with(p.name, "ffn_down_exps.weight")) fam = "ffn_down";
+            else if (ends_with(p.name, "ffn_gate_exps.weight")) fam = "ffn_gate";
+            else if (ends_with(p.name, "ffn_up_exps.weight")) fam = "ffn_up";
+            const std::string key = std::string(ggml_type_name(static_cast<uint32_t>(p.disk))) + "." + fam +
+                                    (p.role == TensorRole::RoutedMoE ? ".routed" : ".other");
+            auto it = std::find_if(groups.begin(), groups.end(), [&](const Group& g) { return g.key == key; });
+            if (it == groups.end()) {
+                groups.push_back(Group{key, p.role, p.disk, {}});
+                it = groups.end() - 1;
+            }
+            it->idx.push_back(k);
+        }
+        std::vector<quant::PromoClassSpec> classes;
+        for (const auto& g : groups) {
+            quant::PromoClassSpec c;
+            c.name = g.key;
+            c.from_format = ggml_type_name(static_cast<uint32_t>(g.disk));
+            c.to_format = "VJ_Q4_DOT8";
+            c.role = g.role;
+            c.disk = g.disk;
+            for (size_t k : g.idx) {
+                const auto& p = plan_[k];
+                c.old_bytes += p.bytes_total;  // VJ_IQ_PACKED, the layout it is uploaded in today
+                c.new_bytes += quant::VramBudgetPlanner::estimate_bytes(NativeFormat::VJ_Q4_DOT8, p.disk, p.out, p.in,
+                                                                       p.experts);
+            }
+            classes.push_back(c);
+        }
+        uint64_t usable_total = 0;
+        for (size_t i = 0; i < n; ++i) {
+            const double usable = double(opt.gpus[i].vram_bytes) - double(opt.kv_scratch_reserve_bytes) - fixed[i] -
+                                  double(rep.kv_bytes_per_gpu[i]) - double(rep.state_bytes_per_gpu[i]);
+            usable_total += static_cast<uint64_t>(std::max(0.0, usable));
+        }
+        quant::FormatBwTable bwtab;
+        const std::string bw_path = quant::FormatBwTable::default_path();
+        const bool bw_loaded = quant::FormatBwTable::load_json(bw_path, bwtab);
+        const auto pp = quant::VramBudgetPlanner::plan_crossover(classes, usable_total, bwtab, 1);
+        for (size_t j = 0; j < classes.size(); ++j) {
+            if (!pp.verdicts[j].promoted) continue;
+            for (size_t k : groups[j].idx) {
+                auto& p = plan_[k];
+                p.format = NativeFormat::VJ_Q4_DOT8;
+                p.bytes_total = quant::VramBudgetPlanner::estimate_bytes(p.format, p.disk, p.out, p.in, p.experts);
+            }
+        }
+        rep.notes.push_back("v13 dot8 crossover: bandwidth table " + std::string(bw_loaded ? bw_path : "missing at " + bw_path));
+        rep.notes.push_back("v13 dot8: promotion applies to this load plan (formats, VRAM, notes); the GPU expert "
+                            "upload path is not switched by this flag");
+        std::istringstream ls(pp.summary());
+        for (std::string line; std::getline(ls, line);) rep.notes.push_back("v13 dot8: " + line);
     }
 
     // ---- per-GPU accounting -----------------------------------------------------------------------

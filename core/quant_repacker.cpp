@@ -13,6 +13,8 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
+#include <sstream>
 
 namespace vegajet::quant {
 
@@ -1108,6 +1110,153 @@ std::vector<TensorPlanDecision> VramBudgetPlanner::plan_roofline_knapsack(const 
         d.roi_ms_per_gib = c.roi;
     }
     return out;
+}
+
+// =================================================================================================
+// Measured-bandwidth crossover rule (see quant_repacker.hpp)
+// =================================================================================================
+std::string FormatBwTable::default_path() {
+    if (const char* p = std::getenv("VEGAJET_FORMAT_BW_JSON"); p && p[0]) return p;
+    const char* home = std::getenv("HOME");
+    if (!home || !home[0]) return "/tmp/vegajet_format_bw.json";
+    return std::string(home) + "/.config/vegajet/format_bw.json";
+}
+
+void FormatBwTable::set(const std::string& format, double bw_gbs, uint32_t m_max) {
+    for (auto& e : entries_)
+        if (e.format == format && e.m_max == m_max) { e.bw_gbs = bw_gbs; return; }
+    FormatBwEntry e;
+    e.format = format;
+    e.m_max = m_max;
+    e.bw_gbs = bw_gbs;
+    entries_.push_back(e);
+}
+
+double FormatBwTable::gbs(const std::string& format, uint32_t m) const {
+    double best = 0.0;
+    uint32_t best_cov = 0;
+    for (const auto& e : entries_) {
+        if (e.format != format || e.bw_gbs <= 0.0 || m > e.m_max) continue;
+        if (best_cov == 0 || e.m_max < best_cov) { best_cov = e.m_max; best = e.bw_gbs; }
+    }
+    return best;
+}
+
+bool FormatBwTable::load_json(const std::string& path, FormatBwTable& out) {
+    out.entries_.clear();
+    std::ifstream ifs(path);
+    if (!ifs.is_open()) return false;
+    const std::string text((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+    auto num = [](const std::string& s, const char* key, double& v) -> bool {
+        const size_t p = s.find(key);
+        if (p == std::string::npos) return false;
+        const size_t c = s.find(':', p + std::strlen(key));
+        if (c == std::string::npos) return false;
+        size_t i = c + 1;
+        while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r')) ++i;
+        char* end = nullptr;
+        const double d = std::strtod(s.c_str() + i, &end);
+        if (end == s.c_str() + i) return false;
+        v = d;
+        return true;
+    };
+    size_t pos = 0;
+    while ((pos = text.find("\"format\"", pos)) != std::string::npos) {
+        const size_t colon = text.find(':', pos + 8);
+        const size_t q1 = colon == std::string::npos ? colon : text.find('"', colon + 1);
+        const size_t q2 = q1 == std::string::npos ? q1 : text.find('"', q1 + 1);
+        if (q2 == std::string::npos) break;
+        const std::string name = text.substr(q1 + 1, q2 - q1 - 1);
+        const size_t end = text.find('}', q2);
+        const std::string obj = text.substr(q2, end == std::string::npos ? std::string::npos : end - q2);
+        double bw = 0.0, mm = 1.0;
+        num(obj, "\"bw_gbs\"", bw);
+        if (!num(obj, "\"m_max\"", mm)) mm = 1.0;
+        const uint32_t m_max = mm < 1.0 ? 1u : static_cast<uint32_t>(mm);
+        if (!name.empty()) out.set(name, bw, m_max);
+        pos = q2;
+    }
+    return !out.entries_.empty();
+}
+
+std::string PromoPlan::summary() const {
+    std::ostringstream o;
+    for (const auto& v : verdicts)
+        o << (v.promoted ? "PROMOTE " : "KEEP    ") << v.name << ": " << v.from_format << " -> " << v.to_format
+          << ": " << v.reason << "\n";
+    o << "crossover: " << promoted_classes << " of " << verdicts.size() << " classes promoted, " << used_bytes
+      << " of " << usable_bytes << " usable bytes charged (all ranks)\n";
+    return o.str();
+}
+
+PromoPlan VramBudgetPlanner::plan_crossover(const std::vector<PromoClassSpec>& classes, uint64_t usable_bytes,
+                                            const FormatBwTable& bw, uint32_t m) {
+    PromoPlan plan;
+    plan.usable_bytes = usable_bytes;
+    plan.verdicts.resize(classes.size());
+    std::vector<size_t> order;
+    for (size_t i = 0; i < classes.size(); ++i) {
+        const PromoClassSpec& c = classes[i];
+        PromoVerdict& v = plan.verdicts[i];
+        v.name = c.name;
+        v.from_format = c.from_format;
+        v.to_format = c.to_format;
+        v.bw_old_gbs = bw.gbs(c.from_format, m);
+        v.bw_new_gbs = bw.gbs(c.to_format, m);
+        v.bw_ratio = v.bw_old_gbs > 0.0 ? v.bw_new_gbs / v.bw_old_gbs : 0.0;
+        v.bpw_ratio = c.old_bytes > 0 ? static_cast<double>(c.new_bytes) / static_cast<double>(c.old_bytes) : 0.0;
+        v.delta_bytes = static_cast<int64_t>(c.new_bytes) - (c.frees_old ? static_cast<int64_t>(c.old_bytes) : 0);
+        char buf[256];
+        if (c.to_format == "VJ_Q4_A8" && c.disk == GgmlType::IQ2_S && m == 1u) {
+            v.reason = "banned: IQ2_S -> VJ_Q4_A8 at M=1 (measured regression)";
+        } else if (v.bw_old_gbs <= 0.0 || v.bw_new_gbs <= 0.0) {
+            v.reason = "bandwidth not measured: no table entry for ";
+            v.reason += v.bw_old_gbs <= 0.0 ? c.from_format : c.to_format;
+            v.reason += " at M=" + std::to_string(m);
+        } else if (c.old_bytes == 0 || c.new_bytes == 0) {
+            v.reason = "empty class (no bytes to move)";
+        } else if (!(v.bw_ratio > v.bpw_ratio)) {
+            std::snprintf(buf, sizeof(buf), "not worth it: bw ratio %.4f <= bpw ratio %.4f", v.bw_ratio,
+                          v.bpw_ratio);
+            v.reason = buf;
+        } else {
+            std::snprintf(buf, sizeof(buf), "bw ratio %.4f > bpw ratio %.4f", v.bw_ratio, v.bpw_ratio);
+            v.reason = buf;
+            order.push_back(i);
+        }
+    }
+    // Routed experts first (IQ3_XXS before IQ2_S), then the rest; ties keep input order.
+    auto prio = [&](size_t i) -> int {
+        const PromoClassSpec& c = classes[i];
+        if (c.role != TensorRole::RoutedMoE) return 2;
+        return c.disk == GgmlType::IQ2_S ? 1 : 0;
+    };
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return prio(a) < prio(b); });
+
+    int64_t used = 0;
+    bool blocked = false;
+    for (size_t idx : order) {
+        PromoVerdict& v = plan.verdicts[idx];
+        if (blocked) {
+            v.promoted = false;
+            v.reason += "; held: a higher-priority class did not fit in usable VRAM";
+            continue;
+        }
+        if (v.delta_bytes > 0 && used + v.delta_bytes > static_cast<int64_t>(usable_bytes)) {
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), "; does not fit: needs %lld more bytes",
+                          static_cast<long long>(used + v.delta_bytes - static_cast<int64_t>(usable_bytes)));
+            v.reason += buf;
+            blocked = true;
+            continue;
+        }
+        used += v.delta_bytes;
+        if (used < 0) used = 0;
+        v.promoted = true;
+        ++plan.promoted_classes;
+    }
+    plan.used_bytes = static_cast<uint64_t>(used);
+    return plan;
 }
 
 // =================================================================================================
