@@ -248,7 +248,7 @@ bool Runtime::execute_plan(const ops::StepPlan&, const OpBinderFn&, bool, Execut
     if (err) *err = "step plans cannot execute in a CPU-only build";
     return false;
 }
-void Runtime::reset_allreduce_mailboxes() {}
+bool Runtime::reset_allreduce_mailboxes(std::string* err) { if (err) *err = "KFD runtime disabled"; return false; }
 bool Runtime::alloc_userptr_pinned(uint64_t, KfdBuffer&, bool) { return false; }
 bool Runtime::free_buffer(KfdBuffer&) { return true; }
 bool Runtime::enqueue_kernel(size_t, const LoadedKernel&, uint32_t, uint32_t, uint32_t,
@@ -500,18 +500,50 @@ bool Runtime::init(double vram_arena_gib, size_t host_pinned_mb, std::string* er
     return true;
 }
 
-void Runtime::reset_allreduce_mailboxes() {
-    if (!p2p_flag_slices_.empty()) {
-        for (auto& b : p2p_flag_slices_) if (b.host_ptr) std::memset(b.host_ptr, 0, b.size);
-    } else if (mailbox_flag_buf_.host_ptr) {
+bool Runtime::reset_allreduce_mailboxes(std::string* err) {
+    auto fail = [&](const std::string& why) {
+        if (err) *err = "AllReduce reset failed: " + why;
+        std::fprintf(stderr, "[vegajet::kfd] AllReduce reset failed: %s; runtime stopped\n", why.c_str());
+        failed_ = true;
+        open_ = false;
+        return false;
+    };
+    if (failed_) return fail("runtime is already failed");
+    if (devices_.size() <= 1) return true;
+    if (queues_.size() != devices_.size()) return fail("missing device queues");
+    if (transport_ == AllReduceTransport::PeerBarP2P) {
+        if (p2p_payload_slices_.size() != devices_.size() || p2p_flag_slices_.size() != devices_.size())
+            return fail("incomplete peer mailbox slices");
+        for (const auto& b : p2p_payload_slices_)
+            if (!b.host_ptr || b.size < kArGpuBytes) return fail("peer payload has no required CPU mapping");
+        for (const auto& b : p2p_flag_slices_)
+            if (!b.host_ptr || b.size < 4096) return fail("peer flags have no required CPU mapping");
+    } else if (!mailbox_payload_buf_.host_ptr || mailbox_payload_buf_.size < sizeof(AllReducePayload) ||
+               !mailbox_flag_buf_.host_ptr || mailbox_flag_buf_.size < sizeof(AllReduceFlags)) {
+        return fail("host mailbox mapping missing or too small");
+    }
+    for (size_t g = 0; g < queues_.size(); ++g) {
+        const auto& q = queues_[g];
+        if (!q.completion_sig) {
+            // Mailboxes are initialized before queues are created. No producer exists in this generation yet.
+            if (!open_ && !q.queue_active && !q.ring_buf.handle && !q.next_write_idx && !q.submission_in_flight) continue;
+            return fail("missing completion signal");
+        }
+        if (q.submission_in_flight || q.next_write_idx != q.completed_write_idx ||
+            __atomic_load_n(&q.completion_sig->value, __ATOMIC_ACQUIRE) != 0) {
+            if (!wait_idle(g)) return fail("GPU " + std::to_string(g) + " did not quiesce");
+        }
+    }
+    // Validate every mapping and quiesce every queue before changing any rank's epoch state.
+    if (transport_ == AllReduceTransport::PeerBarP2P) {
+        for (auto& b : p2p_payload_slices_) std::memset(b.host_ptr, 0, b.size);
+        for (auto& b : p2p_flag_slices_) std::memset(b.host_ptr, 0, b.size);
+    } else {
+        std::memset(mailbox_payload_buf_.host_ptr, 0, sizeof(AllReducePayload));
         std::memset(mailbox_flag_buf_.host_ptr, 0, sizeof(AllReduceFlags));
     }
-    if (!p2p_payload_slices_.empty()) {
-        for (auto& b : p2p_payload_slices_) if (b.host_ptr) std::memset(b.host_ptr, 0, b.size);
-    } else if (mailbox_payload_buf_.host_ptr) {
-        std::memset(mailbox_payload_buf_.host_ptr, 0, sizeof(AllReducePayload));
-    }
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    return true;
 }
 
 bool Runtime::setup_allreduce_mailbox() {
@@ -549,6 +581,12 @@ bool Runtime::setup_allreduce_mailbox() {
                                static_cast<off_t>(args.mmap_offset));
                 if (p != MAP_FAILED) out.host_ptr = p;
             }
+            if (!out.host_ptr) {
+                std::fprintf(stderr, "[vegajet::kfd] required CPU peer mailbox mmap failed GPU %zu: %s\n", gidx,
+                             args.mmap_offset ? std::strerror(errno) : "KFD returned no mmap offset");
+                free_buffer(out);
+                return false;
+            }
             if (!map_to_gpus(out, all_gpu_ids_)) {
                 free_buffer(out);
                 return false;
@@ -569,14 +607,17 @@ bool Runtime::setup_allreduce_mailbox() {
             mailbox_flag_buf_.va          = f_base;
             mailbox_flag_buf_.host_ptr    = p2p_flag_slices_[0].host_ptr;
             transport_ = AllReduceTransport::PeerBarP2P;
-            reset_allreduce_mailboxes();
+            if (!reset_allreduce_mailboxes()) return false;
             std::printf("[vegajet::kfd] AllReduce: PEER_BAR_P2P PUSH-ONLY DUAL-BAR (payload @ 0x%llx [COH-WC], flags @ 0x%llx [UC])\n",
                         static_cast<unsigned long long>(p_base),
                         static_cast<unsigned long long>(f_base));
             return true;
         }
-        for (auto& b : p2p_payload_slices_) free_buffer(b);
-        for (auto& b : p2p_flag_slices_) free_buffer(b);
+        std::fprintf(stderr, "[vegajet::kfd] peer mailbox setup failed; falling back to host-pinned transport\n");
+        bool cleaned = true;
+        for (auto& b : p2p_payload_slices_) if (!free_buffer(b)) cleaned = false;
+        for (auto& b : p2p_flag_slices_) if (!free_buffer(b)) cleaned = false;
+        if (!cleaned) { failed_ = true; return false; }
         p2p_payload_slices_.clear();
         p2p_flag_slices_.clear();
     }
@@ -586,8 +627,7 @@ bool Runtime::setup_allreduce_mailbox() {
     if (!alloc_userptr_pinned(payload_bytes, mailbox_payload_buf_, true)) return false;
     if (!alloc_userptr_pinned(flag_bytes, mailbox_flag_buf_, true)) return false;
     transport_ = AllReduceTransport::HostPinnedUserptr;
-    reset_allreduce_mailboxes();
-    return true;
+    return reset_allreduce_mailboxes();
 }
 
 bool Runtime::alloc_vram(size_t gpu_idx, uint64_t size, uint32_t extra_flags, KfdBuffer& out, bool map_all_gpus) {
