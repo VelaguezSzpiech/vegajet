@@ -79,12 +79,49 @@ static void replay_layout(const VerifyTree& tree, const std::vector<uint32_t>& p
     }
 }
 
+static void catchup_layout(const VerifyTree& tree, const std::vector<uint32_t>& path) {
+    for (uint32_t taps : {1u, 3u, 5u}) {
+        const uint32_t words = 3072u * taps;
+        std::vector<uint32_t> hidden((tree.nodes.size() + 1u) * words);
+        for (uint32_t row = 0; row <= tree.nodes.size(); ++row)
+            for (uint32_t w = 0; w < words; ++w) hidden[row * words + w] = pattern(0, row, w);
+        const auto original = hidden;
+        for (uint32_t j = 0; j < path.size(); ++j) {
+            if (path[j] == j) continue;
+            std::memcpy(hidden.data() + j * words, hidden.data() + path[j] * words, words * 4u);
+        }
+        for (uint32_t j = 0; j < path.size(); ++j)
+            VJ_CHECK(std::equal(hidden.begin() + j * words, hidden.begin() + (j + 1u) * words,
+                                original.begin() + path[j] * words));
+        VJ_CHECK(std::equal(hidden.begin() + tree.nodes.size() * words, hidden.end(),
+                            original.begin() + tree.nodes.size() * words));
+    }
+    std::vector<int32_t> predictions(tree.nodes.size(), 701);
+    for (uint32_t j = 1; j < path.size(); ++j) predictions[path[j - 1u]] = tree.nodes[path[j]].token;
+    for (uint32_t rem = 1; rem <= 8u; ++rem) {
+        const auto accepted = accept_tree(tree, predictions, rem - 1u);
+        VJ_CHECK(accepted.rows.size() <= rem);
+        std::vector<int32_t> emitted;
+        for (uint32_t j = 1; j < accepted.rows.size(); ++j) emitted.push_back(tree.nodes[accepted.rows[j]].token);
+        emitted.push_back(accepted.bonus);
+        VJ_CHECK(emitted.size() == accepted.rows.size());
+        // The anchor was already emitted; bonus is emitted but not injected.
+        std::vector<int32_t> injected;
+        for (uint32_t row : accepted.rows) injected.push_back(tree.nodes[row].token);
+        VJ_CHECK(injected.front() == tree.nodes[0].token);
+        for (uint32_t j = 1; j < injected.size(); ++j) VJ_CHECK(injected[j] == emitted[j - 1u]);
+        VJ_CHECK(accepted.bonus == predictions[accepted.rows.back()]);
+        if (accepted.rows.size() < path.size()) VJ_CHECK(emitted.back() == tree.nodes[path[accepted.rows.size()]].token);
+    }
+}
+
 int main() {
     const auto tree = make_topk_verify_tree(9, {{10, 11}, {12, 13}});
     const std::vector<std::vector<uint32_t>> paths{{0}, {0, 1}, {0, 2}, {0, 1, 3}, {0, 1, 4}, {0, 2, 5}, {0, 2, 6}};
     for (const auto& path : paths) {
         compact_kv(tree, path);
         replay_layout(tree, path);
+        catchup_layout(tree, path);
     }
-    std::printf("[PASS] tree commit physical KV bytes, 36-layer record strides, all path leaves and 17 ring heads\n");
+    std::printf("[PASS] tree commit physical KV bytes, 36-layer records, accepted taps/catch-up, all leaves and 17 ring heads\n");
 }
