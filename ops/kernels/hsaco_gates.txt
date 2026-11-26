@@ -102,6 +102,8 @@ vj_flash_splitkv_any_merge_quant_kernel stream
 vj_spec_gdn_verify_kernel stream
 vj_spec_gdn_norm_quant_kernel stream
 vj_spec_gdn_verify_fused_nq_kernel tiled
+vj_tree_gdn_conv_kernel tiled
+vj_tree_gdn_verify_kernel stream
 vj_moe_down_dot8_kernel stream
 vj_moe_down_dot8_prepush_kernel stream
 vj_moe_gu_dot8_kernel stream
