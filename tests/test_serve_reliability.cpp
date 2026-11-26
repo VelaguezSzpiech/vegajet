@@ -158,6 +158,15 @@ Resp chat(int port, const std::string& body, const std::string& extra = {}) {
     return one(port, chat_head(static_cast<int>(body.size()), false, extra) + body);
 }
 
+// Sends on an already open connection (keep-alive), reusing its read buffer.
+Resp chat_on(int fd, std::string& buf, const std::string& body) {
+    send_str(fd, chat_head(static_cast<int>(body.size()), true) + body);
+    Resp r;
+    const bool ok = read_resp(fd, r, buf);
+    VJ_CHECK(ok);
+    return r;
+}
+
 std::string chat_body(const std::string& model, const std::string& content, const std::string& tail = {}) {
     return "{\"model\":" + json::quote(model) + ",\"messages\":[{\"role\":\"user\",\"content\":" +
            json::quote(content) + "}]" + tail + "}";
@@ -244,12 +253,77 @@ void test_b1_server_survives() {
     VJ_CHECK(srv2.stats().errors == 0);
 }
 
+// ------------------------------------------------------------------------------------------------ S-B2
+// 256 idle sockets used to make every endpoint, /health included, answer with a bare RST.
+void test_b2_connection_limit() {
+    MockGen gen;
+    ServerOptions opt;
+    opt.port = 0;
+    opt.model_id = "m";
+    opt.max_connections = 4;
+    opt.reserve_connections = 2;
+    opt.metrics_text = [] { return std::string("# metrics ok\n"); };
+    OpenAiServer srv(opt, [&](const GenerateRequest& r, const TokenSink& s) { return gen(r, s); });
+    std::string err;
+    VJ_CHECK(srv.start(&err));
+
+    const std::string keepalive_get_health = "GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
+    std::vector<int> conns;
+    std::vector<std::string> bufs;
+    std::vector<Resp> resps;
+    for (int i = 0; i < 6; ++i) {  // 4 normal + 2 reserve, in accept order
+        const int fd = connect_local(srv.port());
+        VJ_CHECK(fd >= 0);
+        send_str(fd, keepalive_get_health);
+        Resp r;
+        std::string b;
+        VJ_CHECK(read_resp(fd, r, b));
+        VJ_CHECK(r.status == 200);  // a reserve socket still reaches /health
+        conns.push_back(fd);
+        bufs.push_back(b);
+        resps.push_back(r);
+    }
+
+    // /metrics is reachable on a reserve socket too.
+    send_str(conns[4], "GET /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+    Resp r;
+    VJ_CHECK(read_resp(conns[4], r, bufs[4]));
+    VJ_CHECK(r.status == 200);
+    VJ_CHECK(r.body.find("metrics ok") != std::string::npos);
+
+    // A normal socket in the pool still generates.
+    r = chat_on(conns[0], bufs[0], chat_body("m", "hi"));
+    VJ_CHECK(r.status == 200);
+
+    // The next socket is over both limits: it gets a 503 with a body, not a reset.
+    const int reject = connect_local(srv.port());
+    VJ_CHECK(reject >= 0);
+    send_str(reject, keepalive_get_health);
+    Resp rj;
+    std::string rb;
+    VJ_CHECK(read_resp(reject, rj, rb));
+    VJ_CHECK(rj.status == 503);
+    VJ_CHECK(rj.headers.count("retry-after") == 1);
+    VJ_CHECK(rj.body.find("connection limit") != std::string::npos);
+    ::close(reject);
+
+    // A reserve socket may not generate (the 503 closes it).
+    r = chat_on(conns[5], bufs[5], chat_body("m", "hi"));
+    VJ_CHECK(r.status == 503);
+    VJ_CHECK(r.headers.count("retry-after") == 1);
+    VJ_CHECK(r.body.find("connection limit") != std::string::npos);
+
+    for (int fd : conns) ::close(fd);
+    srv.stop();
+}
+
 }  // namespace
 
 int main() {
     test_b1_json_limits();
     test_b1_server_survives();
-    std::printf("test_serve_reliability: S-B1 bounded JSON parse, 413/400, server survives\n");
+    test_b2_connection_limit();
+    std::printf("test_serve_reliability: S-B1 bounded JSON parse, S-B2 connection limit 503 + health reserve\n");
     std::printf("PASS\n");
     return 0;
 }

@@ -417,6 +417,10 @@ void set_nonblocking(int fd, bool on) {
 // Server
 // =================================================================================================
 struct OpenAiServer::Impl {
+    // Over the connection limit a socket is still accepted far enough to answer 503 with a body (S-B2): Reserve
+    // sockets only reach /health and /metrics, Reject sockets get the 503 for their first request.
+    enum class Lane { Normal, Reserve, Reject };
+    static constexpr size_t kMaxRejectSockets = 8;  // sockets kept only long enough to answer 503
     struct Conn {
         int fd = -1;
         std::string in, out;
@@ -424,6 +428,7 @@ struct OpenAiServer::Impl {
         bool busy = false;           // owned by the worker
         bool sent_continue = false;
         bool peer_closed = false;
+        Lane lane = Lane::Normal;
         int64_t last_ms = 0;
     };
     struct Job {
@@ -533,7 +538,7 @@ struct OpenAiServer::Impl {
             ++n_requests;
             // Nothing escapes into the I/O thread: an exception here would std::terminate the process (S-B1).
             try {
-                route(fd, req);
+                route(fd, req, c.lane);
             } catch (const std::bad_alloc&) {
                 respond_if_idle(fd, error_response(503, "server out of memory while building the response", false), false);
             } catch (const std::exception& e) {
@@ -550,9 +555,20 @@ struct OpenAiServer::Impl {
         if (it != conns.end() && !it->second.busy) respond(fd, std::move(bytes), keep_alive);
     }
 
-    void route(int fd, const HttpRequest& req) {
+    void route(int fd, const HttpRequest& req, Lane lane) {
         std::string path = req.target.substr(0, req.target.find('?'));
         const bool ka = req.keep_alive;
+        if (lane == Lane::Reject) {
+            // The pool is full: say so instead of dropping the socket (S-B2).
+            ++n_rejected;
+            respond(fd, error_response(503, "server busy: connection limit reached", false, "Retry-After: 1\r\n"), false);
+            return;
+        }
+        if (lane == Lane::Reserve && path != "/health" && path != "/metrics") {
+            ++n_rejected;
+            respond(fd, error_response(503, "server busy: connection limit reached", false, "Retry-After: 1\r\n"), false);
+            return;
+        }
         if (req.method == "OPTIONS") {
             respond(fd, http_response(204, "", "", ka,
                                       "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
@@ -707,11 +723,23 @@ struct OpenAiServer::Impl {
                 if (errno == EINTR) continue;
                 return;  // EAGAIN or a transient error
             }
-            if (conns.size() >= opt.max_connections) { ::close(fd); continue; }
+            Lane lane = Lane::Normal;
+            if (conns.size() >= opt.max_connections) {
+                if (conns.size() >= opt.max_connections + opt.reserve_connections) {
+                    size_t reject = 0;
+                    for (const auto& kv : conns)
+                        if (kv.second.lane == Lane::Reject) ++reject;
+                    if (reject >= kMaxRejectSockets) { ::close(fd); continue; }  // hard ceiling: no fd left to keep
+                    lane = Lane::Reject;
+                } else {
+                    lane = Lane::Reserve;
+                }
+            }
             const int one = 1;
             setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
             Conn c;
             c.fd = fd;
+            c.lane = lane;
             c.last_ms = now_ms();
             conns.emplace(fd, std::move(c));
             watch(fd, false, EPOLL_CTL_ADD);
