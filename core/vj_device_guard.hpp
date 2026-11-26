@@ -69,5 +69,10 @@ inline void fault_clear(uint32_t* slot) {
     slot[kFaultWEpoch]    = 0u;
 }
 
+// C3: an argmax-derived token id must name an embedding row before it is used as an address offset.
+inline bool token_id_in_range(int32_t id, uint32_t vocab) {
+    return id >= 0 && static_cast<uint32_t>(id) < vocab;
+}
+
 } // namespace guard
 } // namespace vegajet

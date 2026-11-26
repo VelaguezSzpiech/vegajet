@@ -2156,6 +2156,17 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         // Callers still index preds[0]/preds.back(), so hand back inert -1 ids: no GPU work runs and
         // res.error is already set, which keeps the run on the error path.
         if (device_faulted) return std::vector<int32_t>(M, -1);
+        // v1.2 C3: never turn an out-of-range token id into an embedding address offset.
+        const uint32_t n_vocab = static_cast<uint32_t>(hp.vocab);
+        for (const int32_t t : toks) {
+            if (guard::token_id_in_range(t, n_vocab)) continue;
+            if (res.error.empty()) {
+                res.error = "token id " + std::to_string(t) + " is outside the vocabulary [0, " +
+                            std::to_string(n_vocab) + ") before the embedding lookup";
+                std::fprintf(stderr, "[ornith::gpu] BAD TOKEN ID: %s\n", res.error.c_str());
+            }
+            return std::vector<int32_t>(M, -1);
+        }
         // A fault raised by a dispatch queued outside step_batch (stage-profiler path) is caught here.
         if (device_fault_check("previous dispatch")) return std::vector<int32_t>(M, -1);
         for (size_t g = 0; g < 2; ++g) guard::fault_clear(io_fault_host + g * guard::kFaultWords);
@@ -3115,6 +3126,16 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                     const uint32_t idx = m * kVocabBlocks + b;
                     if (io_arg_val_host0[idx] > best_v) { best_v = io_arg_val_host0[idx]; best_i = io_arg_id_host0[idx]; }
                     if (io_arg_val_host1[idx] > best_v) { best_v = io_arg_val_host1[idx]; best_i = io_arg_id_host1[idx]; }
+                }
+                // v1.2 C3: a block reduction that never replaced its -1 sentinel (all-NaN / empty
+                // logits) or an id outside the vocabulary must not reach the embedding gather.
+                if (!guard::token_id_in_range(best_i, n_vocab)) {
+                    if (res.error.empty()) {
+                        res.error = "argmax token id " + std::to_string(best_i) + " is outside the vocabulary [0, " +
+                                    std::to_string(n_vocab) + "); refusing to feed it to the embedding lookup";
+                        std::fprintf(stderr, "[ornith::gpu] BAD ARGMAX: %s\n", res.error.c_str());
+                    }
+                    return std::vector<int32_t>(M, -1);
                 }
                 preds[last_tok_only_vocab ? (M - 1u) : m] = best_i;
             }

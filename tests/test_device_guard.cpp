@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Host side of the v1.2 C1 device-fault record: the exact word packing the super-kernels write
-// (ops/kernels/vj_ornith_super.hip, fault_record()) must decode back to rank / kind / barrier id /
-// stage / epoch, and re-arming a slot must keep the rank while clearing the fault.
+// Host side of the v1.2 C1 device-fault record and the C3 token-id guard: the exact word packing the
+// super-kernels write (ops/kernels/vj_ornith_super.hip, fault_record()) must decode back to rank /
+// kind / barrier id / stage / epoch, and an out-of-vocabulary id must never pass the guard.
 #include "core/vj_device_guard.hpp"
 #include "tests/test_common.hpp"
 
@@ -74,6 +74,16 @@ int main() {
     VJ_CHECK(!fault_seen(slots));
     VJ_CHECK(fault_seen(slots + kFaultWords));
     VJ_CHECK(fault_describe(slots + kFaultWords).find("rank 1") != std::string::npos);
+
+    // C3: ids are only usable as embedding row indices inside [0, vocab).
+    const uint32_t vocab = 151936u;
+    VJ_CHECK(token_id_in_range(0, vocab));
+    VJ_CHECK(token_id_in_range(151935, vocab));
+    VJ_CHECK(!token_id_in_range(151936, vocab));
+    VJ_CHECK(!token_id_in_range(-1, vocab));          // the reduction's -1 sentinel (all-NaN blocks)
+    VJ_CHECK(!token_id_in_range(INT32_MIN, vocab));
+    VJ_CHECK(!token_id_in_range(0, 0u));
+    VJ_CHECK(!token_id_in_range(5, 0u));
 
     std::printf("test_device_guard: OK\n");
     return 0;
