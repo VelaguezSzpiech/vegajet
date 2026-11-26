@@ -3,6 +3,7 @@
 // validate GPU code objects against them, then hand the graphs to the KFD runtime. CPU-only builds stop
 // after planning and validation.
 #include "cli/inspect.hpp"
+#include "cli/tp_ar_bench.hpp"
 
 #include "core/bench_json.hpp"
 #include "core/grid_planner.hpp"
@@ -191,6 +192,7 @@ int run_bench(const std::string& cmd, const std::vector<std::string>& args) {
         if (!tp_given) tp = 2; // preserve the legacy standalone benchmark default
         if (tp > 256) { std::fprintf(stderr, "--bench-ar plan CLI admits at most 256 ranks (matrix resource bound)\n"); return 2; }
         if (ar_int8) { std::fprintf(stderr, "--bench-ar M2 planning supports FP16 wire only\n"); return 2; }
+        tp::CollectiveOptions runtime_options;
         try {
             auto read = [](const std::string& path) {
                 std::ifstream input(path);
@@ -205,6 +207,7 @@ int run_bench(const std::string& cmd, const std::vector<std::string>& args) {
                 if (peers.size() != tp) throw std::invalid_argument("--tp does not match hardware profile rank count");
             } else std::printf("No peer profile: P2P capability unknown; all remote plan edges use host-bounce.\n");
             const auto options = tp_plan.empty() ? tp::CollectiveOptions{} : tp::collective_options_from_json(read(tp_plan));
+            runtime_options = options;
             const auto topology = tp::plan_topology(peers, options);
             const auto collective = tp::plan_collective(3072, peers, options);
             std::printf("%s", tp::format_collective_plan(collective, topology).c_str());
@@ -212,14 +215,9 @@ int run_bench(const std::string& cmd, const std::vector<std::string>& args) {
             std::fprintf(stderr, "--bench-ar plan: %s\n", e.what()); return 2;
         }
         if (dry_only) return 0;
-        if (tp != 2) {
-            std::fprintf(stderr, "--bench-ar GPU execution supports TP=2 only until milestone 3; TP=%u is plan-only (use --dry-run)\n", tp); return 3;
-        }
-        if (!tp_profile.empty() || !tp_plan.empty()) {
-            std::fprintf(stderr, "--bench-ar owner profile/plan execution requires milestone 3; use --dry-run\n"); return 3;
-        }
         if (!kfd::Runtime::compiled_with_gpu()) { std::fprintf(stderr, "--bench-ar: this build has no GPU backend\n"); return 3; }
-        return ornith::run_ornith_ar_bench(hsaco_dir);
+        if (!tp_profile.empty()) std::printf("Profile is advisory; execution re-reads actual sysfs capabilities, never trusts claimed peer edges.\n");
+        return run_tp_ar_bench(tp, hsaco_dir, runtime_options);
     }
     if (bench_gemv) {
         if (!kfd::Runtime::compiled_with_gpu()) { std::fprintf(stderr, "--bench-gemv: this build has no GPU backend\n"); return 3; }

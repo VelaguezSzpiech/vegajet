@@ -17,6 +17,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include "core/tp_runtime_topology.hpp"
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -275,6 +276,13 @@ public:
     // Read-only topology scan of /sys/class/kfd/kfd/topology/nodes/* (safe without opening /dev/kfd).
     static std::vector<DeviceInfo> scan_gfx906_topology();
 
+    const tp::RuntimeTopology& collective_topology() const { return collective_topology_; }
+    const tp::CollectivePlan& collective_plan() const { return collective_plan_; }
+    // Configure only with quiescent queues after loading the generic collective hsaco.
+    bool configure_collective(uint64_t elements, const tp::CollectiveOptions& options, std::string* err);
+    bool collective_allreduce(const std::vector<uint64_t>& partials, const std::vector<uint64_t>& outputs,
+                              uint64_t elements, std::string* err);
+
     // Opens /dev/kfd with default arena sizing (30.5 GiB ceiling, 64 MiB pinned staging).
     bool open(std::string* err);
     bool init(double vram_arena_gib, size_t host_pinned_mb, std::string* err = nullptr, size_t expected_devices = 0);
@@ -365,6 +373,16 @@ private:
                            std::unordered_map<std::string, LoadedKernel>& out_kernels,
                            std::string* err);
 #endif
+
+    struct CollectiveInbox {
+        KfdBuffer payload, flags, host_payload, host_flags;
+    };
+    tp::RuntimeTopology collective_topology_;
+    tp::CollectivePlan collective_plan_;
+    tp::CollectiveOptions collective_options_;
+    std::vector<CollectiveInbox> collective_inboxes_;
+    KfdBuffer collective_routes_, collective_status_;
+    uint32_t collective_epoch_ = 0;
 
     int kfd_fd_ = -1;
     // VEGAJET_DISPATCH_LOG=<file>: unbuffered host-side journal, one record per enqueue (E), submit (S) and completed

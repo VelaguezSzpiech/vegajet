@@ -36,7 +36,7 @@ class CollectiveCLI(unittest.TestCase):
                 if n != 2:
                     p = self.run_cli("--tp", str(n))
                     self.assertEqual(p.returncode, 3)
-                    self.assertIn("TP=2 only until milestone 3", p.stderr)
+                    self.assertIn("this build has no GPU backend", p.stderr)
 
     def test_default_and_invalid(self):
         p = self.run_cli("--dry-run")

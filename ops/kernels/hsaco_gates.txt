@@ -16,6 +16,7 @@ kfd_memset_u32 tiled
 kfd_stamp_clock_u64 tiled
 vj_flash_decode_mixed_kv_kernel tiled
 vj_flash_decode_lse_merge_kernel tiled
+vj_tp_allreduce_fp16 tiled
 ornith_embed_q8_kernel tiled
 ornith_rms_quant_q8_kernel tiled
 ornith_p2p_ar_res_rms_quant_kernel tiled

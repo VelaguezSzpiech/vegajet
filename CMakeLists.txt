@@ -76,6 +76,7 @@ add_library(vegajet_core STATIC
     core/sharder.cpp
     core/tp_sharder.cpp
     core/tp_collective.cpp
+    core/tp_runtime_topology.cpp
     core/topology_planner.cpp
     core/hw_profile.cpp
     core/kv_cache.cpp
@@ -184,6 +185,7 @@ if(NOT VEGAJET_CPU_ONLY)
         set(VEGAJET_HSACO_TARGETS "${VEGAJET_HSACO_TARGETS}" PARENT_SCOPE)
     endfunction()
 
+    vj_add_hsaco(vj_tp_collective      ops/kernels/vj_tp_collective.hip)
     vj_add_hsaco(vj_kfd_base           ops/kernels/vj_kfd_base.hip)
     vj_add_hsaco(vj_quant_ops          ops/kernels/vj_quant_ops.hiph -Wno-pragma-once-outside-header -x hip)
     vj_add_hsaco(vj_kv_flash_ops       ops/kernels/vj_kv_flash_ops.hiph -Wno-pragma-once-outside-header -x hip)
@@ -245,6 +247,7 @@ add_executable(vegajet
     cli/main.cpp
     cli/inspect.cpp
     cli/bench.cpp
+    cli/tp_ar_bench.cpp
     cli/soak.cpp
 )
 target_link_libraries(vegajet PRIVATE vegajet_cli vegajet_models Threads::Threads)
@@ -297,6 +300,7 @@ vj_test(test_ornith_loader)
 vj_test(test_sharder)
 vj_test(test_tp_sharder)
 vj_test(test_tp_collective)
+vj_test(test_tp_runtime_topology)
 vj_test(test_topology_planner)
 vj_test(test_grid_planner)
 vj_test(test_hsaco_gate)

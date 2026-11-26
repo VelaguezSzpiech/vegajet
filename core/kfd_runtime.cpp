@@ -3,9 +3,11 @@
 #include "core/gpu_select.hpp"
 #include "core/hsaco_gate.hpp"
 #include "core/hsaco_loader.hpp"
+#include "core/tp_collective_abi.hpp"
 #include "core/v12_modules.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -221,6 +223,8 @@ bool Runtime::open(std::string* err) {
     if (err) *err = "VegaJet was built with VEGAJET_CPU_ONLY=ON; the KFD runtime is disabled";
     return false;
 }
+bool Runtime::configure_collective(uint64_t, const tp::CollectiveOptions&, std::string* err) { return open(err); }
+bool Runtime::collective_allreduce(const std::vector<uint64_t>&, const std::vector<uint64_t>&, uint64_t, std::string* err) { return open(err); }
 bool Runtime::init(double, size_t, std::string* err, size_t) { return open(err); }
 void Runtime::shutdown() { open_ = false; }
 bool Runtime::abort_dispatches() { open_ = false; failed_ = true; return true; }
@@ -313,7 +317,7 @@ bool Runtime::init(double vram_arena_gib, size_t host_pinned_mb, std::string* er
     gpusel::Selection selection;
     if (!gpusel::resolve(nullptr, std::getenv(gpusel::kEnvVar), selection, err) ||
         !gpusel::filter(devices_, selection, err)) return false;
-    if ((expected_devices && devices_.size() != expected_devices) || devices_.size() > kMaxGpus) {
+    if ((expected_devices && devices_.size() != expected_devices) || devices_.size() > UINT32_MAX) {
         if (err) *err = "Runner requires exactly " + std::to_string(expected_devices ? expected_devices : kMaxGpus) +
                         " selected GPUs; found " + std::to_string(devices_.size()) +
                         ". Pin the intended cards with --gpu dddd:bb:dd.f,dddd:bb:dd.f (or VJ_GPU_DEVICES).";
@@ -493,7 +497,7 @@ bool Runtime::init(double vram_arena_gib, size_t host_pinned_mb, std::string* er
         }
     }
 
-    if (!setup_allreduce_mailbox()) {
+    if (devices_.size() == 2 && !setup_allreduce_mailbox()) {
         if (err) *err = "Failed to initialize AllReduce mailbox";
         shutdown();
         return false;
@@ -929,6 +933,13 @@ void Runtime::shutdown() {
         std::fprintf(stderr, "[vegajet::kfd] shutdown incomplete: queue teardown failed; retaining runtime allocations and fds\n");
         return;
     }
+    for (auto& inbox : collective_inboxes_) {
+        free_buffer(inbox.payload); free_buffer(inbox.flags);
+        free_buffer(inbox.host_payload); free_buffer(inbox.host_flags);
+    }
+    collective_inboxes_.clear();
+    free_buffer(collective_routes_); free_buffer(collective_status_);
+    collective_plan_ = {}; collective_topology_ = {}; collective_epoch_ = 0;
     for (auto& m : loaded_modules_) {
         for (auto& cb : m.code_buffers) free_buffer(cb);
     }
@@ -1134,6 +1145,7 @@ bool Runtime::load_hsaco_dir(const std::string& hsaco_dir, std::string* err) {
     }
     // Optional modules: loaded (and gated) when present, so builds without them keep working.
     const char* optional[] = {
+        "vj_tp_collective.hsaco",
         "vj_ornith_ar.hsaco",
         "vj_ornith_gemm.hsaco",
         "vj_ornith_attn.hsaco",
@@ -1580,6 +1592,8 @@ bool Runtime::download_from_vram(size_t gpu_idx, void* dst, uint64_t src_vram_va
     }
     return true;
 }
+
+#include "core/tp_runtime_collective.inc"
 
 #endif  // VEGAJET_CPU_ONLY
 
