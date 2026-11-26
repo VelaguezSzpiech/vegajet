@@ -864,6 +864,13 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
     const auto& hp = planner.hparams();
     const char* asym_env = std::getenv("VEGAJET_V12_ASYM_EXPERTS");
     const bool asym_experts = asym_env && std::strcmp(asym_env, "1") == 0;
+    const bool v12_batch_catchup = (std::getenv("VEGAJET_V12_BATCH_CATCHUP") != nullptr &&
+                                    std::getenv("VEGAJET_V12_BATCH_CATCHUP")[0] == '1');
+    if (!dispatch::mtp_batch_layout_supported(asym_experts, v12_batch_catchup)) {
+        res.error = "VEGAJET_V12_ASYM_EXPERTS=1 cannot be combined with VEGAJET_V12_BATCH_CATCHUP=1: "
+                    "batched MTP requires symmetric 512-column experts; disable either toggle";
+        return res;
+    }
 
     kfd::Runtime rt;
     if (!rt.init(30.5, 64, &res.error) && !rt.init(30.0, 64, &res.error)) return res;
@@ -3914,8 +3921,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
 
     // v1.2 levers, both default off: C7+S1 measured depth governor, S2 batched drafter catch-up.
     const bool v12_spec_gov = (std::getenv("VEGAJET_V12_SPEC_GOV") != nullptr && std::getenv("VEGAJET_V12_SPEC_GOV")[0] == '1');
-    const bool v12_batch_catchup = (std::getenv("VEGAJET_V12_BATCH_CATCHUP") != nullptr &&
-                                    std::getenv("VEGAJET_V12_BATCH_CATCHUP")[0] == '1');
+    // Batch flag was validated against the expert layout before runtime initialization.
 
     // v1.2 S2: ingest n <= kMaxSpecBatch blk.48 MTP tokens in ONE M-row forward instead of n M=1 forwards.
     // Same kernels, buffers and order as step_mtp; only the grid gains the row dimension (attn_prep/spec_flash
