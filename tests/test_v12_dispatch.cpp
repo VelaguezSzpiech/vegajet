@@ -8,6 +8,10 @@
 #include <initializer_list>
 
 int main() {
+    VJ_CHECK(vegajet::dispatch::mtp_batch_layout_supported(false, false));
+    VJ_CHECK(vegajet::dispatch::mtp_batch_layout_supported(false, true));
+    VJ_CHECK(vegajet::dispatch::mtp_batch_layout_supported(true, false));
+    VJ_CHECK(!vegajet::dispatch::mtp_batch_layout_supported(true, true));
     // Two logical collectives per batch: both ranks must share epoch and slot.
     for (uint32_t start : {1u, 2u, std::numeric_limits<uint32_t>::max()}) {
         uint32_t next = start;
