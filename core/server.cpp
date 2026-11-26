@@ -1009,15 +1009,16 @@ struct OpenAiServer::Impl {
             parser.push(text, ev);
             deliver(ev);
         };
-        const TokenSink sink = [&](std::string_view piece) -> bool {
-            if (gone || stopping) return false;
+        const TokenSink sink = [&](std::string_view piece) -> SinkResult {
+            if (stopping) return SinkResult::Stop();
+            if (gone) return SinkResult::ClientGone();
             if (pieces++ == 0) t_first = Clock::now();
             emit(sm.push(piece));
-            if (gone) return false;
-            if (sm.stopped()) return false;
-            if (parser.done()) return false;  // parallel_tool_calls = false: the first call ends the turn
-            if (static_cast<int32_t>(pieces) >= rq.max_tokens) { hit_length = true; return false; }
-            return true;
+            if (gone) return SinkResult::ClientGone();  // a write failed: the client is gone
+            if (sm.stopped()) return SinkResult::Stop();
+            if (parser.done()) return SinkResult::Stop();  // parallel_tool_calls = false: the first call ends the turn
+            if (static_cast<int32_t>(pieces) >= rq.max_tokens) { hit_length = true; return SinkResult::Stop(); }
+            return SinkResult();
         };
 
         GenerateResult res;

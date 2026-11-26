@@ -61,9 +61,22 @@ struct GenerateResult {
     std::string error;               // non-empty: request failed (HTTP 500 unless streaming already started)
 };
 
-// Receives one decoded token piece (any bytes; may split UTF-8 sequences). Returns false when generation must stop
+// What a TokenSink returns. `stop` ends generation; `client_gone` says it stopped because the client went away, so
+// the request is recorded as cancelled (status 499) instead of as a completed 200 (S-M2). A plain bool is still
+// accepted (true = continue), so existing sinks keep working.
+struct SinkResult {
+    bool stop = false;
+    bool client_gone = false;
+    SinkResult() = default;
+    SinkResult(bool continue_generation) : stop(!continue_generation) {}  // NOLINT: implicit on purpose
+    static SinkResult Stop() { SinkResult r; r.stop = true; return r; }
+    static SinkResult ClientGone() { SinkResult r; r.stop = true; r.client_gone = true; return r; }
+    explicit operator bool() const { return !stop; }
+};
+
+// Receives one decoded token piece (any bytes; may split UTF-8 sequences). A falsy result means generation must stop
 // (client gone, stop sequence hit, max_tokens reached, or server shutting down).
-using TokenSink = std::function<bool(std::string_view piece)>;
+using TokenSink = std::function<SinkResult(std::string_view piece)>;
 using GenerateFn = std::function<GenerateResult(const GenerateRequest&, const TokenSink&)>;
 
 struct ServerOptions {
