@@ -376,6 +376,8 @@ set_source_files_properties(tests/test_moe_route_group.cpp core/moe_route_group.
 
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_FOUND)
+    add_test(NAME test_v12_fix_contracts
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/test_v12_fix_contracts.py)
     add_test(NAME test_tools
              COMMAND ${Python3_EXECUTABLE} -m unittest discover -s tests -p "test_tools*.py"
              WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
