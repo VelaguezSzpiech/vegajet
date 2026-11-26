@@ -233,7 +233,9 @@ bool GgufFile::open(const std::string& path) {
         const uint64_t nb = ti.n_bytes();
         if (nb == 0 && ggml_type_traits(ti.type).name == nullptr)
             return fail("tensor " + ti.name + " has unknown ggml type " + std::to_string(ti.type));
-        if (data_offset_ + ti.offset + nb > file_size_)
+        // Overflow-safe: `offset` and `nb` are file-controlled, so a plain sum can wrap.
+        if (data_offset_ > file_size_ || ti.offset > file_size_ - data_offset_ ||
+            nb > file_size_ - data_offset_ - ti.offset)
             return fail("tensor " + ti.name + " extends past end of file");
     }
     return true;
@@ -286,6 +288,13 @@ const GgufTensorInfo* GgufFile::tensor(const std::string& name) const {
 
 const uint8_t* GgufFile::tensor_data(const GgufTensorInfo& t) {
     if (fd_ < 0) return nullptr;
+    // Re-validate the range here: callers may hand in tensor infos that were never vetted by open().
+    const uint64_t nb = t.n_bytes();
+    if (nb == 0 || data_offset_ > file_size_ || t.offset > file_size_ - data_offset_ ||
+        nb > file_size_ - data_offset_ - t.offset) {
+        err_ = path_ + ": tensor " + t.name + " extends past end of file";
+        return nullptr;
+    }
     if (!map_) {
         void* m = ::mmap(nullptr, file_size_, PROT_READ, MAP_PRIVATE, fd_, 0);
         if (m == MAP_FAILED) { err_ = path_ + ": mmap failed"; return nullptr; }
