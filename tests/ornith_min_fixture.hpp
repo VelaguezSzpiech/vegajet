@@ -12,6 +12,7 @@ struct OrnithHparams {
     uint32_t block_count = 1;
     bool nextn_present = true;
     uint64_t nextn = 0;              // written as u32 when it fits, u64 otherwise
+    uint32_t embedding_length = 256;
     uint32_t head_count = 4;
     uint32_t head_count_kv = 2;
     uint32_t full_attn_interval = 4;
@@ -22,7 +23,7 @@ inline std::string write_min_ornith(const OrnithHparams& p, const std::string& t
     const std::string a = "qwen35moe";
     g.kv_str("general.architecture", a);
     g.kv_u32(a + ".block_count", p.block_count);
-    g.kv_u32(a + ".embedding_length", 256);
+    g.kv_u32(a + ".embedding_length", p.embedding_length);
     g.kv_u32(a + ".attention.head_count", p.head_count);
     g.kv_u32(a + ".attention.head_count_kv", p.head_count_kv);
     g.kv_u32(a + ".expert_count", 8);
