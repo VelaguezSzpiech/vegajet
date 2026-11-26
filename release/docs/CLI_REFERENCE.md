@@ -315,6 +315,7 @@ Exit codes: 0 ok (end of input or `/quit`), 1 server unreachable (`GET /health` 
 | `VEGAJET_MOE_Q3_FAST` | Ornith GPU bench | `0` turns off the dedicated Q3 MoE super-kernel. On by default; it is used only at 240 workgroups on layers whose Gate+Up is in the VJ_Q3_IQ2S layout (`VEGAJET_GU_Q3`). |
 | `VEGAJET_SUPER_PROFILE` | Ornith GPU bench | `1`: after the raw bench, a per-stage `s_memrealtime` profile of the super-kernels (diagnostic). |
 | `VEGAJET_V12_BARRIER_VOL` | Ornith GPU bench | `1`: bind the `vj_ornith_super_vol` super-kernels, whose stage barriers use `buffer_wbinvl1_vol` instead of `buffer_wbinvl1`. Same source, separate `.hsaco`; off by default and unverified on hardware. |
+| `VEGAJET_V12_IQ2S_REG` | Ornith GPU bench | `1`: bind the `vj_ornith_super_iq2sreg` super-kernels, which decode IQ2_S Gate+Up from the 4 KiB `iq2s_grid32` table held in L1D instead of a 4 KiB LDS copy (8,896 B -> 4,800 B LDS, bit-exact). Off by default; mutually exclusive with `VEGAJET_V12_BARRIER_VOL`. |
 | `VEGAJET_RAW_TG512` | Ornith GPU bench | `1`: also measure raw M=1 over 512 tokens after tg128. |
 | `VEGAJET_RAW_ONLY` | Ornith GPU bench | `1`: raw M=1 only; skips the MTP head and uses the smaller raw-only VRAM budget for DOT8 promotion. |
 | `VEGAJET_GU_DOT8_LAYERS` | Ornith GPU bench | Number of Gate+Up layers to promote to DOT8 (overrides the automatic choice; `0` = automatic). |

@@ -857,6 +857,17 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
     {
         const char* v = std::getenv("VEGAJET_V12_BARRIER_VOL");
         if (v != nullptr && v[0] == '1') super_sfx = "_vol";
+        const char* r = std::getenv("VEGAJET_V12_IQ2S_REG");
+        if (r != nullptr && r[0] == '1') {
+            // Both levers rebuild the same four kernels; there is no _vol+_iq2sreg object, and
+            // silently picking one would misreport which variant was measured.
+            if (!super_sfx.empty()) {
+                res.error = "VEGAJET_V12_BARRIER_VOL and VEGAJET_V12_IQ2S_REG are mutually exclusive "
+                            "(no combined super-kernel variant is built)";
+                return res;
+            }
+            super_sfx = "_iq2sreg";
+        }
     }
 
     KernelTable K[2];
@@ -971,7 +982,8 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                                        !K[g].m1_moe_super || !K[g].m1_moe_super_q3)) {
                 // Fail closed: a requested variant that is not on disk would otherwise fall through
                 // to the baseline kernels of a stale build and silently measure nothing.
-                if (kerr && kerr->empty()) *kerr = "VEGAJET_V12_BARRIER_VOL=1 needs vj_ornith_super" + super_sfx + ".hsaco in " + hdir;
+                if (kerr && kerr->empty()) *kerr = "super-kernel variant " + super_sfx +
+                    " requested but vj_ornith_super" + super_sfx + ".hsaco is missing from " + hdir;
                 return false;
             }
             K[g].moe_gu_repack    = rt.get_kernel(g, "vj_repack_iq2s_to_dot8_gu_kernel");

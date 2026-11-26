@@ -1291,7 +1291,8 @@ void VJ_KNAME(ornith_m1_gqa_super_kernel)(
 // ============================================================================
 // SUPER-KERNEL B-MoE: [Post-Mixer AR] -> [Balanced 240-WG Router+ShGU] -> [Top8+ShSwiGLU]
 //                     -> [240-WG 4-KiB grid32 IQ2_S Gate+Up + Shared Down] -> [192-WG DOT8 Down + BAR0 PP]
-// Grid: 240 WGs x 256 thr (4 WGs/CU x 60 CUs). 48 dispatches/token! Total LDS = 8,928 B!
+// Grid: 240 WGs x 256 thr (4 WGs/CU x 60 CUs). 48 dispatches/token! Total LDS = 8,928 B
+// (4,800 B with -DVJ_V12_IQ2S_REG, which drops the 4 KiB grid table from LDS).
 // ============================================================================
 extern "C" __global__ __launch_bounds__(256, 4)
 void VJ_KNAME(ornith_m1_moe_super_kernel)(
@@ -1302,7 +1303,15 @@ void VJ_KNAME(ornith_m1_moe_super_kernel)(
     uint64_t fault_va) {
     using namespace vegajet::super_dev;
     const FaultCtx fctx{fault_va, super_sense & 0x7FFFFFFFu};
+#if defined(VJ_V12_IQ2S_REG)
+    // v1.2 (D8) variant: no LDS grid table. The 4 KiB iq2s_grid32 is read-only and shared by every
+    // WG on the CU, so it stays resident in the 16 KiB L1D; the tile helper reads it through the
+    // same generic pointer it used for the LDS copy (identical bytes, identical perm4 math ->
+    // bit-exact, see tests/test_iq2s_perm4.cpp). LDS drops 8,896 B -> 4,800 B.
+    const uint32_t* sm_grid32 = vegajet::ggml_tables::iq2s_grid32;
+#else
     __shared__ uint32_t sm_grid32[1024]; // 4,096 B (half of sm_grid!)
+#endif
     __shared__ uint4    sm_x[256];       // 4,096 B
     __shared__ float    sm_xd[128];      //   512 B
     __shared__ float    sm_y[32];        //   128 B
@@ -1335,9 +1344,11 @@ void VJ_KNAME(ornith_m1_moe_super_kernel)(
             desc->D, ar_epoch, desc->eps, fctx, 0u)) return;
     }
     // Preload 4-KiB sm_grid32 into LDS ONLY on non-DOT8 (IQ2_S) layers!
+#if !defined(VJ_V12_IQ2S_REG)
     if (desc->w_gu_d8_w == 0ULL) {
         reinterpret_cast<uint4*>(sm_grid32)[tid] = reinterpret_cast<const uint4*>(vegajet::ggml_tables::iq2s_grid32)[tid];
     }
+#endif
     if (ar_epoch != 0u) {
         VJ_SUPER_BAR(sbar, super_sense, 0u, 1u);
     } else {

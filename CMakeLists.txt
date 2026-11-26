@@ -207,6 +207,9 @@ if(NOT VEGAJET_CPU_ONLY)
         # v1.2 opt-in variants: same source, own symbol suffix (see VJ_KNAME), own gate lines.
         # VEGAJET_V12_BARRIER_VOL=1 binds *_vol (buffer_wbinvl1_vol stage barriers).
         vj_add_hsaco(vj_ornith_super_vol ops/kernels/vj_ornith_super.hip -DVJ_V12_WBINVL1_VOL -DVJ_KERNEL_SUFFIX=_vol)
+        # VEGAJET_V12_IQ2S_REG=1 binds *_iq2sreg (IQ2_S Gate+Up decodes from the L1-resident 4 KiB
+        # grid table, no LDS copy -> 8,896 B -> 4,800 B LDS per WG).
+        vj_add_hsaco(vj_ornith_super_iq2sreg ops/kernels/vj_ornith_super.hip -DVJ_V12_IQ2S_REG -DVJ_KERNEL_SUFFIX=_iq2sreg)
     endif()
     add_custom_target(vegajet_hsacos DEPENDS ${VEGAJET_HSACO_TARGETS})
 endif()
@@ -274,6 +277,7 @@ vj_test(test_grid_planner)
 vj_test(test_hsaco_gate)
 # v1.2 C1/C3: device fault-record decoding + token-id bounds guard (host side).
 vj_test(test_device_guard)
+vj_test(test_iq2s_perm4)
 # ---- Pre-tokenizer families + SPM, Jinja-subset chat templates, full sampler stack (core_tokenizer_samplers) ----
 target_sources(vegajet_core PRIVATE core/pretok_families.cpp core/chat_template.cpp core/sampler_stack.cpp)
 vj_test(test_tokenizer_samplers)
