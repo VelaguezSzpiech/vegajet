@@ -59,6 +59,7 @@ struct GenerateResult {
     double prefill_ms = 0.0;
     double decode_ms = 0.0;
     std::string error;               // non-empty: request failed (HTTP 500 unless streaming already started)
+    int http_status = 0;             // error only: the status to answer with (0 = 500), e.g. 400 context_length_exceeded
 };
 
 // What a TokenSink returns. `stop` ends generation; `client_gone` says it stopped because the client went away, so

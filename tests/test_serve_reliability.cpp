@@ -170,6 +170,12 @@ bool wait_until(const std::function<bool()>& pred, int ms = 5000) {
     return pred();
 }
 
+json::Value parse_json_body(const std::string& s) {
+    json::Value v;
+    if (!json::parse(s, v)) { std::fprintf(stderr, "bad JSON: %s\n", s.c_str()); VJ_CHECK(false); }
+    return v;
+}
+
 std::string read_text_file(const std::string& path) {
     std::FILE* f = std::fopen(path.c_str(), "rb");
     VJ_CHECK(f != nullptr);
@@ -389,7 +395,12 @@ void test_m1_half_close() {
 // client-gone sink result becomes FinishReason::Cancelled.
 struct SlowEngine : IEngine {
     MockEngine inner;
-    ModelInfo model_info() const override { return inner.model_info(); }
+    uint32_t ctx = 0;  // 0: the mock's own context length
+    ModelInfo model_info() const override {
+        ModelInfo mi = inner.model_info();
+        if (ctx) mi.context_length = ctx;
+        return mi;
+    }
     const BpeTokenizer& tokenizer() const override { return inner.tokenizer(); }
     std::string format_chat(const std::vector<ChatMessage>& m) const override { return inner.format_chat(m); }
     void generate(const std::vector<int32_t>&, const GenerationParams& gp, const TokenCallback& on) override {
@@ -496,6 +507,84 @@ void test_m3_model_field() {
     srv.stop();
 }
 
+// ------------------------------------------------------------------------------------------------ S-M4
+// No prompt / context / max_tokens bound: an 8 MB body was accepted (391 MB process) and --max-tokens-cap was
+// never wired, so one request could hold a queue slot for as long as it liked.
+void test_m4_token_and_prompt_caps() {
+    {  // max_tokens is capped
+        MockGen gen;
+        ServerOptions opt;
+        opt.port = 0;
+        opt.model_id = "m";
+        opt.max_tokens_cap = 2;
+        OpenAiServer srv(opt, [&](const GenerateRequest& r, const TokenSink& s) { return gen(r, s); });
+        std::string err;
+        VJ_CHECK(srv.start(&err));
+        const Resp r = chat(srv.port(), chat_body("m", "hi", ",\"max_tokens\":100000"));
+        VJ_CHECK(r.status == 200);
+        const json::Value v = parse_json_body(r.body);
+        VJ_CHECK(v.get("usage")->get("completion_tokens")->num == 2);
+        VJ_CHECK(v.get("choices")->arr[0].get("finish_reason")->str == "length");
+        srv.stop();
+    }
+    {  // a prompt that cannot fit answers 400 before it is encoded
+        MockGen gen;
+        ServerOptions opt;
+        opt.port = 0;
+        opt.model_id = "m";
+        opt.context_length = 64;
+        OpenAiServer srv(opt, [&](const GenerateRequest& r, const TokenSink& s) { return gen(r, s); });
+        std::string err;
+        VJ_CHECK(srv.start(&err));
+        const Resp r = chat(srv.port(), chat_body("m", std::string(600, 'a')));
+        VJ_CHECK(r.status == 400);
+        VJ_CHECK(r.body.find("context_length_exceeded") != std::string::npos);
+        srv.stop();
+    }
+    {  // max_tokens is clamped to what the prompt leaves free, so one request cannot hold the slot
+        const int32_t room_ctx = 64;
+        int emitted = 0;
+        ServerOptions opt;
+        opt.port = 0;
+        opt.model_id = "m";
+        opt.context_length = static_cast<uint32_t>(room_ctx);
+        opt.max_tokens_cap = 4096;
+        OpenAiServer srv(opt, [&](const GenerateRequest& r, const TokenSink& s) {
+            (void)r;
+            GenerateResult res;
+            for (int i = 0; i < 100; ++i) {
+                ++emitted;
+                if (!s("x")) break;
+            }
+            return res;  // finish = Stop; the server overrides to Length when max_tokens cuts it
+        });
+        std::string err;
+        VJ_CHECK(srv.start(&err));
+        const Resp r = chat(srv.port(), chat_body("m", std::string(40, 'a'), ",\"max_tokens\":100000"));
+        VJ_CHECK(r.status == 200);
+        const json::Value v = parse_json_body(r.body);
+        const int tokens = static_cast<int>(v.get("usage")->get("completion_tokens")->num);
+        VJ_CHECK(tokens > 0 && tokens < 64);
+        VJ_CHECK(v.get("choices")->arr[0].get("finish_reason")->str == "length");
+        srv.stop();
+    }
+    {  // the tokenizer's exact count is the final word (adapter path)
+        SlowEngine engine;
+        engine.ctx = 4;
+        ServerOptions opt;
+        opt.port = 0;
+        opt.model_id = "m";
+        opt.context_length = 0;  // no server-side estimate: exercise the adapter check
+        OpenAiServer srv(opt, make_engine_generate_fn(engine));
+        std::string err;
+        VJ_CHECK(srv.start(&err));
+        const Resp r = chat(srv.port(), chat_body("m", "hello there"));
+        VJ_CHECK(r.status == 400);
+        VJ_CHECK(r.body.find("context length of 4") != std::string::npos);
+        srv.stop();
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -505,9 +594,11 @@ int main() {
     test_m1_half_close();
     test_m2_cancelled_accounting();
     test_m3_model_field();
+    test_m4_token_and_prompt_caps();
     std::printf("test_serve_reliability: S-B1 bounded JSON parse, S-B2 connection limit 503 + health reserve,\n"
                 "                        S-M1 half-closed client gets the full response, S-M2 cancellation is logged as 499,\n"
-                "                        S-M3 model validated (404/400) and not repeated per chunk\n");
+                "                        S-M3 model validated (404/400) and not repeated per chunk,\n"
+                "                        S-M4 max_tokens + prompt capped against the context\n");
     std::printf("PASS\n");
     return 0;
 }

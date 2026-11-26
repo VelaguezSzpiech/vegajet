@@ -56,9 +56,10 @@ void print_serve_usage(std::FILE* f) {
                  "       vegajet serve --mock [--gguf TOKENIZER-FILE] [--slots N] [common options]\n"
                  "  common: [--host 127.0.0.1] [--port 8080] [--model-id NAME] [--max-queue 16]\n"
                  "          [--chat-format auto|chatml|qwen25|qwen3|ornith] [--enable-thinking] [--reasoning-format auto|none]\n"
-                 "          [--request-log FILE] [--metrics-hw]\n"
+                 "          [--request-log FILE] [--metrics-hw] [--max-tokens-cap N]\n"
                  "  --gpu       GPUs this process may use (positions in `vegajet serve --gpu list`); overrides VJ_GPU_DEVICES\n"
                  "  --slots     concurrent sequences (continuous batching; needs an engine with a batch path, e.g. --mock)\n"
+                 "  --max-tokens-cap  cap on a request's max_tokens (default: the --ctx context length)\n"
                  "  --request-log  append one JSON line per request (timings, token counts; never prompt text)\n"
                  "  --metrics-hw   add read-only GPU sysfs telemetry (temperatures, power, RAS ECC) to GET /metrics\n"
                  "  Exit codes: 0 ok, 1 model/tokenizer/request-log unreadable, 2 usage error, 3 engine unavailable or bind failure.\n");
@@ -90,6 +91,10 @@ int parse_serve_args(const std::vector<std::string>& args, ServeConfig& c, std::
         else if (a == "--hsaco-dir") { if (!value(c.hsaco_dir)) return fail("--hsaco-dir needs a directory"); }
         else if (a == "--request-log") { if (!value(c.request_log) || c.request_log.empty()) return fail("--request-log needs a file"); }
         else if (a == "--metrics-hw") c.metrics_hw = true;
+        else if (a == "--max-tokens-cap") {
+            if (!value(v) || !parse_uint(v, 1, 1u << 20, n)) return fail("--max-tokens-cap takes 1..1048576");
+            c.max_tokens_cap = static_cast<int32_t>(n);
+        }
         else if (a == "--chat-format") {
             bpe::ChatFormat f;
             if (!value(v) || (v != "auto" && !chat_format_from(v, f))) return fail("--chat-format takes auto|chatml|qwen25|qwen3|ornith");
@@ -234,6 +239,9 @@ int run_serve(const std::vector<std::string>& args, const gpusel::Selection& gpu
     so.model_id = c.model_id.empty() ? "vegajet-mock-gfx906" : c.model_id;
     so.context_length = c.ctx;
     so.max_queue = std::max<uint32_t>(c.max_queue, c.slots);
+    // S-M4: bound a single request's max_tokens. Default: the context length, so one stream cannot hold a queue slot
+    // far beyond what the model can produce; --max-tokens-cap lowers it further.
+    so.max_tokens_cap = c.max_tokens_cap > 0 ? c.max_tokens_cap : static_cast<int32_t>(c.ctx);
     so.parse_reasoning = c.parse_reasoning;
     so.workers = c.slots;
     std::unique_ptr<sched::ServeLoop> loop;
