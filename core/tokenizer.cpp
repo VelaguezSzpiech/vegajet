@@ -74,6 +74,7 @@ struct GgufReader {
     bool ok = true;
     std::string why;  // set when a count/shape is refused, so the caller can name the problem
 
+    static constexpr int kMaxArrayDepth = 4;
     uint64_t remaining() const { return ok ? static_cast<uint64_t>(end - p) : 0; }
 
     template <typename T>
@@ -122,7 +123,7 @@ struct GgufReader {
         p += n;
     }
 
-    void skip_val(uint32_t vt) {
+    void skip_val(uint32_t vt, int depth = 0) {
         if (!ok) return;
         switch (vt) {
             case 0: case 1: case 7: skip_bytes(1); break;
@@ -131,6 +132,12 @@ struct GgufReader {
             case 10: case 11: case 12: skip_bytes(8); break;
             case 8: { uint64_t l = read<uint64_t>(); skip_bytes(l); break; }
             case 9: {
+                // GGUF has no nested arrays in practice; each level costs a stack frame, so cap it.
+                if (depth >= kMaxArrayDepth) {
+                    why = "nested array value deeper than " + std::to_string(kMaxArrayDepth) + " levels";
+                    ok = false;
+                    return;
+                }
                 uint32_t et = read<uint32_t>();
                 uint64_t cnt = read<uint64_t>();
                 if (!ok) return;
@@ -144,7 +151,7 @@ struct GgufReader {
                     if (cnt > static_cast<uint64_t>(end - p) / elem_sz) { ok = false; return; }
                     p += cnt * elem_sz;
                 } else {
-                    for (uint64_t i = 0; i < cnt && ok; ++i) skip_val(et);
+                    for (uint64_t i = 0; i < cnt && ok; ++i) skip_val(et, depth + 1);
                 }
                 break;
             }

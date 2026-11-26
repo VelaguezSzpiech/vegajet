@@ -111,6 +111,11 @@ public:
         str(k); u32(9); u32(elem_type); u64(count);  // header only; caller appends elements
         ++n_kv_;
     }
+    // KV header with an arbitrary value type; the caller appends the value bytes itself.
+    void kv_raw_value(const std::string& k, uint32_t value_type) {
+        str(k); u32(value_type);
+        ++n_kv_;
+    }
     void kv_arr_str(const std::string& k, const std::vector<std::string>& v) {
         kv_arr_scalars(k, 8, v.size());
         for (const auto& s : v) str(s);
