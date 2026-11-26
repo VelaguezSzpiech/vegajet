@@ -3626,6 +3626,9 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         VJ_CHECK(rt.enqueue_kernel(1, *K[1].memcpy_u32, gx, 1, 1, 256, 1, 1, &ka1, sizeof(ka1), true));
     };
 
+    // v1.2 C7+S1, default off: measured depth governor.
+    const bool v12_spec_gov = (std::getenv("VEGAJET_V12_SPEC_GOV") != nullptr && std::getenv("VEGAJET_V12_SPEC_GOV")[0] == '1');
+
     auto run_greedy_mtp = [&](const std::vector<int32_t>& prompt_ids, int n_gen, uint32_t K_draft,
                               bool use_hybrid_suffix, double* out_tps,
                               uint64_t* out_acc = nullptr, uint64_t* out_dr = nullptr,
@@ -3699,9 +3702,16 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         double t_draft = 0.0, t_catch = 0.0, t_ver[17] = {};
         uint32_t n_ver[17] = {}, n_cyc = 0, n_neural = 0;
         auto now_ms = []() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
+        // v1.2 C7+S1: depth from the measured per-M verify time and the live accepted length.
+        spec_policy::MeasuredDepthGovernor mtp_gov;
+        uint32_t gov_depth_sum = 0u, gov_depth_n = 0u;
         while (static_cast<int>(gen.size()) < n_gen) {
             const uint32_t rem = static_cast<uint32_t>(n_gen - static_cast<int>(gen.size()));
-            const uint32_t k_cur = std::min<uint32_t>({K_draft, kGdnRingSlots - 2u, (rem > 1u) ? (rem - 1u) : 0u});
+            uint32_t k_cur = std::min<uint32_t>({K_draft, kGdnRingSlots - 2u, (rem > 1u) ? (rem - 1u) : 0u});
+            if (v12_spec_gov) {
+                const uint32_t gd = mtp_gov.next_depth(k_cur);
+                if (gd > 0u) { k_cur = std::min(k_cur, gd); gov_depth_sum += k_cur; ++gov_depth_n; }
+            }
             // Suffix chains are free to draft and almost always accepted, so they may fill a whole verify batch.
             const uint32_t k_sfx = std::min<uint32_t>({opt.suffix_max_draft, kGdnRingSlots - 2u, (rem > 1u) ? (rem - 1u) : 0u});
             if (k_cur == 0u && (!use_hybrid_suffix || k_sfx == 0u)) {
@@ -3778,6 +3788,10 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             uint32_t acc = 0;
             while (acc < dk && preds[acc] == drafts[acc]) ++acc;
             dr_tot += dk; acc_tot += acc;
+            if (v12_spec_gov) {
+                mtp_gov.observe_verify(std::min<uint32_t>(dk + 1u, 16u), tC - tB);
+                mtp_gov.observe_accept(dk, acc);
+            }
             commit_spec_gdn(acc, dk);
 
             ctx.push_back(gen.back());
@@ -3844,6 +3858,10 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                             static_cast<unsigned long long>(zs.neural),
                             static_cast<unsigned long long>(zs.suffix_tokens));
             }
+            if (v12_spec_gov && gov_depth_n > 0u)
+                std::printf(" | v12_gov depth %.2f alpha %.3f t_ver(M=4) %.2f ms",
+                            static_cast<double>(gov_depth_sum) / static_cast<double>(gov_depth_n),
+                            mtp_gov.alpha(), mtp_gov.measured_ms(4u));
             std::printf("\n");
         }
         double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - td0).count();
@@ -5006,6 +5024,11 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                 evict::CostModel ecost;
                 ecost.fixed_us = 2500.0; ecost.per_token_us = 350.0; ecost.per_expert_us = 14.0;
                 evict::EvictController evict_ctl(ecfg, ecost);
+                // v1.2 C7+S1: depth and inflation from the measured per-M verify time + live acceptance.
+                const bool v12_spec_gov = (std::getenv("VEGAJET_V12_SPEC_GOV") != nullptr &&
+                                           std::getenv("VEGAJET_V12_SPEC_GOV")[0] == '1');
+                spec_policy::MeasuredDepthGovernor df_gov;
+                uint32_t df_gov_depth_sum = 0u, df_gov_depth_n = 0u;
 
                 uint32_t pos = 0u;
                 int32_t last_pred = -1;
@@ -5029,7 +5052,11 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                 const auto td0 = std::chrono::steady_clock::now();
                 while (static_cast<int>(gen.size()) < n_gen) {
                     const uint32_t rem = static_cast<uint32_t>(n_gen - static_cast<int>(gen.size()));
-                    const uint32_t k_target = use_evict ? evict_ctl.next_depth() : k_draft;
+                    uint32_t k_target = use_evict ? evict_ctl.next_depth() : k_draft;
+                    if (v12_spec_gov) {
+                        const uint32_t gd = df_gov.next_depth(std::min<uint32_t>(k_draft, df.block_size - 1u));
+                        if (gd > 0u) { k_target = std::min(k_target, gd); df_gov_depth_sum += gd; ++df_gov_depth_n; }
+                    }
                     const uint32_t k_cur = std::min<uint32_t>({k_target, df.block_size - 1u, kGdnRingSlots - 2u, (rem > 1u) ? (rem - 1u) : 0u});
                     const uint32_t k_sfx = std::min<uint32_t>({opt.suffix_max_draft, kGdnRingSlots - 2u, (rem > 1u) ? (rem - 1u) : 0u});
                     if (k_cur == 0u) {
@@ -5075,6 +5102,10 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                         else if (use_hybrid_suffix) cascade.commit(drafts[acc]);
                         ++acc;
                     }
+                    if (v12_spec_gov) {
+                        df_gov.observe_verify(std::min<uint32_t>(dk + 1u, 17u), t2 - t1);
+                        df_gov.observe_accept(dk, acc);
+                    }
                     if (std::getenv("VEGAJET_DFLASH2_DEBUG") && pos < 64u) {
                         std::printf("  [DFVER pos=%u acc=%u/%u] tgt=[%d,%d,%d,%d,%d] dft=[%d,%d,%d,%d,%d]\n",
                                     pos, acc, dk,
@@ -5087,7 +5118,11 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                         else if (use_hybrid_suffix) cascade.commit(preds[acc]);
                     }
                     if (use_evict && !used_suffix && dk > 0u) {
-                        evict_ctl.observe(dk, acc, 1.0 + 0.35 * static_cast<double>(dk));
+                        // Measured time inflation replaces the fabricated 1 + 0.35*dk constant (C7); before the
+                        // first measurement the old constant keeps the controller warm-started.
+                        double infl = v12_spec_gov ? df_gov.time_inflation(dk + 1u) : 0.0;
+                        if (!(infl > 0.0)) infl = 1.0 + 0.35 * static_cast<double>(dk);
+                        evict_ctl.observe(dk, acc, infl);
                     }
                     acc_tot += acc; dr_tot += dk;
                     const uint32_t n_commit = acc + 1u;
@@ -5113,6 +5148,11 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                                 t_dr / n_cyc, df_t_body / n_cyc, df_t_lm / n_cyc, df_t_sel / n_cyc,
                                 t_ver / n_cyc, t_inj / n_cyc,
                                 static_cast<double>(n_gen - 1) / n_cyc);
+                    if (v12_spec_gov && df_gov_depth_n > 0u)
+                        std::printf("[V12 SPEC_GOV gpu=%zu] depth %.2f | alpha %.3f | t_ver(M=4) %.2f ms | inflation(M=8) %.2f\n",
+                                    df_gpu,
+                                    static_cast<double>(df_gov_depth_sum) / static_cast<double>(df_gov_depth_n),
+                                    df_gov.alpha(), df_gov.measured_ms(4u), df_gov.time_inflation(8u));
                 }
                 return gen;
             };
