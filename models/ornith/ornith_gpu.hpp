@@ -82,6 +82,7 @@ struct OrnithGpuOptions {
     uint32_t    dot8_fwht_layers = 0;      // with --dot8-fwht: 0 = all 48 layers, N = rotate layers 0..N-1 only
                                            // (N=1 isolates one layer's contribution in an A/B)
     std::string dump_logits_path;          // bench: dump full-vocab FP32 logits on held-out prompts (for KLD gate) and exit
+    std::string dump_tokens_path;          // bench: write generated token ids (tools/token_compare.py diffs two dumps)
     std::string gdn_state_dump;            // bench: two-chunk prompt + continuation; dump the carried GDN state at both chunk boundaries
     bool        prefill_seq     = false;   // with gdn_state_dump: feed the prompt one token at a time (sequential reference)
     bool        pp_stages       = false;   // bench: per-stage, per-rank wall time of one uncached pp2048 request

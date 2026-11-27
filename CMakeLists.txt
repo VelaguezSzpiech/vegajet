@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 cmake_minimum_required(VERSION 3.18)  # find_program(... REQUIRED), file(CONFIGURE)
-project(VegaJet VERSION 0.1.1 LANGUAGES CXX)
+project(VegaJet VERSION 0.1.2 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -254,6 +254,8 @@ if(NOT VEGAJET_CPU_ONLY)
         vj_add_hsaco(vj_ornith_super   ops/kernels/vj_ornith_super.hip)
         # Avoid hoisting LDS addresses across GU: fused AR otherwise triggers an 8 B Q3 spill.
         vj_add_hsaco(vj_ornith_super_x ops/kernels/vj_ornith_super_x.hip -mllvm -disable-machine-licm)
+        # Lean production twin of the _x source (W21): experimental bits compiled out; kernels *_l (VEGAJET_SUPER_X=1).
+        vj_add_hsaco(vj_ornith_super_l ops/kernels/vj_ornith_super_x.hip -DVJ_SUPER_LEAN=1 -mllvm -disable-machine-licm)
         vj_add_hsaco(vj_ornith_mega    ops/kernels/vj_ornith_mega.hip -mllvm -disable-machine-licm)
         vj_add_hsaco(vj_w75_vocab_q4a8 ops/kernels/vj_w75_vocab_q4a8.hip)
     endif()
@@ -567,6 +569,13 @@ endif()
 target_compile_definitions(vegajet PRIVATE VEGAJET_GIT_COMMIT="${VJ_GIT_COMMIT}")
 vj_test(test_bench_json)
 vj_test(test_power_telemetry)
+# M6: `vegajet bench --dump-tokens` writer + the token_compare.py gate that run.sh uses.
+vj_test(test_token_dump)
+if(Python3_FOUND)
+    add_test(NAME test_token_compare
+             COMMAND ${Python3_EXECUTABLE} -B -m unittest discover -s tests -p "test_token_compare*.py"
+             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+endif()
 if(Python3_FOUND)
     add_test(NAME test_bench_json_roundtrip
              COMMAND ${Python3_EXECUTABLE} -m unittest discover -s tests -p "test_bench_json_roundtrip*.py"

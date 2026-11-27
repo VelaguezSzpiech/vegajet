@@ -208,19 +208,77 @@ uint32_t MeasuredDepthGovernor::samples(uint32_t m) const {
     return (m < n_.size()) ? n_[m] : 0u;
 }
 
+void MeasuredDepthGovernor::observe_draft(uint32_t drafted, double ms) {
+    if (drafted == 0u || !(ms > 0.0)) return;
+    draft_ms_ = (draft_n_ == 0u) ? ms / drafted
+                                 : (1.0 - cfg_.ema) * draft_ms_ + cfg_.ema * (ms / drafted);
+    ++draft_n_;
+}
+
+void MeasuredDepthGovernor::observe_catchup(uint32_t committed, double ms) {
+    if (committed == 0u || !(ms > 0.0)) return;
+    catch_ms_ = (catch_n_ == 0u) ? ms / committed
+                                 : (1.0 - cfg_.ema) * catch_ms_ + cfg_.ema * (ms / committed);
+    ++catch_n_;
+}
+
+double MeasuredDepthGovernor::draft_ms_per_tok() const {
+    return draft_n_ > 0u ? draft_ms_ : cfg_.draft_ms_per_tok;
+}
+
+double MeasuredDepthGovernor::catchup_ms_per_tok() const {
+    return catch_n_ > 0u ? catch_ms_ : cfg_.catchup_ms_per_tok;
+}
+
+bool MeasuredDepthGovernor::warmed() const {
+    for (uint32_t k = 1; k < ms_.size() && k < 64u; ++k)
+        if (measured_ms(k) > 0.0) return true;
+    return false;
+}
+
+double MeasuredDepthGovernor::expected_tokens(uint32_t drafted) const {
+    const double a = alpha();
+    double prefix = 1.0, total = 1.0;
+    for (uint32_t j = 0; j < drafted; ++j) {
+        prefix *= a;
+        total += prefix;
+    }
+    return total;
+}
+
+double MeasuredDepthGovernor::cycle_ms(uint32_t drafted) const {
+    // v1.2 M2: verify the drafted prefix + bonus, pay for every proposed token, then catch the drafter up on
+    // every committed token. draft_ms_per_tok()/catchup_ms_per_tok() are the measured per-token costs.
+    return est_ms(drafted + 1u) + static_cast<double>(drafted) * draft_ms_per_tok() +
+           expected_tokens(drafted) * catchup_ms_per_tok();
+}
+
+double MeasuredDepthGovernor::cycle_rate(uint32_t drafted) const {
+    const double cost = cycle_ms(drafted);
+    return cost > 0.0 ? expected_tokens(drafted) / cost : 0.0;
+}
+
+MeasuredDepthGovernor::DepthChoice MeasuredDepthGovernor::choose_depth(uint32_t cap) const {
+    DepthChoice best;
+    if (cap == 0u || !warmed()) return best;  // cold: the caller keeps its configured depth
+    best.warmed = true;
+    best.tokens_per_ms = -1.0;
+    for (uint32_t m = 0; m <= cap; ++m) {
+        const double rate = cycle_rate(m);
+        if (rate > 0.0 && rate > best.tokens_per_ms * (1.0 + 1e-9)) {  // strict: ties keep the shallower cycle
+            best.depth = m;
+            best.tokens_per_ms = rate;
+        }
+    }
+    return best;
+}
+
 uint32_t MeasuredDepthGovernor::next_depth(uint32_t cap) const {
-    if (cap == 0) return 0;
-    bool any = false;
-    for (uint32_t k = 1; k < ms_.size() && k < 64u && !any; ++k) any = measured_ms(k) > 0.0;
-    if (!any) return 0;  // cold: leave the caller's depth alone
-
-    VerifyCostModel cm;
-    cm.measured_ms.assign(static_cast<size_t>(cap) + 2u, 0.0);
-    for (uint32_t m = 1; m <= cap + 1u; ++m) cm.measured_ms[m] = est_ms(m);
-
-    std::vector<double> cond(cap, alpha());
-    const EvictDecision ev = plan_evict(cond, cm, std::min(cfg_.k_min, cap), 0.0);
-    return std::min(std::max(ev.keep, std::min(cfg_.k_min, cap)), cap);
+    const DepthChoice c = choose_depth(cap);
+    if (!c.warmed) return 0;  // cold: leave the caller's depth alone
+    // Legacy contract: never 0 once warmed (0 means "no measurement"). Callers that want the plain-decode
+    // decision ask choose_depth() and get depth == 0 with warmed == true.
+    return std::min(std::max(c.depth, std::min(cfg_.k_min, cap)), cap);
 }
 
 // ---------------------------------------------------------------------------------------------------------

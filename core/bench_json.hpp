@@ -69,7 +69,7 @@ struct TelemetryCard {
 
 struct Record {
     // meta
-    std::string vegajet_version = "0.1.1", commit = "unknown", command = "bench", model, architecture, flags;
+    std::string vegajet_version = "0.1.2", commit = "unknown", command = "bench", model, architecture, flags;
     std::string gpu_selection = "all", prefill_path = "w4a8", plan_status, error, timestamp_utc;
     uint32_t tp = 1;
     bool executed = false;

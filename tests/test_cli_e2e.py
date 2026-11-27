@@ -123,7 +123,7 @@ class Cli(unittest.TestCase):
         self.assertEqual(rc, 0)
         for sub in ("inspect", "plan", "bench", "run", "doctor", "soak", "serve", "--gpu", "VJ_GPU_DEVICES", "Exit codes"):
             self.assertIn(sub, out)
-        self.assertEqual(run("--version")[1].strip(), "vegajet 0.1.1")
+        self.assertEqual(run("--version")[1].strip(), "vegajet 0.1.2")
         self.assertEqual(run()[0], 1)
         self.assertEqual(run("frobnicate")[0], 2)
         for sub in ("plan", "serve", "doctor", "inspect"):

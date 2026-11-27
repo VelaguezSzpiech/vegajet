@@ -2,3 +2,9 @@ build*/
 *.bin
 __pycache__/
 .claude/
+
+# telemetry raw artifacts (JSON/MD summaries are tracked)
+runs/*.csv
+runs/*.log
+runs/*.bin
+runs/.*_isa.json

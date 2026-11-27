@@ -1,3 +1,18 @@
+# VegaJet v0.1.2
+
+v0.1.2 is a source release on top of v0.1.1. It contains two bit-exact decode speedups, both on by default, and no binary bundle; build it from source.
+
+- **Binary version string:** `vegajet 0.1.2`; the CMake project version is `0.1.2`.
+- **Rig:** 3× Instinct MI50 32 GB (gfx906), TheRock / ROCm 7.12.0, BAR0 P2P, 150 W cap.
+- **Measured** (resident `vegajet bench --tp 3` engine, no environment overrides):
+  - raw `M=1` tg128: **175.6 tok/s** (mean of four runs; v0.1.1 defaults 174.0);
+  - Hybrid tg128 / tg512 on repeated code: **418.2 / 412.0 tok/s** (v0.1.1 defaults 390.9 / 384.6);
+  - all runs 129/129 against raw decode, ECC UE/DE 0/0.
+- **Rollback switches:** `VEGAJET_VERIFY_GEMM_X=0` restores the 8-row verify GEMM; `VEGAJET_SUPER_X=0` restores the previous M=1 super kernels.
+- **Known:**
+  - `VEGAJET_VERIFY_GEMM_X=2` also routes M<=8 verify GEMMs and is not bit-identical for MTP prose; investigation only.
+  - MTP K=4 prose matches raw decode only to token 14 (21/129), as in v0.1.1.
+
 # VegaJet v0.1.1
 
 v0.1.1 is a source release on top of `v0.1.0-alpha.1`. It runs the Ornith backend on **three** MI50 32 GB cards

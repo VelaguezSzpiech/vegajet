@@ -1076,6 +1076,8 @@ bool Runtime::load_hsaco_dir(const std::string& hsaco_dir, std::string* err) {
         "vj_ornith_mega.hsaco",
         // Opt-in super-kernel build with AR tile tags / DN_K4 (kernel names suffixed _x).
         "vj_ornith_super_x.hsaco",
+        // Lean production twin of the _x source (kernels suffixed _l; VEGAJET_SUPER_X=1).
+        "vj_ornith_super_l.hsaco",
         // Sealed Q8/Q4 Split-KV attention pair; host contract in ops/flash_decode_splitkv_launch.hpp.
         "vj_flash_decode_splitkv.hsaco",
         // Normal-engine Q/KV wire producers + epilogue for that pair (ops/wire_normal_launch.hpp).

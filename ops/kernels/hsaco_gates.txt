@@ -24,6 +24,7 @@ ornith_gemv_q4a8_m1_w16_kernel stream
 ornith_gemm_q4a8_tcc_kernel tiled
 ornith_gemm_q4a8_m8_kernel tiled
 ornith_gemm_q4a8_m12_kernel tiled
+ornith_gemm_q4a8_m12_x_kernel tiled
 ornith_gemm_q4a8_m16_l2_kernel tiled
 ornith_gdn_conv_l2_gate_kernel tiled
 ornith_gdn_recur_quant_kernel tiled
@@ -169,6 +170,10 @@ ornith_m1_gdn_super_kernel_x tiled
 ornith_m1_gqa_super_kernel_x tiled
 ornith_m1_moe_super_kernel_x tiled
 ornith_m1_moe_super_q3_kernel_x tiled
+ornith_m1_gdn_super_kernel_l tiled
+ornith_m1_gqa_super_kernel_l tiled
+ornith_m1_moe_super_kernel_l tiled
+ornith_m1_moe_super_q3_kernel_l tiled
 vj_dflash2_tap_copy_kernel tiled
 vj_dflash2_quant_q8_kernel tiled
 vj_dflash2_embed_block_kernel tiled

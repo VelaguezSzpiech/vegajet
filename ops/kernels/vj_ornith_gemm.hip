@@ -781,6 +781,155 @@ void ornith_gemm_q4a8_m12_kernel(
     }
 }
 
+// 4e-x. Resident-activation M<=12 VJ_Q4_A8 GEMM (VEGAJET_VERIFY_GEMM_X, default on for M=9..12):
+//     bit-identical to 4e. Each row is still owned by 32 lanes, lane L still accumulates blocks L, L+32, ... with the
+//     same fmaf chain into the same 12 accumulators, then the same block32_sum. What changes:
+//       * one 1024-thread WG per CU stages the WHOLE activation (<= 12 rows x <= 4096 cols q8 + scales, 60 KiB) into
+//         LDS once and then walks 32-row chunks (grid-stride), instead of every 8-row WG re-staging 1 KiB-col tiles
+//         from L2 (about 23 MB of activation traffic per GEMM pair at M=12 -> about 2.7 MB);
+//       * conflict-free LDS layout: the two 16 B halves of a block live in separate lane-contiguous planes
+//         (4e reads 16 B at a 32 B lane stride = 2-way bank conflicts on every ds_read_b128);
+//       * no per-tile __syncthreads pair: one barrier after staging, then barriers only around the BAR0 push.
+//     Requires cols % 32 == 0 and cols <= 4096 (host falls back to 4e otherwise).
+#define VJ_GX_MAXNB 128u
+extern "C" __global__ __launch_bounds__(1024, 1)
+void ornith_gemm_q4a8_m12_x_kernel(
+    const uint8_t*  __restrict__ w_qs,
+    const uint32_t* __restrict__ w_dm,
+    const int8_t*   __restrict__ x_q8,
+    const float2*   __restrict__ x_ds,
+    float*          __restrict__ y_out,
+    uint32_t rows,
+    uint32_t cols,
+    uint32_t M,
+    uint32_t row_stride_bytes,
+    uint16_t*       __restrict__ peer_tx,
+    uint16_t*       __restrict__ peer_tx2) {
+    const uint32_t tid  = threadIdx.x;
+    const uint32_t grp  = tid >> 5;  // 0..31: row slot inside the 32-row chunk
+    const uint32_t lane = tid & 31u;
+    const uint32_t m_cnt = min(12u, M);
+    const uint32_t nb    = cols >> 5;
+
+    // plane p (0 = low 16 B, 1 = high 16 B of each 32 B q8 block): sm_xp[(m * 2 + p) * VJ_GX_MAXNB + block]
+    __shared__ uint4  sm_xp[12u * 2u * VJ_GX_MAXNB];   // 48 KiB
+    __shared__ float2 sm_xds[12u * VJ_GX_MAXNB];       // 12 KiB
+    __shared__ float  sm_out[12u * 32u];               // 1.5 KiB: BAR0 push staging for one 32-row chunk
+
+    {
+        const uint4* gx4 = reinterpret_cast<const uint4*>(x_q8);
+        const uint32_t n16 = cols >> 4;  // uint4 per activation row (= 2 * nb)
+        #pragma nounroll
+        for (uint32_t idx = tid; idx < m_cnt * n16; idx += 1024u) {
+            const uint32_t m = idx / n16, s = idx - m * n16;
+            sm_xp[(m * 2u + (s & 1u)) * VJ_GX_MAXNB + (s >> 1)] = gx4[static_cast<uint64_t>(m) * n16 + s];
+        }
+        #pragma nounroll
+        for (uint32_t idx = tid; idx < m_cnt * nb; idx += 1024u) {
+            const uint32_t m = idx / nb, b = idx - m * nb;
+            sm_xds[m * VJ_GX_MAXNB + b] = x_ds[static_cast<uint64_t>(m) * nb + b];
+        }
+    }
+    __syncthreads();
+
+    const bool do_pp = (peer_tx != nullptr && (rows & 7u) == 0u);
+    #pragma nounroll
+    for (uint32_t chunk = blockIdx.x * 32u; chunk < rows; chunk += gridDim.x * 32u) {
+        const uint32_t row = chunk + grp;
+        const bool valid_row = (row < rows);
+        float a0=0, a1=0, a2=0, a3=0, a4=0, a5=0, a6=0, a7=0, a8=0, a9=0, a10=0, a11=0;
+        if (valid_row) {
+            const uint4*    w4 = reinterpret_cast<const uint4*>(w_qs + static_cast<uint64_t>(row) * row_stride_bytes);
+            const uint32_t* dm = w_dm + static_cast<uint64_t>(row) * nb;
+            #pragma nounroll
+            for (uint32_t b = lane; b < nb; b += 32u) {
+                const uint4    wv  = w4[b];
+                const uint32_t dmv = dm[b];
+                const float    wd  = vegajet::ornith_dev::fp16_to_f32(static_cast<uint16_t>(dmv & 0xFFFFu));
+                const float    wm  = vegajet::ornith_dev::fp16_to_f32(static_cast<uint16_t>(dmv >> 16));
+                const uint32_t wl0 = wv.x & 0x0F0F0F0Fu, wh0 = (wv.x >> 4) & 0x0F0F0F0Fu;
+                const uint32_t wl1 = wv.y & 0x0F0F0F0Fu, wh1 = (wv.y >> 4) & 0x0F0F0F0Fu;
+                const uint32_t wl2 = wv.z & 0x0F0F0F0Fu, wh2 = (wv.z >> 4) & 0x0F0F0F0Fu;
+                const uint32_t wl3 = wv.w & 0x0F0F0F0Fu, wh3 = (wv.w >> 4) & 0x0F0F0F0Fu;
+                auto mac = [&](uint32_t m, float& acc) {
+                    const uint4  xa  = sm_xp[(m * 2u)      * VJ_GX_MAXNB + b];
+                    const uint4  xb  = sm_xp[(m * 2u + 1u) * VJ_GX_MAXNB + b];
+                    const float2 xds = sm_xds[m * VJ_GX_MAXNB + b];
+                    int32_t dp = vegajet::ornith_dev::sdot4(wl0, xa.x, 0);
+                    dp         = vegajet::ornith_dev::sdot4(wl1, xa.y, dp);
+                    dp         = vegajet::ornith_dev::sdot4(wl2, xa.z, dp);
+                    dp         = vegajet::ornith_dev::sdot4(wl3, xa.w, dp);
+                    dp         = vegajet::ornith_dev::sdot4(wh0, xb.x, dp);
+                    dp         = vegajet::ornith_dev::sdot4(wh1, xb.y, dp);
+                    dp         = vegajet::ornith_dev::sdot4(wh2, xb.z, dp);
+                    dp         = vegajet::ornith_dev::sdot4(wh3, xb.w, dp);
+                    acc = fmaf(wd * xds.x, static_cast<float>(dp), fmaf(wm, xds.y, acc));
+                };
+                mac(0u, a0);
+                if (m_cnt > 1u) mac(1u, a1);
+                if (m_cnt > 2u) mac(2u, a2);
+                if (m_cnt > 3u) mac(3u, a3);
+                if (m_cnt > 4u) mac(4u, a4);
+                if (m_cnt > 5u) mac(5u, a5);
+                __builtin_amdgcn_sched_barrier(0);
+                if (m_cnt > 6u) mac(6u, a6);
+                if (m_cnt > 7u) mac(7u, a7);
+                if (m_cnt > 8u) mac(8u, a8);
+                if (m_cnt > 9u) mac(9u, a9);
+                if (m_cnt > 10u) mac(10u, a10);
+                if (m_cnt > 11u) mac(11u, a11);
+            }
+            auto emit = [&](uint32_t m, float v) {
+                v = vegajet::ornith_dev::block32_sum(v);
+                if (lane == 0u) {
+                    y_out[static_cast<uint64_t>(m) * rows + row] = v;
+                    if (do_pp) sm_out[m * 32u + grp] = v;
+                }
+            };
+            emit(0u, a0);
+            if (m_cnt > 1u) emit(1u, a1);
+            if (m_cnt > 2u) emit(2u, a2);
+            if (m_cnt > 3u) emit(3u, a3);
+            if (m_cnt > 4u) emit(4u, a4);
+            if (m_cnt > 5u) emit(5u, a5);
+            if (m_cnt > 6u) emit(6u, a6);
+            if (m_cnt > 7u) emit(7u, a7);
+            if (m_cnt > 8u) emit(8u, a8);
+            if (m_cnt > 9u) emit(9u, a9);
+            if (m_cnt > 10u) emit(10u, a10);
+            if (m_cnt > 11u) emit(11u, a11);
+        }
+        if (do_pp) {
+            __syncthreads();
+            // one 16 B FP16 packet per (m, 8-row group); same packets/addresses as 4e (8-row WG blockIdx.x -> chunk/8 + q)
+            uint32_t ptid = tid;
+            asm volatile("" : "+v"(ptid));  // keep the push addressing inside the loop (hoisting it spilled 20 B)
+            if (ptid < m_cnt * 4u) {
+                const uint32_t m = ptid >> 2, q = ptid & 3u;
+                const uint32_t r8 = chunk + q * 8u;
+                if (r8 < rows) {
+                    const float* so = sm_out + m * 32u + q * 8u;
+                    const __half2 h0 = __float22half2_rn(make_float2(so[0], so[1]));
+                    const __half2 h1 = __float22half2_rn(make_float2(so[2], so[3]));
+                    const __half2 h2 = __float22half2_rn(make_float2(so[4], so[5]));
+                    const __half2 h3 = __float22half2_rn(make_float2(so[6], so[7]));
+                    typedef uint32_t u32x4_t __attribute__((ext_vector_type(4)));
+                    u32x4_t pv = {
+                        *reinterpret_cast<const uint32_t*>(&h0),
+                        *reinterpret_cast<const uint32_t*>(&h1),
+                        *reinterpret_cast<const uint32_t*>(&h2),
+                        *reinterpret_cast<const uint32_t*>(&h3)
+                    };
+                    __builtin_nontemporal_store(pv, reinterpret_cast<u32x4_t*>(peer_tx + static_cast<uint64_t>(m) * rows + r8));
+                    if (peer_tx2 != nullptr)
+                        __builtin_nontemporal_store(pv, reinterpret_cast<u32x4_t*>(peer_tx2 + static_cast<uint64_t>(m) * rows + r8));
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
+
 // 4f. Bit-identical 32-lane LDS-tiled M=9..16 batched VJ_Q4_A8 GEMM for native block_size=16 DFlash2 & Suffix-15 verify:
 //     Loads w_qs/w_dm ONCE per 32-block K-tile and reuses 10 KiB LDS (4 WGs/CU) across 2 sub-batches of <=8 tokens
 //     (a0..a7, a8..a15). Exact 32-lane block32_sum order = 100% bit-identical to M=1 gemv_q4_w32 & m8/m12!

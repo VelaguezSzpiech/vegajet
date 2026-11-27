@@ -18,7 +18,7 @@ namespace {
 
 void print_usage(const char* prog) {
     std::printf(
-        "VegaJet CLI v0.1.1 — Bare-Metal gfx906 (Vega 20: MI50 / MI60) LLM Engine\n\n"
+        "VegaJet CLI v0.1.2 — Bare-Metal gfx906 (Vega 20: MI50 / MI60) LLM Engine\n\n"
         "Usage:\n"
         "  %s inspect <model-file> [--all-keys]                Header-only GGUF metadata / tensor / footprint report\n"
         "  %s plan <model-file> [--tp N] [--ctx T] ...         Plan + graph summary only (= bench --dry-run; any build)\n"
@@ -138,7 +138,7 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (cmd == "--version" || cmd == "-v") {
-        std::printf("vegajet 0.1.1\n");
+        std::printf("vegajet 0.1.2\n");
         return 0;
     }
     std::vector<std::string> args(argv + 2, argv + argc);

@@ -15,6 +15,7 @@
 #include "core/sharder.hpp"
 #include "core/gdn_vshard.hpp"
 #include "core/tcc_stagger.hpp"
+#include "core/token_dump.hpp"
 #include "core/q4_dot8_repack.hpp"
 #include "core/quant_repacker.hpp"
 #include "core/spec_policy.hpp"
@@ -329,6 +330,7 @@ struct KernelTable {
     const kfd::LoadedKernel* gemm_q4_tcc = nullptr;
     const kfd::LoadedKernel* gemm_q4_m8  = nullptr;
     const kfd::LoadedKernel* gemm_q4_m12 = nullptr;
+    const kfd::LoadedKernel* gemm_q4_m12x = nullptr;  // resident-activation M<=12 variant (VEGAJET_VERIFY_GEMM_X=1)
     const kfd::LoadedKernel* gemm_q4_m16 = nullptr;
     const kfd::LoadedKernel* gdn_conv_l2 = nullptr;
     const kfd::LoadedKernel* gdn_recur = nullptr;
@@ -445,6 +447,11 @@ struct KernelTable {
     const kfd::LoadedKernel* m1_gqa_super_x = nullptr;
     const kfd::LoadedKernel* m1_moe_super_x = nullptr;
     const kfd::LoadedKernel* m1_moe_super_q3_x = nullptr;
+    // Lean twins (vj_ornith_super_l): production path + W21 AllReduce fast path / WG0 broadcast (VEGAJET_SUPER_X=1).
+    const kfd::LoadedKernel* m1_gdn_super_l = nullptr;
+    const kfd::LoadedKernel* m1_gqa_super_l = nullptr;
+    const kfd::LoadedKernel* m1_moe_super_l = nullptr;
+    const kfd::LoadedKernel* m1_moe_super_q3_l = nullptr;
     const kfd::LoadedKernel* moe_gu_repack = nullptr;
     const kfd::LoadedKernel* moe_gu_lru    = nullptr;
 };
@@ -924,6 +931,21 @@ bool write_vram_bin(kfd::Runtime& rt, size_t gpu_idx, uint64_t va, uint64_t byte
 
 } // namespace
 
+// VEGAJET_MOE_PREFETCH bitmask for the _x Q3 MoE super kernel: 1 = L2-prefetch Stage-1 router/shared-GU weights
+// while WG0 runs the incoming AllReduce, 2 = L2-prefetch the first four experts' routed-Down weights before Stage 4.
+// Deep-telemetry dump layout (must match ops/kernels/vj_ornith_super_x.hip VJ_PROF_WG_OFF / VJ_PROF_ARW_OFF).
+static constexpr uint64_t kProfWgOff   = 32768u;
+static constexpr uint64_t kProfWgBytes = 96ull * 17ull * 256ull * 8ull;
+static constexpr uint64_t kProfArwOff  = kProfWgOff + kProfWgBytes;
+static constexpr uint64_t kProfDumpBytes = kProfArwOff + 96ull * 2ull * 8ull;
+static_assert(kProfWgOff >= ornith_mega::kScratchBytes, "per-WG profile area overlaps the mega scratch");
+
+static uint32_t moe_prefetch_xflags() {
+    const char* e = std::getenv("VEGAJET_MOE_PREFETCH");
+    if (!e || !e[0]) return 0u;
+    return static_cast<uint32_t>(std::atoi(e)) & 3u;
+}
+
 OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                                   const std::string& prompt_text,
                                   const OrnithGpuOptions& opt_in) {
@@ -1216,6 +1238,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             K[g].gemm_q4_tcc  = need_k("ornith_gemm_q4a8_tcc_kernel");
             K[g].gemm_q4_m8   = need_k("ornith_gemm_q4a8_m8_kernel");
             K[g].gemm_q4_m12  = need_k("ornith_gemm_q4a8_m12_kernel");
+            K[g].gemm_q4_m12x = rt.get_kernel(g, "ornith_gemm_q4a8_m12_x_kernel");
             K[g].gemm_q4_m16  = need_k("ornith_gemm_q4a8_m16_l2_kernel");
             K[g].gdn_conv_l2  = need_k("ornith_gdn_conv_l2_gate_kernel");
             K[g].gdn_recur    = need_k("ornith_gdn_recur_quant_kernel");
@@ -1361,6 +1384,10 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             K[g].m1_gqa_super_x    = rt.get_kernel(g, "ornith_m1_gqa_super_kernel_x");
             K[g].m1_moe_super_x    = rt.get_kernel(g, "ornith_m1_moe_super_kernel_x");
             K[g].m1_moe_super_q3_x = rt.get_kernel(g, "ornith_m1_moe_super_q3_kernel_x");
+            K[g].m1_gdn_super_l    = rt.get_kernel(g, "ornith_m1_gdn_super_kernel_l");
+            K[g].m1_gqa_super_l    = rt.get_kernel(g, "ornith_m1_gqa_super_kernel_l");
+            K[g].m1_moe_super_l    = rt.get_kernel(g, "ornith_m1_moe_super_kernel_l");
+            K[g].m1_moe_super_q3_l = rt.get_kernel(g, "ornith_m1_moe_super_q3_kernel_l");
             K[g].moe_gu_repack    = rt.get_kernel(g, "vj_repack_iq2s_to_dot8_gu_kernel");
             K[g].moe_gu_lru       = rt.get_kernel(g, "vj_moe_gu_dot8_lru_kernel");
             K[g].vocab_argmax_b16 = need_k("ornith_vocab_argmax_q8_batch16_l2_kernel");
@@ -2413,7 +2440,9 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         S[g].gdn_bar_va     = alloc(8192u, 256);
         S[g].moe_bq_va      = alloc(256u);
         // Reserve diagnostic records at load time: warm runs may enable PROFILE=2 later (>= mega barrier bytes).
-        S[g].super_bar_va      = alloc(std::max<uint64_t>(16384u, ornith_mega::kScratchBytes), 256);
+        // super scratch + mega ring + the per-WG critical-stamp area (super_x VJ_PROF_WG_OFF/ARW_OFF). Always sized for
+        // the stamps: VEGAJET_SUPER_PROFILE=2 can be set per warm run, after this load-time allocation (W17 fault).
+        S[g].super_bar_va      = alloc(std::max<uint64_t>(kProfDumpBytes, ornith_mega::kScratchBytes), 256);
         S[g].mega_desc_va      = alloc(sizeof(ornith_super::Mega48Desc), 256);
         S[g].gdn_super_desc_va = alloc(36ULL * sizeof(ornith_super::GdnSuperDesc), 256);
         S[g].gqa_super_desc_va = alloc(12ULL * sizeof(ornith_super::GqaSuperDesc), 256);
@@ -3284,14 +3313,31 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                 } else if (M <= 8u && K[g].gemm_q4_m8) {
                     struct GemmPpKA { uint64_t wq, wdm, xq, xds, y; uint32_t rows, cols, M, stride; uint64_t ptx, ptx2; };
                     GemmPpKA pka{w.qs_va, w.dm_va, xq, xds, y, w.rows, w.cols, M, w.row_stride_bytes, peer_tx, peer_tx2};
+                    // The resident-activation kernel uses the 4d per-lane arithmetic too (same blocks, fmaf chain, block32_sum).
+                    const char* gx8_env = std::getenv("VEGAJET_VERIFY_GEMM_X");
+                    // M<=8 routing is opt-in (=2): W19 showed MTP prose 21/129 -> 19/129 with it, i.e. not bit-identical (open).
+                    if (gx8_env && gx8_env[0] == '2' && K[g].gemm_q4_m12x && (w.cols % 32u) == 0u && w.cols <= 4096u) {
+                        const uint32_t wgs = std::min<uint32_t>((w.rows + 31u) / 32u, 60u);
+                        VJ_CHECK(rt.enqueue_kernel(g, *K[g].gemm_q4_m12x, wgs * 1024u, 1, 1, 1024, 1, 1, &pka, sizeof(pka), barrier));
+                    } else {
                     const uint32_t gx = ((w.rows + 7u) / 8u) * 256u;
                     VJ_CHECK(rt.enqueue_kernel(g, *K[g].gemm_q4_m8, gx, 1, 1, 256, 1, 1, &pka, sizeof(pka), barrier));
+                    }
                     if (peer_tx != 0ULL && peer_tx2 != 0ULL && (w.rows & 7u) == 0u) ep_push_mask |= (1u << g);
                 } else if (M <= 12u && K[g].gemm_q4_m12) {
                     struct GemmPpKA { uint64_t wq, wdm, xq, xds, y; uint32_t rows, cols, M, stride; uint64_t ptx, ptx2; };
                     GemmPpKA pka{w.qs_va, w.dm_va, xq, xds, y, w.rows, w.cols, M, w.row_stride_bytes, peer_tx, peer_tx2};
+                    // Resident-activation variant (W18), bit-identical; one 1024-thread WG per CU.
+                    // Read per dispatch (not cached): warm-engine runs change the env between variants.
+                    const char* gx_env = std::getenv("VEGAJET_VERIFY_GEMM_X");
+                    const bool gemm_x_on = !(gx_env && gx_env[0] == '0');  // default ON since W18 (+6.9% Hybrid, 129/129)
+                    if (gemm_x_on && K[g].gemm_q4_m12x && (w.cols % 32u) == 0u && w.cols <= 4096u) {
+                        const uint32_t wgs = std::min<uint32_t>((w.rows + 31u) / 32u, 60u);
+                        VJ_CHECK(rt.enqueue_kernel(g, *K[g].gemm_q4_m12x, wgs * 1024u, 1, 1, 1024, 1, 1, &pka, sizeof(pka), barrier));
+                    } else {
                     const uint32_t gx = ((w.rows + 7u) / 8u) * 256u;
                     VJ_CHECK(rt.enqueue_kernel(g, *K[g].gemm_q4_m12, gx, 1, 1, 256, 1, 1, &pka, sizeof(pka), barrier));
+                    }
                     if (peer_tx != 0ULL && peer_tx2 != 0ULL && (w.rows & 7u) == 0u) ep_push_mask |= (1u << g);
                 } else if (M <= 16u && K[g].gemm_q4_m16) {
                     struct GemmPpKA { uint64_t wq, wdm, xq, xds, y; uint32_t rows, cols, M, stride; uint64_t ptx, ptx2; };
@@ -3551,7 +3597,13 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             const bool profile_critical = std::getenv("VEGAJET_SUPER_PROFILE") && std::getenv("VEGAJET_SUPER_PROFILE")[0] == '2';
             const bool use_sx = sx_ok && (ar_fused_bit != 0u || ar_tile_bit != 0u || profile_critical);
             const bool use_sx_moe = use_sx;  // TOP8_WG0 is Q3-kernel only
-            const bool use_sx_q3 = sx_ok && (ar_fused_bit != 0u || ar_tile_bit != 0u || dn_k4_on || gu_pair_on || gu_stream_on || top8_on || profile_critical);
+            const uint32_t moe_xf = sx_ok ? moe_prefetch_xflags() : 0u;  // VEGAJET_MOE_PREFETCH (_x Q3 only)
+            const bool use_sx_q3 = sx_ok && (moe_xf != 0u || ar_fused_bit != 0u || ar_tile_bit != 0u || dn_k4_on || gu_pair_on || gu_stream_on || top8_on || profile_critical);
+            // VEGAJET_SUPER_X (default 1, W21): all four super-kernels from the lean module whenever no experimental _x
+            // feature is on; =0 restores the pristine vj_ornith_super kernels (8f23ebb).
+            const char* sl_env = std::getenv("VEGAJET_SUPER_X");
+            const bool sl_ok = K[0].m1_gdn_super_l && K[0].m1_gqa_super_l && K[0].m1_moe_super_l && K[0].m1_moe_super_q3_l;
+            const bool use_sl = sl_ok && !(sl_env && sl_env[0] == '0') && !use_sx && !use_sx_q3;  // default ON since W21 (+0.9% raw, 129/129)
             const uint32_t c_in_slot  = conv_head;
             const uint32_t c_out_slot = (conv_head + 1u) % kGdnRingSlots;
             const uint32_t s_rhead    = opt.spec_gdn ? 0u : ring_head;
@@ -3577,7 +3629,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                             S[g].gdn_super_desc_va + static_cast<uint64_t>(gi) * sizeof(ornith_super::GdnSuperDesc),
                             s_ov, prev_ep, attn_ep, c_in_slot, c_out_slot, s_rhead, s_uring, super_sense | ar_fused_bit | ar_tile_bit, gdn_sense
                         };
-                        VJ_CHECK(rt.enqueue_kernel(g, use_sx ? *K[g].m1_gdn_super_x : *K[g].m1_gdn_super, super_wgs * 256u, 1, 1, 256, 1, 1, &ka, sizeof(ka), true));
+                        VJ_CHECK(rt.enqueue_kernel(g, use_sl ? *K[g].m1_gdn_super_l : use_sx ? *K[g].m1_gdn_super_x : *K[g].m1_gdn_super, super_wgs * 256u, 1, 1, 256, 1, 1, &ka, sizeof(ka), true));
                     }
                 } else {
                     const uint32_t ai = attn_idx++;
@@ -3598,7 +3650,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                                 L4[g].signs,uint32_t(l4_format),uint32_t(l4_chrono)};
                             VJ_CHECK(rt.enqueue_kernel(g, *K[g].m1_gqa_super_kvq, super_wgs * 256u, 1, 1, 256, 1, 1, &kvka, sizeof(kvka), true));
                         } else {
-                        VJ_CHECK(rt.enqueue_kernel(g, use_sx ? *K[g].m1_gqa_super_x : *K[g].m1_gqa_super, super_wgs * 256u, 1, 1, 256, 1, 1, &ka, sizeof(ka), true));
+                        VJ_CHECK(rt.enqueue_kernel(g, use_sl ? *K[g].m1_gqa_super_l : use_sx ? *K[g].m1_gqa_super_x : *K[g].m1_gqa_super, super_wgs * 256u, 1, 1, 256, 1, 1, &ka, sizeof(ka), true));
                         }
                     }
                 }
@@ -3616,8 +3668,14 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                         S[g].moe_super_desc_va + static_cast<uint64_t>(il) * sizeof(ornith_super::MoeSuperDesc),
                         attn_ep, moe_ep, super_sense | ar_fused_bit | ar_tile_bit | ((use_q3_k && top8_on) ? 0x01000000u : 0u) | ((use_q3_k && dn_k4_on) ? 0x20000000u : 0u) | ((use_q3_k && gu_pair_on) ? 0x40000000u : 0u) | ((use_q3_k && gu_stream_on) ? 0x04000000u : 0u)
                     };
-                    const auto* mk = use_q3_k ? (use_sx_q3 ? K[g].m1_moe_super_q3_x : K[g].m1_moe_super_q3)
-                                              : (use_sx_moe ? K[g].m1_moe_super_x : K[g].m1_moe_super);
+                    const auto* mk = use_q3_k ? (use_sl ? K[g].m1_moe_super_q3_l : use_sx_q3 ? K[g].m1_moe_super_q3_x : K[g].m1_moe_super_q3)
+                                              : (use_sl ? K[g].m1_moe_super_l : use_sx_moe ? K[g].m1_moe_super_x : K[g].m1_moe_super);
+                    if (mk == K[g].m1_moe_super_q3_x || mk == K[g].m1_moe_super_q3_l) {
+                        // The _x Q3 kernel takes one extra kernarg (xflags: VEGAJET_MOE_PREFETCH bits).
+                        struct MoeSupKAX { uint64_t desc; uint32_t ar_ep, out_ep, ssense, xflags; };
+                        const MoeSupKAX kx{ka.desc, ka.ar_ep, ka.out_ep, ka.ssense, moe_xf};
+                        VJ_CHECK(rt.enqueue_kernel(g, *mk, super_wgs * 256u, 1, 1, 256, 1, 1, &kx, sizeof(kx), true));
+                    } else
                     VJ_CHECK(rt.enqueue_kernel(g, *mk, super_wgs * 256u, 1, 1, 256, 1, 1, &ka, sizeof(ka), true));
                 }
                 disp += 2u;
@@ -5202,6 +5260,22 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         for (unsigned i = 0; i < 3; ++i) times[i].print(names[i], source);
     };
     double reject_recompute_ms = 0.0;
+
+    // M6: `--dump-tokens` writes the generated ids of one greedy sequence so tools/token_compare.py can prove token
+    // parity across binaries/toggles. A write failure fails the run (res.error) instead of leaving a stale dump.
+    auto dump_tokens = [&](const std::vector<int32_t>& ids) -> bool {
+        if (opt.dump_tokens_path.empty()) return true;
+        std::string derr;
+        if (!bench_io::write_token_ids(opt.dump_tokens_path, ids, &derr)) {
+            res.ok = false;
+            res.error = derr;
+            std::fprintf(stderr, "[DUMP-TOKENS] %s\n", derr.c_str());
+            return false;
+        }
+        std::printf("[DUMP-TOKENS] %zu generated token ids -> %s\n", ids.size(), opt.dump_tokens_path.c_str());
+        return true;
+    };
+
     auto commit_spec_gdn = [&](uint32_t acc, uint32_t dk) {
         struct RejectTimer {
             double& total;
@@ -5836,7 +5910,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
         if (res.tg128_raw_tps > 0.0) mgate.seed_raw_ms(1000.0 / res.tg128_raw_tps);
         // v1.2 C7+S1: depth from the measured per-M verify time and the live accepted length.
         spec_policy::MeasuredDepthGovernor mtp_gov;
-        uint32_t gov_depth_sum = 0u, gov_depth_n = 0u;
+        uint32_t gov_depth_sum = 0u, gov_depth_n = 0u, gov_plain_n = 0u;
         auto mtp_ingest = [&](const std::vector<std::pair<int32_t, uint32_t>>& tok_pos,
                               const std::vector<std::array<uint64_t, kfd::kMaxGpus>>& hs_rows) {
             size_t i = 0;
@@ -5870,8 +5944,16 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                 continue;
             }
             if (v12_spec_gov) {
-                const uint32_t gd = mtp_gov.next_depth(k_cur);
-                if (gd > 0u) { k_cur = std::min(k_cur, gd); gov_depth_sum += k_cur; ++gov_depth_n; }
+                // M2: the complete-cycle cost picks the depth before drafting. choose_depth() may answer 0 (plain
+                // decoding); this loop has no standalone plain cycle with MTP catch-up, so a plain choice floors at
+                // one draft (= verify a single token, the cheapest speculative cycle) and is counted in gov_plain_n.
+                const auto gc = mtp_gov.choose_depth(k_cur);
+                if (gc.warmed) {
+                    k_cur = std::min(k_cur, std::max<uint32_t>(gc.depth, 1u));
+                    gov_depth_sum += k_cur;
+                    ++gov_depth_n;
+                    if (gc.depth == 0u) ++gov_plain_n;
+                }
             }
             // Suffix chains are free to draft and almost always accepted, so they may fill a whole verify batch.
             const uint32_t k_sfx = std::min<uint32_t>({opt.suffix_max_draft, kGdnRingSlots - 2u, (rem > 1u) ? (rem - 1u) : 0u});
@@ -5913,6 +5995,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             }
             const double tA = now_ms();
             double pre_catch_ms = 0.0;
+            double t_neural = -1.0;  // start of the neural proposal loop (after any deferred catch-up replay)
             if (!used_suffix) {
                 if (use_hybrid_suffix && opt.zero_tax_catchup && kv_sync.pending() > 0u) {
                     const auto pre = kv_sync.before_neural();
@@ -5941,6 +6024,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                 }
                 pre_catch_ms = now_ms() - tA;
                 ++n_neural;
+                t_neural = now_ms();
                 int32_t d_in = gen.back();
                 for (uint32_t j = 0; j < k_cur; ++j) {
                     uint64_t hs[kfd::kMaxGpus] = {};
@@ -5955,6 +6039,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             t_draft += tB - tA - pre_catch_ms;
             treewy_force_width(drafts, gen.back());
             const uint32_t dk = static_cast<uint32_t>(drafts.size());
+            if (v12_spec_gov && t_neural >= 0.0 && dk > 0u) mtp_gov.observe_draft(dk, tB - t_neural);
             std::vector<int32_t> vtoks;
             vtoks.reserve(1u + dk);
             vtoks.push_back(gen.back());
@@ -6060,6 +6145,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             const double catch_ms = now_ms() - tC - r + pre_catch_ms;
             t_catch += catch_ms;
             cycle_times[verifier].add(tB - t_cyc0 - pre_catch_ms, tC - tB, catch_ms, r);
+            if (v12_spec_gov) mtp_gov.observe_catchup(n_commit, catch_ms);
             pos += n_commit;
             if (mtp_gate) mgate.on_spec(n_commit, now_ms() - t_cyc0);
         }
@@ -6078,9 +6164,10 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                             static_cast<unsigned long long>(zs.suffix_tokens));
             }
             if (v12_spec_gov && gov_depth_n > 0u)
-                std::printf(" | v12_gov depth %.2f alpha %.3f t_ver(M=4) %.2f ms",
-                            static_cast<double>(gov_depth_sum) / static_cast<double>(gov_depth_n),
-                            mtp_gov.alpha(), mtp_gov.measured_ms(4u));
+                std::printf(" | v12_gov depth %.2f plain %u alpha %.3f t_ver(M=4) %.2f ms draft %.2f us/tok catchup %.2f us/tok",
+                            static_cast<double>(gov_depth_sum) / static_cast<double>(gov_depth_n), gov_plain_n,
+                            mtp_gov.alpha(), mtp_gov.measured_ms(4u),
+                            1000.0 * mtp_gov.draft_ms_per_tok(), 1000.0 * mtp_gov.catchup_ms_per_tok());
             std::printf("\n");
         }
         double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - td0).count();
@@ -6259,6 +6346,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             else if (a == "--zero-tax-catchup") dst.zero_tax_catchup = true;
             else if (a == "--no-zero-tax-catchup") dst.zero_tax_catchup = false;
             else if (a == "--mtp-k") dst.mtp_k = static_cast<uint32_t>(std::atoi(next().c_str()));
+            else if (a == "--n-predict" || a == "-n") dst.decode_tokens = std::max(1, std::atoi(next().c_str()));
             else if (a == "--dflash-k") dst.dflash_k = static_cast<uint32_t>(std::atoi(next().c_str()));
             else if (a == "--dflash-p-min") dst.dflash_p_min = static_cast<float>(std::atof(next().c_str()));
             else if (a == "--profile-stages") dst.profile_stages = true;
@@ -6371,6 +6459,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                     std::printf("[BENCH context] repeated code prompt=%zu tokens; decode positions=%zu..%zu; prefill excluded from tok/s\n",
                                 raw_prompt.size(), raw_prompt.size(), raw_prompt.size() + raw_count - 2);
                 auto raw128 = run_greedy_raw(raw_prompt, raw_count, &res.tg128_raw_tps);
+                if (!dump_tokens(raw128)) return false;
                 res.dispatches_per_tok = last_dispatches;
                 if (trusted_raw128.size() != raw128.size() || trusted_context != raw_prompt.size()) {
                     trusted_raw128 = raw128;
@@ -6486,7 +6575,8 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                         VJ_CHECK(!critical || psx_ok);
                         const bool p_use_sx = psx_ok && (af_bit != 0u || at_bit != 0u || critical);
                         const bool p_use_sx_moe = p_use_sx;  // TOP8_WG0 is Q3-kernel only
-                        const bool p_use_sx_q3 = psx_ok && (af_bit != 0u || at_bit != 0u || (pdk_env && pdk_env[0] == '1') || p_gp || p_gs || p_top8 || critical);
+                        const uint32_t p_moe_xf = psx_ok ? moe_prefetch_xflags() : 0u;
+                        const bool p_use_sx_q3 = psx_ok && (p_moe_xf != 0u || af_bit != 0u || at_bit != 0u || (pdk_env && pdk_env[0] == '1') || p_gp || p_gs || p_top8 || critical);
                         struct ClkKA { uint64_t dst; uint32_t idx; uint32_t pad; };
                         auto stamp_all = [&](uint32_t idx) {
                             for (size_t g = 0; g < N; ++g) {
@@ -6499,6 +6589,11 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                             uint64_t z16[1920] = {};
                             for (size_t g = 0; g < N; ++g)
                                 VJ_CHECK(rt.upload_to_vram(g, S[g].super_bar_va + 1024u, z16, critical ? sizeof(z16) : 128u));
+                            if (critical && std::getenv("VEGAJET_PROFILE_DUMP")) {
+                                const std::vector<uint8_t> zz(kProfDumpBytes - kProfWgOff, 0u);
+                                for (size_t g = 0; g < N; ++g)
+                                    VJ_CHECK(rt.upload_to_vram(g, S[g].super_bar_va + kProfWgOff, zz.data(), zz.size()));
+                            }
                         }
                         // Match mega's diagnostic token at the middle of this raw decode.
                         const auto prep = prefill_sched::schedule(static_cast<uint32_t>(raw_prompt.size()), 0u, c2_cfg);
@@ -6565,6 +6660,11 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                                                   (critical ? (super_sense & ~0x007f0000u) : super_sense) | 0x80000000u | af_bit | at_bit | (critical ? (0x08000000u | ((2u * il + 1u) << 16u)) : 0u) | ((use_q3_k && p_top8) ? 0x01000000u : 0u) | (dk_on ? 0x20000000u : 0u) | ((use_q3_k && p_gp) ? 0x40000000u : 0u) | ((use_q3_k && p_gs) ? 0x04000000u : 0u)};
                                 const auto* mk = use_q3_k ? (p_use_sx_q3 ? K[g].m1_moe_super_q3_x : K[g].m1_moe_super_q3)
                                                           : (p_use_sx_moe ? K[g].m1_moe_super_x : K[g].m1_moe_super);
+                                if (mk == K[g].m1_moe_super_q3_x) {
+                                    struct MoeSupKAX { uint64_t desc; uint32_t aep, oep, ss, xflags; };
+                                    const MoeSupKAX kx{ka.desc, ka.aep, ka.oep, ka.ss, p_moe_xf};
+                                    VJ_CHECK(rt.enqueue_kernel(g, *mk, swgs * 256u, 1, 1, 256, 1, 1, &kx, sizeof(kx), true));
+                                } else
                                 VJ_CHECK(rt.enqueue_kernel(g, *mk, swgs * 256u, 1, 1, 256, 1, 1, &ka, sizeof(ka), true));
                             }
                             stamp_all(tidx++);
@@ -6634,18 +6734,55 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                         }
                         auto pm = [](uint64_t c) { return static_cast<double>(c) * 40e-6; };
                         uint64_t cp[kfd::kMaxGpus][16] = {};
+                        // MoE sub-stage offsets (_x Q3, critical mode): [0] router done, [1] shared GU done, [2] Stage-1 end
+                        // (all from the Stage-0 AR end), [3] LDS stage-in, [4] Down rows, [5] peer stores, [6] flag/end
+                        // (all from the Stage-3 GU end). Summed over MoE layers.
+                        double moe_sub[kfd::kMaxGpus][7] = {};
+                        const char* dump_path = critical ? std::getenv("VEGAJET_PROFILE_DUMP") : nullptr;
+                        std::FILE* dump_f = dump_path ? std::fopen(dump_path, "wb") : nullptr;
+                        if (dump_f) {
+                            // Header: magic, N, wgs, then per GPU: stage stamps (u64 tv[tidx]), ends[96][17], per-WG [96][17][256],
+                            // AR wait windows [96][2]; then 48 layer-type bytes (1 = GDN). Ticks are 25 MHz s_memrealtime.
+                            const uint32_t hdr[4] = {0x564a5044u /*VJPD*/, static_cast<uint32_t>(N), swgs, tidx};
+                            std::fwrite(hdr, sizeof(hdr), 1, dump_f);
+                        }
                         if (critical) for (size_t g = 0; g < N; ++g) {
                             uint64_t ends[96][17] = {};
                             VJ_CHECK(rt.download_from_vram(g, ends, S[g].super_bar_va + 2048u, sizeof(ends)));
-                            for (auto& record : ends) {
+                            if (dump_f) {
+                                std::vector<uint8_t> wgb(kProfDumpBytes - kProfWgOff);
+                                VJ_CHECK(rt.download_from_vram(g, wgb.data(), S[g].super_bar_va + kProfWgOff, wgb.size()));
+                                std::fwrite(tv[g].data(), 8u, tidx, dump_f);
+                                std::fwrite(ends, sizeof(ends), 1, dump_f);
+                                std::fwrite(wgb.data(), 1, wgb.size(), dump_f);
+                            }
+                            for (size_t ri = 0; ri < 96u; ++ri) {
+                                auto& record = ends[ri];
+                                const bool moe_row = (ri & 1u) != 0u;
                                 uint64_t prev = record[16];
                                 // DOT8 GU (15) precedes Down (14).
                                 const unsigned order[] = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,15,14};
                                 for (unsigned slot : order) if (record[slot]) {
+                                    if (moe_row && slot >= 1u && slot <= 5u) continue;  // sub-stamps, reported below
                                     cp[g][slot] += record[slot] - prev;
                                     prev = record[slot];
                                 }
+                                if (moe_row && record[10] && record[11]) {
+                                    auto off = [&](uint64_t t, uint64_t ref) { return (t && t >= ref) ? static_cast<double>(t - ref) * 40e-6 : 0.0; };
+                                    moe_sub[g][0] += off(record[1], record[10]);
+                                    moe_sub[g][1] += off(record[2], record[10]);
+                                    moe_sub[g][2] += off(record[11], record[10]);
+                                    moe_sub[g][3] += off(record[3], record[15]);
+                                    moe_sub[g][4] += off(record[4], record[15]);
+                                    moe_sub[g][5] += off(record[5], record[15]);
+                                    moe_sub[g][6] += off(record[14], record[15]);
+                                }
                             }
+                        }
+                        if (dump_f) {
+                            for (uint32_t il = 0; il < 48u; ++il) { const uint8_t t = layers[0][il].is_gdn ? 1u : 0u; std::fwrite(&t, 1, 1, dump_f); }
+                            std::fclose(dump_f);
+                            std::printf("[SUPER-PROFILE] per-WG dump written: %s\n", dump_path);
                         }
                         for (unsigned table = 0; table < (critical ? 2u : 1u); ++table) {
                             if (table) {
@@ -6662,6 +6799,10 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                                 std::printf("    MoE sub (dot8=%u iq2s=%u): AR=%.3f Rtr+ShGU=%.3f Top8=%.3f GU_IQ2S=%.3f GU_DOT8=%.3f MoEDn+PP=%.3f\n",
                                             gu_dot8_promoted, 48u - gu_dot8_promoted,
                                             pm(pf[g][10]), pm(pf[g][11]), pm(pf[g][12]), pm(pf[g][13]), pm(pf[g][15]), pm(pf[g][14]));
+                                if (table && moe_sub[g][2] > 0.0)
+                                    std::printf("    MoE x-sub (offsets, ms/tok): Stage1 from AR end: router_done=%.3f shGU_done=%.3f barrier_exit=%.3f | "
+                                                "Stage4 from GU end: lds_in=%.3f down_rows=%.3f peer_stores=%.3f flag_end=%.3f\n",
+                                                moe_sub[g][0], moe_sub[g][1], moe_sub[g][2], moe_sub[g][3], moe_sub[g][4], moe_sub[g][5], moe_sub[g][6]);
                             }
                         }
                     }
@@ -7013,6 +7154,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             return false;
         }
         auto raw128 = run_greedy_raw(p_rep_code, 129, &res.tg128_raw_tps);
+        if (!dump_tokens(raw128)) return false;
         res.dispatches_per_tok = last_dispatches;
         // Exact actual fetched HBM2 bytes/tok across ALL GPUs (excluding odd-256B TCC padding bytes never read,
         // and using exact per-format routed Gate+Up and routed Down byte counts).
@@ -7026,18 +7168,27 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                 const double dn_d8_row_b = layers[g][0].dn_is_sub32
                     ? double(dot8_iq3_sub32_layout(1u, local_ff_r[g]).read_bytes_per_row())
                     : double(dot8_iq3_layout(1u, local_ff_r[g]).read_bytes_per_row());
-                double bg = double(voc_rows[g]) * (double(D) + double(D / 32u) * 2.0);
+                // Per-stage split (printed with VEGAJET_BYTES_BREAKDOWN=1); the sum is unchanged.
+                double b_lm = double(voc_rows[g]) * (double(D) + double(D / 32u) * 2.0);
+                double b_gdn_w = 0.0, b_gdn_s = 0.0, b_gqa_w = 0.0, b_rtr = 0.0, b_sh = 0.0, b_gu = 0.0, b_dn = 0.0;
                 for (uint32_t il = 0; il < 48u; ++il) {
                     const auto& lw = layers[g][il];
                     if (lw.is_gdn) {
-                        bg += q4_real_b(lw.w_gdn_qkv_gab) + q4_real_b(lw.w_ssm_out) + 2.0 * double(gdn_nv[g]) * 128.0 * 128.0 * 4.0;
+                        b_gdn_w += q4_real_b(lw.w_gdn_qkv_gab) + q4_real_b(lw.w_ssm_out);
+                        b_gdn_s += 2.0 * double(gdn_nv[g]) * 128.0 * 128.0 * 4.0;
                     } else {
-                        bg += q4_real_b(lw.w_attn_qkv) + q4_real_b(lw.w_o);
+                        b_gqa_w += q4_real_b(lw.w_attn_qkv) + q4_real_b(lw.w_o);
                     }
-                    bg += 256.0 * D * 2.0 + q4_real_b(lw.w_sh_gu) + q4_real_b(lw.w_sh_down);
-                    bg += (lw.w_gu_d8_w_va != 0) ? (8.0 * local_ff_r[g] * gu_d8_row_b) : (8.0 * local_ff_r[g] * 1968.0);
-                    bg += (lw.w_dn_d8_w_va != 0) ? (8.0 * D * dn_d8_row_b)             : (8.0 * D * 208.0);
+                    b_rtr += 256.0 * D * 2.0;
+                    b_sh  += q4_real_b(lw.w_sh_gu) + q4_real_b(lw.w_sh_down);
+                    b_gu  += (lw.w_gu_d8_w_va != 0) ? (8.0 * local_ff_r[g] * gu_d8_row_b) : (8.0 * local_ff_r[g] * 1968.0);
+                    b_dn  += (lw.w_dn_d8_w_va != 0) ? (8.0 * D * dn_d8_row_b)             : (8.0 * D * 208.0);
                 }
+                const double bg = b_lm + b_gdn_w + b_gdn_s + b_gqa_w + b_rtr + b_sh + b_gu + b_dn;
+                if (const char* bb = std::getenv("VEGAJET_BYTES_BREAKDOWN"); bb && bb[0] == '1')
+                    std::printf("[BYTES gpu%zu MB/tok] gdn_w=%.2f gdn_state=%.2f gqa_w=%.2f router=%.2f shared=%.2f routed_gu=%.2f "
+                                "routed_dn=%.2f lm_head=%.2f total=%.2f\n", g, b_gdn_w / 1e6, b_gdn_s / 1e6, b_gqa_w / 1e6,
+                                b_rtr / 1e6, b_sh / 1e6, b_gu / 1e6, b_dn / 1e6, b_lm / 1e6, bg / 1e6);
                 real_bytes_per_tok_all_gpus += bg;
             }
         }
@@ -7495,7 +7646,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                 };
                 // v1.2 C7+S1: depth from the measured per-M verify time + live acceptance.
                 spec_policy::MeasuredDepthGovernor df_gov;
-                uint32_t df_gov_depth_sum = 0u, df_gov_depth_n = 0u;
+                uint32_t df_gov_depth_sum = 0u, df_gov_depth_n = 0u, df_gov_plain_n = 0u;
 
                 uint32_t pos = 0u;
                 int32_t last_pred = -1;
@@ -7532,8 +7683,15 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                     const uint64_t evict_u = use_evict ? evict_route_fb.take() : 0ull;
                     uint32_t k_target = use_evict ? evict_ctl.choose(k_cap, evict_u) : k_draft;
                     if (v12_spec_gov) {
-                        const uint32_t gd = df_gov.next_depth(std::min<uint32_t>(k_draft, df.block_size - 1u));
-                        if (gd > 0u) { k_target = std::min(k_target, gd); df_gov_depth_sum += gd; ++df_gov_depth_n; }
+                        // M2: choose on the complete-cycle cost. depth 0 = plain decoding and is honoured here: the
+                        // k_cur == 0 branch below steps one token and injects it into the drafter KV.
+                        const auto gc = df_gov.choose_depth(std::min<uint32_t>(k_draft, df.block_size - 1u));
+                        if (gc.warmed) {
+                            k_target = std::min(k_target, gc.depth);
+                            df_gov_depth_sum += gc.depth;
+                            ++df_gov_depth_n;
+                            if (gc.depth == 0u) ++df_gov_plain_n;
+                        }
                     }
                     // Past the switch position the drafter cache is no longer exact: no neural DFlash2 draft (the
                     // MTP cache was not fed during this request): single target steps, lossless).
@@ -7603,6 +7761,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                     if (v12_spec_gov) {
                         df_gov.observe_verify(std::min<uint32_t>(dk + 1u, 17u), t2 - t1);
                         df_gov.observe_accept(dk, acc);
+                        if (!used_suffix && dk > 0u) df_gov.observe_draft(dk, t1 - t0);
                     }
                     if (std::getenv("VEGAJET_DFLASH2_DEBUG") && pos < 64u) {
                         std::printf("  [DFVER pos=%u acc=%u/%u] tgt=[%d,%d,%d,%d,%d] dft=[%d,%d,%d,%d,%d]\n",
@@ -7636,6 +7795,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                     const double t3 = now_ms();
                     const double r = reject_recompute_ms - recompute_start;
                     cycle_times[verifier].add(t1 - t0, t2 - t1, t3 - t2 - r, r);
+                    if (v12_spec_gov && !used_suffix) df_gov.observe_catchup(n_commit, t3 - t2 - r);
                     t_dr += (t1 - t0); t_ver += (t2 - t1); t_inj += (t3 - t2 - r); ++n_cyc;
                     if (use_spec_gate) sgate.on_spec(n_commit, t3 - t0);
                     pos += n_commit;
@@ -7657,10 +7817,13 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
                                 t_ver / n_cyc, t_inj / n_cyc,
                                 static_cast<double>(n_gen - 1) / n_cyc);
                     if (v12_spec_gov && df_gov_depth_n > 0u)
-                        std::printf("[V12 SPEC_GOV gpu=%zu] depth %.2f | alpha %.3f | t_ver(M=4) %.2f ms | inflation(M=8) %.2f\n",
+                        std::printf("[V12 SPEC_GOV gpu=%zu] depth %.2f | plain %u | alpha %.3f | t_ver(M=4) %.2f ms | "
+                                    "draft %.2f us/tok | catchup %.2f us/tok | inflation(M=8) %.2f\n",
                                     df_gpu,
                                     static_cast<double>(df_gov_depth_sum) / static_cast<double>(df_gov_depth_n),
-                                    df_gov.alpha(), df_gov.measured_ms(4u), df_gov.time_inflation(8u));
+                                    df_gov_plain_n, df_gov.alpha(), df_gov.measured_ms(4u),
+                                    1000.0 * df_gov.draft_ms_per_tok(), 1000.0 * df_gov.catchup_ms_per_tok(),
+                                    df_gov.time_inflation(8u));
                 }
                 return gen;
             };
@@ -8097,6 +8260,7 @@ OrnithBenchMetrics run_ornith_gpu(const std::string& gguf_path,
             double tps = 0;
             auto gen = opt.use_suffix_spec ? run_greedy_suffix(ids, opt.decode_tokens, &tps)
                                            : run_greedy_raw(ids, opt.decode_tokens, &tps);
+            (void)dump_tokens(gen);
             res.tg128_raw_tps = tps;
             res.parity_simple_text = tok.decode(gen);
             std::printf("[GEN %.2f tok/s]: %s\n", tps, res.parity_simple_text.c_str());

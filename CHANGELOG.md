@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.1.2 (2026-11-27)
+
+A source release on 3× Instinct MI50 32 GB running Ornith-122B (TP=3, decode-only measurements, ECC 0/0).
+
+### Changed
+- **Faster speculative verify (on by default).** The dense M=9..12 verify GEMM now uses
+  `ornith_gemm_q4a8_m12_x_kernel`. One 1024-thread workgroup per CU stages the whole activation in LDS once and
+  walks 32-row chunks, instead of every 8-row workgroup re-staging it. The LDS layout is conflict-free. Per-lane
+  arithmetic is identical, so output stays bit-exact. Hybrid code: **390 -> 418 tok/s** (tg128) and
+  **384 -> 412 tok/s** (tg512), 129/129. `VEGAJET_VERIFY_GEMM_X=0` restores the previous kernel.
+  `VEGAJET_VERIFY_GEMM_X=2` also routes M<=8; it is NOT bit-identical for MTP prose and is for investigation only.
+- **Faster raw M=1 AllReduce (on by default).** The four M=1 super-kernels now come from `vj_ornith_super_l`,
+  a lean build of the `_x` source with every experimental feature compiled out. In the TP=3 AllReduce both peers'
+  fp16 packets are loaded together and the RMS weights are L2-touched during the flag spin; the post-AllReduce
+  full-grid barrier is replaced by a workgroup-0 broadcast flag. Bit-exact. Raw tg128 **174.0 -> 175.6 tok/s**
+  (mean of 3 vs 4 warm runs), 129/129. `VEGAJET_SUPER_X=0` restores the previous kernels.
+- The speculative depth choice prices the proposal and the catch-up (`observe_catchup`).
+- Version string: `vegajet 0.1.2`.
+
+### Added
+- Diagnostics:
+  - `VEGAJET_BYTES_BREAKDOWN=1` prints per-stage HBM bytes per token.
+  - `VEGAJET_PROFILE_DUMP=<path>` (with `VEGAJET_SUPER_PROFILE=2`) dumps per-workgroup stage ends and per-GPU AllReduce wait windows.
+  - `--dump-tokens` writes token-id dumps, with a `token_compare` gate.
+  - The warm engine accepts `--n-predict`.
+- Experimental, off by default: `VEGAJET_MOE_PREFETCH` (L2 warm-up in the MoE super kernel). It is measured
+  slower (174 -> 132–154 tok/s) and kept as a diagnostic.
+
+### Fixed
+- The hardware preflight parses the active DPM clock without `<regex>` (accepts `MHz` and `Mhz`); the CI
+  `-Werror`/sanitizer build is clean.
+- The MoE `_x` feature bits no longer collide (TOP8 moved to bit 24; the sense counter wraps at 2^24).
+
 ## v0.1.1 (2026-11-27)
 
 A source release. Measurements were taken on 3× Instinct MI50 32 GB running Ornith-122B; see the README's

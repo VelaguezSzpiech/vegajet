@@ -119,6 +119,74 @@ int main() {
         VJ_CHECK(gov.alpha() > 0.0);  // neutral prior, still a legal acceptance
     }
 
+    // 9. Measured proposal/catch-up cost: cycle_ms is verify + drafted * draft + expected * catch-up, and the
+    //    numbers below are chosen so every term is exact (alpha = 1, est_ms(4) = 8 ms).
+    {
+        MeasuredDepthConfig cfg;
+        cfg.min_samples = 1;
+        cfg.alpha_hi = 1.0;
+        MeasuredDepthGovernor gov(cfg);
+        for (uint32_t m = 1; m <= 4; ++m) gov.observe_verify(m, 2.0 * static_cast<double>(m));
+        gov.observe_accept(1u, 1u);  // alpha 1.0 -> expected_tokens(m) = m + 1
+        VJ_CHECK(gov.warmed());
+        VJ_CHECK(std::abs(gov.expected_tokens(3u) - 4.0) < 1e-9);
+        VJ_CHECK(std::abs(gov.cycle_ms(3u) - 8.0) < 1e-9);  // verify only before any draft/catch-up is measured
+        gov.observe_draft(4u, 8.0);       // 2.0 ms per drafted token
+        gov.observe_catchup(2u, 1.0);     // 0.5 ms per committed token
+        VJ_CHECK(std::abs(gov.draft_ms_per_tok() - 2.0) < 1e-9);
+        VJ_CHECK(std::abs(gov.catchup_ms_per_tok() - 0.5) < 1e-9);
+        VJ_CHECK(std::abs(gov.cycle_ms(3u) - (8.0 + 3.0 * 2.0 + 4.0 * 0.5)) < 1e-9);
+        VJ_CHECK(std::abs(gov.cycle_rate(3u) - 4.0 / 16.0) < 1e-9);
+        // The smoothing is a plain EWMA of the per-token cost, and absurd samples never poison it.
+        gov.observe_draft(2u, 6.0);   // 3.0 ms/token -> 0.7 * 2.0 + 0.3 * 3.0
+        VJ_CHECK(std::abs(gov.draft_ms_per_tok() - 2.3) < 1e-9);
+        gov.observe_draft(0u, 99.0);
+        gov.observe_draft(4u, -1.0);
+        gov.observe_catchup(0u, 5.0);
+        VJ_CHECK(std::abs(gov.draft_ms_per_tok() - 2.3) < 1e-9);
+        VJ_CHECK(std::abs(gov.catchup_ms_per_tok() - 0.5) < 1e-9);
+    }
+
+    // 10. Verify timings held fixed: a rising measured draft cost moves the optimum shallow and then to plain
+    //     decoding, and a warmed plain decision is distinguishable from "no measurement yet".
+    {
+        MeasuredDepthConfig cfg;
+        const auto warm = [&cfg](double draft_ms_per_tok) {
+            MeasuredDepthGovernor gov(cfg);
+            for (uint32_t i = 0; i < 4; ++i) {
+                gov.observe_accept(8u, 7u);  // alpha 0.875
+                for (uint32_t m = 1; m <= 16; ++m) gov.observe_verify(m, 4.0 + 0.1 * static_cast<double>(m));
+            }
+            if (draft_ms_per_tok > 0.0) gov.observe_draft(4u, 4.0 * draft_ms_per_tok);
+            return gov;
+        };
+        const MeasuredDepthGovernor cold;
+        const auto c0 = cold.choose_depth(15u);
+        VJ_CHECK(!c0.warmed);
+        VJ_CHECK(c0.depth == 0u);  // 0 here means "no measurement", not "plain decoding"
+        VJ_CHECK(cold.next_depth(15u) == 0u);
+
+        const auto free_d = warm(0.0).choose_depth(15u);
+        const auto mild_d = warm(0.5).choose_depth(15u);
+        const auto firm_d = warm(2.0).choose_depth(15u);
+        const auto dear_d = warm(5.0).choose_depth(15u);
+        VJ_CHECK(free_d.warmed);
+        VJ_CHECK(free_d.depth >= 10u);                    // free drafting: deep
+        VJ_CHECK(mild_d.depth < free_d.depth && mild_d.depth >= 2u);
+        VJ_CHECK(firm_d.depth < mild_d.depth && firm_d.depth >= 1u);
+        VJ_CHECK(dear_d.warmed && dear_d.depth == 0u);    // all speculative cycles lose -> plain decoding
+        // next_depth() keeps its legacy contract: 0 only ever means "cold", so it floors a plain decision at k_min.
+        const auto dear = warm(5.0);
+        VJ_CHECK(dear.next_depth(15u) >= 1u);
+        // A measured catch-up cost is part of the same objective and can only lower a deep cycle's rate.
+        const double r_free = free_d.tokens_per_ms;
+        MeasuredDepthGovernor g2 = warm(0.0);
+        g2.observe_catchup(8u, 40.0);  // 5 ms per committed token
+        VJ_CHECK(g2.catchup_ms_per_tok() > 4.9);
+        VJ_CHECK(g2.cycle_rate(15u) < r_free);
+        VJ_CHECK(g2.choose_depth(15u).depth <= free_d.depth);
+    }
+
     // The same conditional acceptance must not fall just because K is deeper.
     for (uint32_t depth : {1u, 4u, 8u, 15u}) {
         MeasuredDepthConfig cfg;

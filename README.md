@@ -12,6 +12,20 @@ I had two 32 GB AMD Instinct MI50s and wanted to know how fast they could run a 
 
 These tuned results are from development builds, not a benchmark of the downloadable binary. The speculative run used an external drafter, `--fr-spec 65536 --spec-gdn --zero-tax-catchup --suffix-max-draft 15`, and `VEGAJET_NO_AUTO_DOT8=1`. The tuned code comparisons reported **129/129 greedy tokens matching raw decode** (`first_diff=-1`). That is a token comparison, not a guarantee for every prompt or a 512-token parity test. In the separate zero-override run (`496e61b`), Hybrid accepted 100% of the draft on the repeated-code prompt and measured **311.04 / 295.43 tok/s**. The qualification recorded **0 UE / 0 DE** across the six monitored RAS blocks. The [full scorecard](#full-benchmarks) keeps the other parity oracles and ECC counts separate.
 
+### New in v0.1.2: faster verify and AllReduce
+
+v0.1.2 is a source release with two bit-exact speedups, both on by default. Measured on 3× MI50 32 GB with Ornith-122B, decode-only, 129/129 against raw decode:
+
+| Workload (TP=3, 150 W per card) | v0.1.1 | v0.1.2 |
+| :--- | ---: | ---: |
+| Raw decode, 128 output tokens | 174.0 tok/s | **175.6 tok/s** |
+| Hybrid speculative decode, repeated code, 128 / 512 tokens | 390.9 / 384.6 tok/s | **418.2 / 412.0 tok/s** |
+
+- **Verify GEMM:** the dense M=9..12 verify GEMM stages the whole activation in LDS once per CU, instead of once per 8 weight rows. `VEGAJET_VERIFY_GEMM_X=0` restores the previous kernel.
+- **AllReduce:** the M=1 super kernels come from a lean build whose TP=3 AllReduce loads both peers' packets together, and a workgroup-0 broadcast flag replaces the post-AllReduce grid barrier. `VEGAJET_SUPER_X=0` restores the previous kernels.
+
+See [`CHANGELOG.md`](CHANGELOG.md).
+
 ### New in v0.1.1: three cards
 
 v0.1.1 is a source release that adds a third MI50 32 GB card (`--tp 3`). On three cards with the new defaults, Ornith-122B decodes at **174.25 tok/s raw** and **390.50 tok/s with Hybrid** on repeated code (**383.96 tok/s** over 512 tokens). The Hybrid output matched raw decode on all 129 compared tokens, and the six RAS blocks recorded **0 UE / 0 DE**. Three lossless speculative-decode changes are now on by default: the zero-tax suffix cascade, the LumoTree GDN verifier and `VERIFY_FAST` expert-weight reuse in the verify step. On the same three cards they took Hybrid from 338.9 to 390.5 tok/s. The [three-card scorecard](#recorded-3-mi50-32-gb-scorecard-v011) lists the commands, ablations and the levers that were measured and left off. The downloadable binary below is still `v0.1.0-alpha.1` (two cards); build v0.1.1 [from source](#build-from-source).

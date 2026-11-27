@@ -44,7 +44,23 @@ __device__ __forceinline__ uint32_t ss_ar_mode_opaque(uint32_t ss) {
 #ifndef VJ_SUPER_EXT
 #define VJ_SUPER_EXT 1  // this file IS the opt-in _x module; the default module is vj_ornith_super.hip (8f23ebb source)
 #endif
-#if VJ_SUPER_EXT
+#ifndef VJ_SUPER_LEAN
+#define VJ_SUPER_LEAN 0
+#endif
+#if VJ_SUPER_LEAN
+// Lean production build of this source (vj_ornith_super_l, kernels *_l, VEGAJET_SUPER_X=1): every experimental bit
+// (AR tile/fused, PROFILE=2 critical stamps, DN_K4, TOP8, GU_PAIR, GU_STREAM, MoE prefetch) is a compile-time 0, so
+// only the production path plus the W21 AllReduce fast path / WG0 broadcast remain (code size, VGPR headroom).
+#define VJ_SS_PROLOGUE(ss) constexpr uint32_t vj_ss_ar_ = 0u; constexpr uint32_t vj_ss_critical_ = 0u; \
+                           constexpr uint32_t vj_ss_dnk4_ = 0u; constexpr uint32_t vj_ss_top8_ = 0u; \
+                           (void)vj_ss_ar_; (void)vj_ss_critical_; (void)vj_ss_dnk4_; (void)vj_ss_top8_
+#define VJ_SS_FUSED(ss) false
+#define VJ_SS_TILE(ss) false
+#define VJ_SS_DNK4(ss) false
+#define VJ_SS_TOP8(ss) false
+#define VJ_SS_TOP8_STD(ss) false
+#define VJ_SUPER_NAME(n) n##_l
+#elif VJ_SUPER_EXT
 // Flags are read ONCE per kernel at entry (uniform control flow, VJ_SS_PROLOGUE) into opaque SGPR locals.
 #define VJ_SS_PROLOGUE(ss) const uint32_t vj_ss_ar_ = vegajet::super_dev::ss_ar_mode_opaque(ss); \
                            const uint32_t vj_ss_critical_ = vegajet::super_dev::ss_bit_opaque((ss), 27u); \
@@ -278,14 +294,22 @@ __device__ __forceinline__ void signal_out_peer_flag_n(
 
 // Bit 27: per-dispatch critical-path endpoints; bits 16..22 select one of 96 records.
 // Keep the WG0 accumulated counters alongside these absolute timestamps.
-__device__ __forceinline__ void prof_max(uint64_t bar, uint32_t ss, uint32_t slot, bool critical) {
+// Deep-telemetry layout behind super_bar (critical mode only): per-WG stage ends after the mega scratch, then the
+// WG0 AllReduce wait window [row][2] (spin start, all peer flags seen).
+#define VJ_PROF_WG_OFF  32768u
+#define VJ_PROF_ARW_OFF (32768u + 96u * 17u * 256u * 8u)
+__device__ __forceinline__ void prof_max(uint64_t bar, uint32_t ss, uint32_t slot, bool critical, bool per_wg = true) {
     if (critical) {
         __syncthreads();
         asm volatile("s_waitcnt vmcnt(0) lgkmcnt(0)" ::: "memory");
         if (threadIdx.x == 0u) {
-            auto p = as_gptr<uint64_t>(bar + 2048u) + ((ss >> 16u) & 127u) * 17u;
+            const uint32_t row = (ss >> 16u) & 127u;
+            auto p = as_gptr<uint64_t>(bar + 2048u) + row * 17u;
             const uint64_t now = __builtin_amdgcn_s_memrealtime();
             __atomic_fetch_max(p + slot, now, __ATOMIC_RELAXED);
+            // Per-WG stage end (deep telemetry): [row][slot][wg] u64 at bar + VJ_PROF_WG_OFF.
+            // Host sets row = 2*il(+1) < 96 in critical mode and launches <= 240 WGs.
+            if (per_wg) as_gptr<uint64_t>(bar + VJ_PROF_WG_OFF)[(static_cast<uint64_t>(row) * 17u + slot) * 256u + blockIdx.x] = now;
         }
     }
 }
@@ -323,6 +347,15 @@ __device__ __forceinline__ void grid_barrier_glc_only(GPtr<uint32_t> bar, uint32
         }
     }
     __syncthreads();
+}
+
+// L2 warm-up: one dword per 128-B line of [base, base+bytes); values are OR-ed into a sink so the loads stay live.
+// Used before grid barriers by the opt-in VEGAJET_MOE_PREFETCH path (_x Q3 MoE only); arithmetic is unchanged.
+__device__ __forceinline__ void l2_touch(GPtr<const uint8_t> base, uint32_t bytes, uint32_t& sink) {
+    const uint32_t lines = (bytes + 127u) >> 7;
+    #pragma nounroll
+    for (uint32_t l = threadIdx.x; l < lines; l += blockDim.x)
+        sink |= *reinterpret_cast<GPtr<const uint32_t>>(base + (static_cast<uint64_t>(l) << 7));
 }
 
 __device__ __forceinline__ void grid_barrier_wbinvl1(GPtr<uint32_t> bar, uint32_t n_wgs, uint32_t sense) {
@@ -374,6 +407,24 @@ __device__ __forceinline__ void router_top8_publish(GPtr<uint32_t> bar, uint32_t
         asm volatile("s_waitcnt vmcnt(0)\n" ::: "memory");
         __atomic_store_n(&bar[16], sense, __ATOMIC_RELEASE);
     }
+}
+
+// W21: after a WG0-only Stage 0 (AllReduce + RMS + quant) the other WGs have done no writes, so a full arrive/wait
+// grid barrier is only a broadcast: WG0 publishes `sense` once its stores are complete, everyone else polls it.
+__device__ __forceinline__ void wg0_broadcast_wbinvl1(GPtr<uint32_t> bar, uint32_t sense, bool producer) {
+    if (producer) {
+        asm volatile("s_waitcnt vmcnt(0)\n" ::: "memory");
+        __syncthreads();
+        if (threadIdx.x == 0u) __atomic_store_n(&bar[16], sense, __ATOMIC_RELEASE);
+    } else if (threadIdx.x == 0u) {
+        #pragma nounroll
+        for (uint32_t spin = 0u; spin < 5000000u; ++spin) {
+            if (load_u32_glc(&bar[16]) == sense) break;
+            __builtin_amdgcn_s_sleep(1);
+        }
+    }
+    if (threadIdx.x == 0u) asm volatile("buffer_wbinvl1\n" ::: "memory");
+    __syncthreads();
 }
 
 template<int Off>
@@ -474,15 +525,34 @@ __device__ __forceinline__ void p2p_ar_prepush_m1_n(
     uint32_t n_ranks,
     float    eps,
     bool     tile,
-    bool     fused) {
+    bool     fused,
+    uint64_t prof_bar = 0ull,
+    uint32_t prof_ss = 0u) {
     const uint32_t tid  = threadIdx.x;
     const uint32_t wave = tid >> 6;
     const uint32_t lane = tid & 63u;
     const uint32_t n8   = D >> 3;
 
+    GPtr<const float4> xp4 = reinterpret_cast<GPtr<const float4>>(x_partial);
+    GPtr<const float4> h4c = reinterpret_cast<GPtr<const float4>>(h_io);
+    GPtr<float4>       h4  = reinterpret_cast<GPtr<float4>>(h_io);
+    float4 ha[2], hb[2];
+    // TP=3 fast path (W21, lean module only: the _x module has no .text/VGPR headroom left for it): WG threads 64..
+    // L2/L1-touch the RMS weights during the flag spin, and both peers' packets are loaded together below.
+    // Same values, same order -> bit-exact. (Pre-loading the local partial/residual before the spin spilled at 64 VGPR.)
+    const bool fast3 = VJ_SUPER_LEAN && (n_ranks == 3u && !tile && !fused);
+    uint32_t w_sink = 0u;
+    if (fast3) {
+        const uint32_t wl = (D * 4u + 127u) >> 7;
+        if (tid >= 64u && tid - 64u < wl)
+            w_sink = *reinterpret_cast<GPtr<const uint32_t>>(reinterpret_cast<GPtr<const uint8_t>>(w_rms) + static_cast<uint64_t>(tid - 64u) * 128u);
+    }
     // tile mode: no single-thread flag spin; each thread waits only for the ready tags of its own chunks below.
     if (n_ranks > 1u && !tile && !fused) {
         if (tid == 0u) {
+            const uint32_t prow = (prof_ss >> 16u) & 127u;
+            if (prof_bar != 0ull)
+                as_gptr<uint64_t>(prof_bar + VJ_PROF_ARW_OFF)[prow * 2u] = __builtin_amdgcn_s_memrealtime();
             #pragma nounroll
             for (uint32_t src = 0u; src < n_ranks; ++src) {
                 if (src != rank && ar_local_flag[src] != 0ULL) {
@@ -494,27 +564,67 @@ __device__ __forceinline__ void p2p_ar_prepush_m1_n(
                     }
                 }
             }
+            if (prof_bar != 0ull)
+                as_gptr<uint64_t>(prof_bar + VJ_PROF_ARW_OFF)[prow * 2u + 1u] = __builtin_amdgcn_s_memrealtime();
         }
         __syncthreads();
     }
 
-    GPtr<const float4> xp4 = reinterpret_cast<GPtr<const float4>>(x_partial);
-    GPtr<const float4> h4c = reinterpret_cast<GPtr<const float4>>(h_io);
-    GPtr<float4>       h4  = reinterpret_cast<GPtr<float4>>(h_io);
-
-    float4 ha[2], hb[2];
     float ss = 0.0f;
+    // TP=3 fast path: both peers' fp16 packets in flight together (issued before any use).
+    const uint32_t pa = (rank == 0u) ? 1u : 0u;   // first remote rank
+    const uint32_t pb = (rank == 2u) ? 1u : 2u;   // second remote rank
+    uint4 r0[2], r1[2];
+    if (fast3) {
+        #pragma unroll
+        for (uint32_t it = 0u; it < 2u; ++it) {
+            const uint32_t ic = min(tid + 256u * it, n8 - 1u);
+            r0[it] = ldg_u32x4_stream(as_gptr<const uint4>(ar_local_rx_base[pa] + slot_off) + ic);
+            r1[it] = ldg_u32x4_stream(as_gptr<const uint4>(ar_local_rx_base[pb] + slot_off) + ic);
+        }
+    }
     #pragma unroll
     for (uint32_t it = 0u; it < 2u; ++it) {
         const uint32_t i  = tid + 256u * it;
         const uint32_t ic = min(i, n8 - 1u);
-        const float4 la = xp4[ic * 2u];
-        const float4 lb = xp4[ic * 2u + 1u];
-        ha[it] = h4c[ic * 2u];
-        hb[it] = h4c[ic * 2u + 1u];
+        float4 la, lb;
+        {
+            la = xp4[ic * 2u];
+            lb = xp4[ic * 2u + 1u];
+            ha[it] = h4c[ic * 2u];
+            hb[it] = h4c[ic * 2u + 1u];
+        }
         if (n_ranks <= 1u) {
             ha[it].x += la.x; ha[it].y += la.y; ha[it].z += la.z; ha[it].w += la.w;
             hb[it].x += lb.x; hb[it].y += lb.y; hb[it].z += lb.z; hb[it].w += lb.w;
+        } else if (fast3) {
+            #pragma clang fp contract(off)
+            // Own partial as the same RN fp16 packet the peers received, then the canonical rank-order sum 0, 1, 2.
+            const __half2 o0 = __floats2half2_rn(la.x, la.y), o1 = __floats2half2_rn(la.z, la.w);
+            const __half2 o2 = __floats2half2_rn(lb.x, lb.y), o3 = __floats2half2_rn(lb.z, lb.w);
+            const uint4 ow = make_uint4(*reinterpret_cast<const uint32_t*>(&o0), *reinterpret_cast<const uint32_t*>(&o1),
+                                        *reinterpret_cast<const uint32_t*>(&o2), *reinterpret_cast<const uint32_t*>(&o3));
+            const uint4 u0 = (rank == 0u) ? ow : r0[it];
+            const uint4 u1 = (rank == 1u) ? ow : ((pa == 1u) ? r0[it] : r1[it]);
+            const uint4 u2 = (rank == 2u) ? ow : r1[it];
+            auto unpack = [](const uint4& rv, float4& va, float4& vb) {
+                const float2 p0 = __half22float2(*reinterpret_cast<const __half2*>(&rv.x));
+                const float2 p1 = __half22float2(*reinterpret_cast<const __half2*>(&rv.y));
+                const float2 p2 = __half22float2(*reinterpret_cast<const __half2*>(&rv.z));
+                const float2 p3 = __half22float2(*reinterpret_cast<const __half2*>(&rv.w));
+                va = make_float4(p0.x, p0.y, p1.x, p1.y);
+                vb = make_float4(p2.x, p2.y, p3.x, p3.y);
+            };
+            float4 sa, sb, va, vb;
+            unpack(u0, sa, sb);
+            unpack(u1, va, vb);
+            sa.x += va.x; sa.y += va.y; sa.z += va.z; sa.w += va.w;
+            sb.x += vb.x; sb.y += vb.y; sb.z += vb.z; sb.w += vb.w;
+            unpack(u2, va, vb);
+            sa.x += va.x; sa.y += va.y; sa.z += va.z; sa.w += va.w;
+            sb.x += vb.x; sb.y += vb.y; sb.z += vb.z; sb.w += vb.w;
+            ha[it].x += sa.x; ha[it].y += sa.y; ha[it].z += sa.z; ha[it].w += sa.w;
+            hb[it].x += sb.x; hb[it].y += sb.y; hb[it].z += sb.z; hb[it].w += sb.w;
         } else {
             float4 sa = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
             float4 sb = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -562,6 +672,7 @@ __device__ __forceinline__ void p2p_ar_prepush_m1_n(
             ss = fmaf(hb[it].x, hb[it].x, fmaf(hb[it].y, hb[it].y, fmaf(hb[it].z, hb[it].z, fmaf(hb[it].w, hb[it].w, ss))));
         }
     }
+    asm volatile("" :: "v"(w_sink));
 
     ss = wave64_sum(ss);
     if (lane == 0u) sm_red4[wave] = ss;
@@ -990,9 +1101,11 @@ void VJ_SUPER_NAME(ornith_m1_gdn_super_kernel)(
                 as_gptr<float2>(desc->x_ds),
                 sm_fo,
                 desc->D, prev_ar_epoch, desc->rank, desc->n_ranks, desc->eps,
-                VJ_SS_TILE(super_sense), VJ_SS_FUSED(super_sense));
+                VJ_SS_TILE(super_sense), VJ_SS_FUSED(super_sense),
+                vj_ss_critical_ != 0u ? desc->super_bar : 0ull, super_sense);
         }
-        grid_barrier_wbinvl1(sbar, gridDim.x, super_sense);
+        if (VJ_SUPER_LEAN && !VJ_SS_TILE(super_sense) && !VJ_SS_FUSED(super_sense)) wg0_broadcast_wbinvl1(sbar, super_sense, wg == 0u);
+        else grid_barrier_wbinvl1(sbar, gridDim.x, super_sense);
         p_acc(0u);
     }
 
@@ -1280,9 +1393,11 @@ void VJ_SUPER_NAME(ornith_m1_gqa_super_kernel)(
                 as_gptr<float2>(desc->x_ds),
                 sm_red,
                 desc->D, prev_ar_epoch, desc->rank, desc->n_ranks, desc->eps,
-                VJ_SS_TILE(super_sense), VJ_SS_FUSED(super_sense));
+                VJ_SS_TILE(super_sense), VJ_SS_FUSED(super_sense),
+                vj_ss_critical_ != 0u ? desc->super_bar : 0ull, super_sense);
         }
-        grid_barrier_wbinvl1(sbar, gridDim.x, super_sense);
+        if (VJ_SUPER_LEAN && !VJ_SS_TILE(super_sense) && !VJ_SS_FUSED(super_sense)) wg0_broadcast_wbinvl1(sbar, super_sense, wg == 0u);
+        else grid_barrier_wbinvl1(sbar, gridDim.x, super_sense);
         p_acc(4u);
     }
 
@@ -1562,7 +1677,8 @@ void VJ_SUPER_NAME(ornith_m1_moe_super_kernel)(
             as_gptr<float2>(desc->x_ds),
             sm_y,
             desc->D, ar_epoch, desc->rank, desc->n_ranks, desc->eps,
-                VJ_SS_TILE(super_sense), VJ_SS_FUSED(super_sense));
+                VJ_SS_TILE(super_sense), VJ_SS_FUSED(super_sense),
+                0ull, 0u);  // .text cap: no AR window in the non-Q3 MoE kernel
     }
     // Preload 4-KiB sm_grid32 into LDS ONLY on non-DOT8 (IQ2_S) layers!
     if (desc->w_gu_d8_w == 0ULL) {
@@ -1573,7 +1689,7 @@ void VJ_SUPER_NAME(ornith_m1_moe_super_kernel)(
     } else {
         __syncthreads();
     }
-    prof_max(desc->super_bar, super_sense, 10u, vj_ss_critical_ != 0u);
+    prof_max(desc->super_bar, super_sense, 10u, vj_ss_critical_ != 0u, false);
     prof_acc(prof, 10u, t_p, prof_on);
 
     // ---- Stage 1: Balanced 240-WG Router FP16 (128 lanes/row, all 256 thr!) + Shared Gate/Up (LDS x_q8/x_ds!) + Shared Gate ----
@@ -1719,7 +1835,7 @@ void VJ_SUPER_NAME(ornith_m1_moe_super_kernel)(
         }
         // Fused mode stamps router production before the rendezvous: compare slots 11+12 together.
         if (!VJ_SS_TOP8_STD(super_sense)) grid_barrier_wbinvl1(sbar + 32u, gridDim.x, super_sense);
-        prof_max(desc->super_bar, super_sense, 11u, vj_ss_critical_ != 0u);
+        prof_max(desc->super_bar, super_sense, 11u, vj_ss_critical_ != 0u, false);
         prof_acc(prof, 11u, t_p, prof_on);
         if (VJ_SS_TOP8_STD(super_sense)) router_top8_arrive(sbar + 32u, gridDim.x, super_sense, wg == 0u);
     }
@@ -1743,7 +1859,7 @@ void VJ_SUPER_NAME(ornith_m1_moe_super_kernel)(
         }
         __syncthreads();
     }
-    prof_max(desc->super_bar, super_sense, 12u, vj_ss_critical_ != 0u);
+    prof_max(desc->super_bar, super_sense, 12u, vj_ss_critical_ != 0u, false);
     prof_acc(prof, 12u, t_p, prof_on);
 
     // ---- Stage 3: ALL WGs (240 WGs = 4 WGs/CU!) Exact VJ_Q3_IQ2S (kBatch=3 + v_bfi_b32) / DOT8 / IQ2_S Gate+Up + 64-WG Shared Down ----
@@ -1871,7 +1987,7 @@ void VJ_SUPER_NAME(ornith_m1_moe_super_kernel)(
             }
         }
         grid_barrier_wbinvl1(sbar + 96u, gridDim.x, super_sense);
-        prof_max(desc->super_bar, super_sense, (desc->w_gu_d8_w != 0ULL) ? 15u : 13u, vj_ss_critical_ != 0u);
+        prof_max(desc->super_bar, super_sense, (desc->w_gu_d8_w != 0ULL) ? 15u : 13u, vj_ss_critical_ != 0u, false);
         prof_acc(prof, (desc->w_gu_d8_w != 0ULL) ? 15u : 13u, t_p, prof_on);
     }
 
@@ -1942,7 +2058,7 @@ void VJ_SUPER_NAME(ornith_m1_moe_super_kernel)(
                 if (!VJ_SS_TILE(super_sense) && !VJ_SS_FUSED(super_sense))
                     signal_out_peer_flag_n(sbar, desc->out_peer_flag, desc->rank, desc->n_ranks, dn_wgs, out_ar_epoch);
             }
-            prof_max(desc->super_bar, super_sense, 14u, vj_ss_critical_ != 0u);
+            prof_max(desc->super_bar, super_sense, 14u, vj_ss_critical_ != 0u, false);
             prof_acc(prof, 14u, t_p, prof_on);
         }
     }
@@ -1953,7 +2069,7 @@ void VJ_SUPER_NAME(ornith_m1_moe_super_kernel)(
 // both polarities: LLVM peephole-opt (SIInstrInfo::optimizeCompareInstr) folded s_and_b32 + s_cmp_lg_u32 +
 // s_cmp_eq_u32 into ONE s_bitcmp0_b32 feeding both s_cselect_b64, inverting the h-loop latch of f34de3f (the inner
 // loop ran 2x with the bit CLEAR -> tile n_tiles -> sm_ids[8] = sm_w[0] bits as expert id -> junk-VA TCP fault).
-#if VJ_SUPER_EXT
+#if VJ_SUPER_EXT && !VJ_SUPER_LEAN
 #define VJ_SS_GUPAIR(ss) (vegajet::super_dev::ss_bit_opaque((ss), 30u))
 #else
 #define VJ_SS_GUPAIR(ss) 0u
@@ -1967,9 +2083,17 @@ void VJ_SUPER_NAME(ornith_m1_moe_super_q3_kernel)(
     const vegajet::ornith_super::MoeSuperDesc* __restrict__ desc,
     uint32_t ar_epoch,
     uint32_t out_ar_epoch,
-    uint32_t super_sense) {
+    uint32_t super_sense,
+    uint32_t xflags) {  // _x only: bit 0 = L2-prefetch Stage-1 weights under the Stage-0 AR wait, bit 1 = Down weights before Stage 4
     VJ_SS_PROLOGUE(super_sense);
-    const uint32_t gu_stream = vegajet::super_dev::ss_bit_opaque(super_sense, 26u);  // bit 26: GU_STREAM (bit 27 is the PROFILE=2 critical-path flag)
+#if VJ_SUPER_LEAN
+    constexpr uint32_t pf_s1 = 0u, pf_s4 = 0u, gu_stream = 0u;
+    (void)xflags;
+#else
+    const uint32_t pf_s1 = vegajet::super_dev::ss_bit_opaque(xflags, 0u);
+    const uint32_t pf_s4 = vegajet::super_dev::ss_bit_opaque(xflags, 1u);
+    const uint32_t gu_stream = vegajet::super_dev::ss_bit_opaque(super_sense, 26u);
+#endif  // bit 26: GU_STREAM (bit 27 is the PROFILE=2 critical-path flag)
     using namespace vegajet::super_dev;
     __shared__ uint4   sm_x[256];   // 4,096 B
     __shared__ float   sm_xd[128];  //   512 B
@@ -1994,6 +2118,23 @@ void VJ_SUPER_NAME(ornith_m1_moe_super_q3_kernel)(
     };
     if (prof_on) as_gptr<uint64_t>(desc->super_bar + 1280u)[0] = __builtin_amdgcn_s_memrealtime();
 
+    uint32_t pf_sink = 0u;
+    if (pf_s1 != 0u && wg != 0u) {
+        const uint32_t sh_wgs_p = (gridDim.x == 240u && desc->sh_gu_rows <= 768u) ? 96u : 128u;
+        if (wg < sh_wgs_p) {
+            const uint32_t r0 = wg * 8u;
+            if (r0 < desc->sh_gu_rows) {
+                const uint32_t nr = min(8u, desc->sh_gu_rows - r0);
+                l2_touch(as_gptr<const uint8_t>(desc->sh_gu_qs) + static_cast<uint64_t>(r0) * desc->sh_gu_stride, nr * desc->sh_gu_stride, pf_sink);
+                l2_touch(as_gptr<const uint8_t>(desc->sh_gu_dm) + static_cast<uint64_t>(r0) * 384u, nr * 384u, pf_sink);
+            }
+        } else if (sh_wgs_p == 96u) {
+            const uint32_t rwg = wg - 96u;
+            if (rwg < 128u) l2_touch(as_gptr<const uint8_t>(desc->w_router_f16) + static_cast<uint64_t>(rwg) * 12800u, 2u * 6400u, pf_sink);
+            else if (rwg == 128u) l2_touch(as_gptr<const uint8_t>(desc->w_sh_gate), 768u * 16u, pf_sink);
+        }
+    }
+
     // ---- Stage 0: Post-Mixer Prepush FP16 AR (WG 0) ----
     if (ar_epoch != 0u) {
         if (wg == 0u) {
@@ -2010,11 +2151,15 @@ void VJ_SUPER_NAME(ornith_m1_moe_super_q3_kernel)(
                 as_gptr<float2>(desc->x_ds),
                 sm_y,
                 desc->D, ar_epoch, desc->rank, desc->n_ranks, desc->eps,
-                VJ_SS_TILE(super_sense), VJ_SS_FUSED(super_sense));
+                VJ_SS_TILE(super_sense), VJ_SS_FUSED(super_sense),
+                vj_ss_critical_ != 0u ? desc->super_bar : 0ull, super_sense);
         }
-        grid_barrier_wbinvl1(sbar, gridDim.x, super_sense);
+        if (VJ_SUPER_LEAN && !VJ_SS_TILE(super_sense) && !VJ_SS_FUSED(super_sense)) wg0_broadcast_wbinvl1(sbar, super_sense, wg == 0u);
+        else grid_barrier_wbinvl1(sbar, gridDim.x, super_sense);
         p_acc(10u);
     }
+
+    asm volatile("" :: "v"(pf_sink));  // keep the Stage-1 L2 touches live (no-op when VEGAJET_MOE_PREFETCH is off)
 
     // ---- Stage 1: Balanced 240-WG ShGU + Router + ShGate ----
     {
@@ -2068,6 +2213,7 @@ void VJ_SUPER_NAME(ornith_m1_moe_super_q3_kernel)(
                 acc = block32_sum(acc);
                 if (l32 == 0u) as_gptr<float>(desc->sh_gu_out)[row] = acc;
             }
+            prof_max(desc->super_bar, super_sense, 2u, vj_ss_critical_ != 0u);  // sub-stamp: shared Gate+Up WGs done
         } else {
             const uint32_t rwg = wg - sh_wgs;
             uint32_t e_beg = 256u, e_end = 256u;
@@ -2139,6 +2285,7 @@ void VJ_SUPER_NAME(ornith_m1_moe_super_q3_kernel)(
                     as_gptr<float>(desc->sh_gate_sc)[0] = 1.0f / (1.0f + __expf(-tot));
                 }
             }
+            prof_max(desc->super_bar, super_sense, 1u, vj_ss_critical_ != 0u);  // sub-stamp: router WGs done
         }
         // Fused mode stamps router production before the rendezvous: compare slots 11+12 together.
         if (!VJ_SS_TOP8(super_sense)) grid_barrier_wbinvl1(sbar + 32u, gridDim.x, super_sense);
@@ -2305,6 +2452,19 @@ void VJ_SUPER_NAME(ornith_m1_moe_super_q3_kernel)(
                 if (lane16 == 0u) as_gptr<float>(desc->sh_down_out)[row] = acc;
             }
         }
+        if (pf_s4 != 0u && wg < 240u) {
+            const bool bal_p = VJ_SS_DNK4(super_sense) && desc->dn_is_sub32 != 0u;
+            const uint32_t nr = bal_p ? (wg < 192u ? 13u : 12u) : (wg < 144u ? 16u : 8u);
+            const uint32_t r0 = bal_p ? (wg < 192u ? wg * 13u : 2496u + (wg - 192u) * 12u) : (wg < 144u ? wg * 16u : 2304u + (wg - 144u) * 8u);
+            uint32_t sink4 = 0u;
+            #pragma nounroll
+            for (uint32_t s = 0u; s < 4u; ++s) {
+                const uint64_t eb = static_cast<uint64_t>(__builtin_amdgcn_readfirstlane(static_cast<uint32_t>(sm_ids[s]))) * desc->D + r0;
+                l2_touch(as_gptr<const uint8_t>(desc->w_dn_d8_w) + eb * desc->dn_w_stride, nr * desc->dn_w_stride, sink4);
+                l2_touch(as_gptr<const uint8_t>(desc->w_dn_d8_s) + eb * desc->dn_s_stride, nr * desc->dn_s_stride, sink4);
+            }
+            asm volatile("" :: "v"(sink4));
+        }
         grid_barrier_wbinvl1(sbar + 96u, gridDim.x, super_sense);
         p_acc(15u);
     }
@@ -2328,6 +2488,7 @@ void VJ_SUPER_NAME(ornith_m1_moe_super_q3_kernel)(
         if (t4 < n_q8_u4) sm_x[t4] = as_gptr<const uint4>(desc->mid_q8)[t4];
         if (t4 < n_d) sm_xd[t4] = as_gptr<const float>(desc->mid_d)[t4];
         __syncthreads();
+        prof_max(desc->super_bar, super_sense, 3u, vj_ss_critical_ != 0u);  // sub-stamp: mid activations staged in LDS
         float total = 0.0f;
         if (has_row) {
             total = vegajet::dot8_dev::vj_dot8_down_row_iq3_flex<2>(
@@ -2342,6 +2503,7 @@ void VJ_SUPER_NAME(ornith_m1_moe_super_q3_kernel)(
                 sm_y[grp16] = v;
             }
         }
+        prof_max(desc->super_bar, super_sense, 4u, vj_ss_critical_ != 0u);  // sub-stamp: routed Down rows done
         // Cross-WG packet handoff: original packet ownership stays aligned to eight FP16 rows.
         const uint32_t pp_rows = wg < 144u ? 16u : 8u;
         const uint32_t pp_row0 = wg < 144u ? wg * 16u : 2304u + (wg - 144u) * 8u;
@@ -2383,6 +2545,7 @@ void VJ_SUPER_NAME(ornith_m1_moe_super_q3_kernel)(
                     }
                 }
             }
+            prof_max(desc->super_bar, super_sense, 5u, vj_ss_critical_ != 0u);  // sub-stamp: peer FP16 stores issued (+waited)
             if (!VJ_SS_TILE(super_sense) && !VJ_SS_FUSED(super_sense))
                 signal_out_peer_flag_n(sbar, desc->out_peer_flag, desc->rank, desc->n_ranks, 240u, out_ar_epoch);
         }
